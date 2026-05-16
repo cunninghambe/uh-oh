@@ -1,13 +1,13 @@
 import { and, desc, eq, sql } from 'drizzle-orm';
 
-import type { Db } from '../index.js';
+import type { DbOrTx } from '../index.js';
 import { newId } from '../ids.js';
 import { issues, type IssueRow } from '../schema.js';
 
 export type IssueStatus = 'open' | 'resolved' | 'ignored';
 
 export const upsertIssue = (
-  db: Db,
+  db: DbOrTx,
   input: { projectId: string; fingerprint: string; title: string; ts: number },
 ): { issue: IssueRow; isNew: boolean } => {
   const existing = db
@@ -45,7 +45,7 @@ export const upsertIssue = (
 };
 
 export const listIssues = (
-  db: Db,
+  db: DbOrTx,
   input: {
     projectId: string;
     status?: IssueStatus;
@@ -76,16 +76,16 @@ export const listIssues = (
   return { rows, total: totalRow?.n ?? 0 };
 };
 
-export const getIssue = (db: Db, id: string): IssueRow | null =>
+export const getIssue = (db: DbOrTx, id: string): IssueRow | null =>
   db.select().from(issues).where(eq(issues.id, id)).get() ?? null;
 
-export const setIssueStatus = (db: Db, id: string, status: IssueStatus): IssueRow | null => {
+export const setIssueStatus = (db: DbOrTx, id: string, status: IssueStatus): IssueRow | null => {
   const existing = getIssue(db, id);
   if (!existing) return null;
   db.update(issues).set({ status }).where(eq(issues.id, id)).run();
   return getIssue(db, id);
 };
 
-export const markIssueAlerted = (db: Db, id: string, ts: number): void => {
+export const markIssueAlerted = (db: DbOrTx, id: string, ts: number): void => {
   db.update(issues).set({ lastAlertedAt: ts }).where(eq(issues.id, id)).run();
 };

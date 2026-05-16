@@ -1,0 +1,92 @@
+import type { Breadcrumb, EventEnvelope } from '@uh-oh/types';
+
+import type { Db } from '../db/index.js';
+import { insertBreadcrumbs } from '../db/repos/breadcrumbs.js';
+import { insertEvent } from '../db/repos/events.js';
+import { upsertIssue } from '../db/repos/issues.js';
+import { getProjectByPublicKey } from '../db/repos/projects.js';
+import type { ProjectRow } from '../db/schema.js';
+
+import { computeFingerprint, computeTitle } from './fingerprint.js';
+import type { RateLimiter } from './rate-limit.js';
+
+export type IngestResult =
+  | { kind: 'stored'; eventId: string; issueId: string; isNewIssue: boolean }
+  | { kind: 'rate-limited'; issueId: string; isNewIssue: boolean }
+  | { kind: 'unknown-key' };
+
+export type IngestDeps = {
+  db: Db;
+  rateLimiter: RateLimiter;
+  now?: () => number;
+};
+
+const isoToMs = (iso: string): number => {
+  const t = Date.parse(iso);
+  return Number.isFinite(t) ? t : Date.now();
+};
+
+export const ingest = (
+  deps: IngestDeps,
+  publicKey: string,
+  envelope: EventEnvelope,
+): IngestResult => {
+  const project = getProjectByPublicKey(deps.db, publicKey);
+  if (!project) return { kind: 'unknown-key' };
+
+  const now = deps.now?.() ?? Date.now();
+  const fingerprint = computeFingerprint(envelope);
+  const title = computeTitle(envelope);
+
+  return deps.db.transaction((tx): IngestResult => {
+    const { issue, isNew } = upsertIssue(tx, {
+      projectId: project.id,
+      fingerprint,
+      title,
+      ts: now,
+    });
+
+    const allowed = deps.rateLimiter.consume(`${project.publicKey}::${fingerprint}`, now);
+    if (!allowed) {
+      return { kind: 'rate-limited', issueId: issue.id, isNewIssue: isNew };
+    }
+
+    const event = insertEvent(tx, {
+      projectId: project.id,
+      issueId: issue.id,
+      releaseId: null,
+      fingerprint,
+      level: envelope.level,
+      platform: envelope.platform,
+      payload: JSON.stringify(envelope),
+      receivedAt: now,
+      deviceInfo: JSON.stringify(envelope.device),
+      userInfo: envelope.user ? JSON.stringify(envelope.user) : null,
+    });
+
+    if (envelope.breadcrumbs.length > 0) {
+      insertBreadcrumbs(
+        tx,
+        event.id,
+        envelope.breadcrumbs.map((b: Breadcrumb) => ({
+          ts: isoToMs(b.ts),
+          category: b.category,
+          level: b.level,
+          message: b.message,
+          data: b.data ? JSON.stringify(b.data) : null,
+        })),
+      );
+    }
+
+    return { kind: 'stored', eventId: event.id, issueId: issue.id, isNewIssue: isNew };
+  });
+};
+
+export type IngestEntry = (publicKey: string, envelope: EventEnvelope) => IngestResult;
+
+export const makeIngest =
+  (deps: IngestDeps): IngestEntry =>
+  (publicKey, envelope) =>
+    ingest(deps, publicKey, envelope);
+
+export type { ProjectRow };

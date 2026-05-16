@@ -1,6 +1,6 @@
 import { eq } from 'drizzle-orm';
 
-import type { Db } from '../index.js';
+import type { DbOrTx } from '../index.js';
 import { newId, newPublicKey } from '../ids.js';
 import { projects, type ProjectRow } from '../schema.js';
 
@@ -12,7 +12,7 @@ const slugify = (s: string): string =>
     .slice(0, 48) || 'project';
 
 export const createProject = (
-  db: Db,
+  db: DbOrTx,
   input: { name: string; slug?: string; webhookUrl?: string },
 ): ProjectRow => {
   const row: ProjectRow = {
@@ -28,16 +28,16 @@ export const createProject = (
   return row;
 };
 
-export const listProjects = (db: Db): ProjectRow[] => db.select().from(projects).all();
+export const listProjects = (db: DbOrTx): ProjectRow[] => db.select().from(projects).all();
 
-export const getProjectById = (db: Db, id: string): ProjectRow | null =>
+export const getProjectById = (db: DbOrTx, id: string): ProjectRow | null =>
   db.select().from(projects).where(eq(projects.id, id)).get() ?? null;
 
-export const getProjectByPublicKey = (db: Db, publicKey: string): ProjectRow | null =>
+export const getProjectByPublicKey = (db: DbOrTx, publicKey: string): ProjectRow | null =>
   db.select().from(projects).where(eq(projects.publicKey, publicKey)).get() ?? null;
 
 export const updateProject = (
-  db: Db,
+  db: DbOrTx,
   id: string,
   patch: Partial<Pick<ProjectRow, 'webhookUrl' | 'alertDedupeMinutes' | 'name'>>,
 ): ProjectRow | null => {
@@ -47,7 +47,7 @@ export const updateProject = (
   return getProjectById(db, id);
 };
 
-export const rotateProjectPublicKey = (db: Db, id: string): ProjectRow | null => {
+export const rotateProjectPublicKey = (db: DbOrTx, id: string): ProjectRow | null => {
   const existing = getProjectById(db, id);
   if (!existing) return null;
   const publicKey = newPublicKey();
@@ -55,7 +55,7 @@ export const rotateProjectPublicKey = (db: Db, id: string): ProjectRow | null =>
   return getProjectById(db, id);
 };
 
-export const deleteProject = (db: Db, id: string): boolean => {
+export const deleteProject = (db: DbOrTx, id: string): boolean => {
   const result = db.delete(projects).where(eq(projects.id, id)).run();
   return result.changes > 0;
 };

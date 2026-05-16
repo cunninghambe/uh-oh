@@ -1,10 +1,10 @@
 import { asc, eq } from 'drizzle-orm';
 
-import type { Db } from '../index.js';
+import type { DbOrTx } from '../index.js';
 import { breadcrumbs, type BreadcrumbRow } from '../schema.js';
 
 export const insertBreadcrumbs = (
-  db: Db,
+  db: DbOrTx,
   eventId: string,
   rows: Array<Omit<BreadcrumbRow, 'eventId' | 'idx'>>,
 ): void => {
@@ -13,7 +13,7 @@ export const insertBreadcrumbs = (
   db.insert(breadcrumbs).values(toInsert).run();
 };
 
-export const listBreadcrumbs = (db: Db, eventId: string): BreadcrumbRow[] =>
+export const listBreadcrumbs = (db: DbOrTx, eventId: string): BreadcrumbRow[] =>
   db
     .select()
     .from(breadcrumbs)

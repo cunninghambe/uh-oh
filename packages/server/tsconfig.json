@@ -2,8 +2,10 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "outDir": "./dist",
-    "rootDir": "./src"
+    "baseUrl": ".",
+    "paths": {
+      "@uh-oh/types": ["../types/src/index.ts"]
+    }
   },
-  "references": [{ "path": "../types" }],
   "include": ["src/**/*"]
 }
