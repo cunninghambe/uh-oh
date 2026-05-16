@@ -17,6 +17,12 @@
     "format:check": "prettier --check .",
     "test": "pnpm -r test"
   },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  },
   "devDependencies": {
     "@types/node": "22.13.0",
     "eslint": "9.18.0",
