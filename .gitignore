@@ -1,0 +1,32 @@
+node_modules/
+dist/
+build/
+.turbo/
+.cache/
+*.tsbuildinfo
+
+# env
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# runtime
+*.log
+*.pid
+.DS_Store
+
+# sqlite
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# uploaded symbols (local dev)
+/var-symbols/
+packages/server/symbols/
+
+# editor
+.vscode/
+.idea/
+*.swp

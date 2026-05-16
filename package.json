@@ -1,0 +1,28 @@
+{
+  "name": "uh-oh",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "description": "Lightweight self-hosted crash reporting for React Native",
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=10.0.0"
+  },
+  "scripts": {
+    "build": "pnpm -r build",
+    "dev": "pnpm -r --parallel dev",
+    "typecheck": "pnpm -r typecheck",
+    "lint": "eslint . --max-warnings 0",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.5",
+    "eslint": "9.18.0",
+    "@eslint/js": "9.18.0",
+    "typescript-eslint": "8.21.0",
+    "prettier": "3.4.2",
+    "typescript": "5.7.3"
+  }
+}
