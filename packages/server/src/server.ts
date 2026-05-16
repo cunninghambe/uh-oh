@@ -2,6 +2,7 @@ import { EventEnvelopeSchema } from '@uh-oh/types';
 import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import type { z } from 'zod';
 
+import { registerApiRoutes } from './api/routes.js';
 import type { Db } from './db/index.js';
 import type { IngestEntry } from './ingest/ingest.js';
 import { makeIngest } from './ingest/ingest.js';
@@ -54,9 +55,15 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
 
   app.get('/healthz', () => ({ ok: true }));
 
+  registerApiRoutes(app, deps.db);
+
   app.setErrorHandler((err: FastifyError, _req, reply) => {
-    if (err.statusCode === 413) {
+    const status = err.statusCode ?? 500;
+    if (status === 413) {
       return reply.code(413).send({ error: 'payload_too_large' });
+    }
+    if (status >= 400 && status < 500) {
+      return reply.code(status).send({ error: err.code ?? 'bad_request', message: err.message });
     }
     app.log.error(err);
     return reply.code(500).send({ error: 'internal' });
