@@ -238,4 +238,21 @@ describe('EventEnvelopeSchema', () => {
       expect(r.error.issues[0]?.path).toEqual(['exception', 'type']);
     }
   });
+
+  it('accepts tags as Record<string, string>', () => {
+    const r = EventEnvelopeSchema.safeParse({ ...validEnvelope, tags: { env: 'prod', ver: '1' } });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.tags).toEqual({ env: 'prod', ver: '1' });
+  });
+
+  it('accepts envelope without tags (optional)', () => {
+    const r = EventEnvelopeSchema.safeParse(validEnvelope);
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.tags).toBeUndefined();
+  });
+
+  it('rejects tags with non-string value (boundary)', () => {
+    const r = EventEnvelopeSchema.safeParse({ ...validEnvelope, tags: { env: 42 } });
+    expect(r.success).toBe(false);
+  });
 });

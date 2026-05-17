@@ -493,7 +493,7 @@ Status legend: `[done]` `[next]` `[blocked]`.
 | 8   | Dashboard shell                                          | —          | [done]    |
 | 9   | Dashboard: projects + issues list + issue detail         | 8          | [done]    |
 | 10  | Dashboard: login + settings + symbol upload UI           | 6, 7a, 7c  | [blocked] |
-| 11  | SDK JS core (`@uh-oh/react-native`)                      | 2, 4       | [next]    |
+| 11  | SDK JS core (`@uh-oh/react-native`)                      | 2, 4       | [done]    |
 | 13  | SDK Android native module (xCrash + UEH)                 | 11         | [blocked] |
 | 14  | CLI (`@uh-oh/cli`)                                       | 6          | [blocked] |
 | 15a | Deploy: systemd + UFW + daily backup                     | 6, 16      | [blocked] |

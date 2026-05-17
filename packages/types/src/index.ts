@@ -112,6 +112,7 @@ export const EventEnvelopeSchema = z
     breadcrumbs: z.array(BreadcrumbSchema).max(100).default([]),
     user: UserSchema.optional(),
     context: z.record(z.string(), JsonValueSchema).optional(),
+    tags: z.record(z.string(), z.string()).optional(),
     device: DeviceInfoSchema,
     fingerprint: z.array(z.string().min(1).max(256)).min(1).max(8).optional(),
   })
