@@ -498,7 +498,7 @@ Status legend: `[done]` `[next]` `[blocked]`.
 | 14  | CLI (`@uh-oh/cli`)                                       | 6          | [blocked] |
 | 15a | Deploy: systemd + UFW + daily backup                     | 6, 16      | [blocked] |
 | 15b | Deploy: nginx vhost + TLS via certbot                    | 15a        | [blocked] |
-| 16  | Hardening: per-IP rate limit, payload caps, metrics, CSP | 6          | [next]    |
+| 16  | Hardening: per-IP rate limit, payload caps, metrics, CSP | 6          | [done]    |
 
 Subtask numbers 7b (iOS dSYM) and 12 (iOS native) are intentionally omitted — iOS is out of scope.
 

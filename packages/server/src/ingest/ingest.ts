@@ -11,6 +11,7 @@ import type { ProjectRow } from '../db/schema.js';
 
 import { computeFingerprint, computeTitle } from './fingerprint.js';
 import type { RateLimiter } from './rate-limit.js';
+import { metrics } from '../metrics/registry.js';
 
 export type IngestResult =
   | { kind: 'stored'; eventId: string; issueId: string; isNewIssue: boolean }
@@ -50,6 +51,7 @@ export const ingest = (
 
     const allowed = deps.rateLimiter.consume(`${project.publicKey}::${fingerprint}`, now);
     if (!allowed) {
+      metrics.eventsIngested.inc({ outcome: 'rate-limited' });
       return { kind: 'rate-limited', issueId: issue.id, isNewIssue: isNew };
     }
 
@@ -97,6 +99,9 @@ export const ingest = (
         markIssueAlerted(tx, issue.id, now);
       }
     }
+
+    metrics.eventsIngested.inc({ outcome: 'stored' });
+    if (isNew) metrics.issuesNew.inc();
 
     return { kind: 'stored', eventId: event.id, issueId: issue.id, isNewIssue: isNew };
   });

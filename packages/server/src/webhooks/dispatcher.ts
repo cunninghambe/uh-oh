@@ -3,6 +3,7 @@ import { getIssue } from '../db/repos/issues.js';
 import { getEvent } from '../db/repos/events.js';
 import { getProjectById } from '../db/repos/projects.js';
 import { takeDueDispatches, markDispatchAttempt } from '../db/repos/webhook-dispatches.js';
+import { metrics } from '../metrics/registry.js';
 
 const BACKOFF_MS = [2000, 8000, 32000] as const;
 const MAX_ATTEMPTS = 3;
@@ -98,6 +99,7 @@ const dispatchOne = async (
       : null;
 
   if (nextAttemptAt === null) {
+    metrics.webhookFailures.inc();
     logger?.error('webhook dispatch failed permanently', {
       id: dispatch.id,
       url: dispatch.url,
