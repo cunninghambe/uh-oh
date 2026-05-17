@@ -253,6 +253,45 @@ describe('GET /api/issues/:id', () => {
   });
 });
 
+describe('GET /api/events/:id', () => {
+  it('returns event + breadcrumbs without symbolicate param', async () => {
+    const app = buildTestServer(db);
+    const { eventId } = await seedEvent(app);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/events/${eventId}`,
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json<{ event: EventRow; breadcrumbs: BreadcrumbRow[]; frames?: unknown[] }>();
+    expect(body.event.id).toBe(eventId);
+    expect(body.frames).toBeUndefined();
+  });
+
+  it('returns frames array when symbolicate=true', async () => {
+    const app = buildTestServer(db);
+    const { eventId } = await seedEvent(app);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/events/${eventId}?symbolicate=true`,
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json<{ event: EventRow; breadcrumbs: BreadcrumbRow[]; frames: unknown[] }>();
+    expect(Array.isArray(body.frames)).toBe(true);
+  });
+
+  it('404 on missing event', async () => {
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'GET',
+      url: '/api/events/no-such-event',
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(404);
+  });
+});
+
 describe('PATCH /api/issues/:id', () => {
   it('flips status', async () => {
     const app = buildTestServer(db);

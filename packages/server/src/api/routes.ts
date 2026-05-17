@@ -12,6 +12,7 @@ import {
 } from '../db/repos/projects.js';
 import type { Db } from '../db/index.js';
 import { buildAuthMiddleware } from '../auth/middleware.js';
+import { symbolicateEvent } from '../symbolication/symbolicate.js';
 
 type IssueStatusInput = 'open' | 'resolved' | 'ignored';
 const isStatus = (s: unknown): s is IssueStatusInput =>
@@ -137,10 +138,20 @@ export const registerApiRoutes = (app: FastifyInstance, db: Db, secret: Uint8Arr
     return { events };
   });
 
-  app.get<{ Params: { id: string } }>('/api/events/:id', { preHandler }, (req, reply) => {
-    const event = getEvent(db, req.params.id);
-    if (!event) return reply.code(404).send({ error: 'not_found' });
-    const breadcrumbs = listBreadcrumbs(db, event.id);
-    return { event, breadcrumbs };
-  });
+  app.get<{ Params: { id: string }; Querystring: { symbolicate?: string } }>(
+    '/api/events/:id',
+    { preHandler },
+    async (req, reply) => {
+      const event = getEvent(db, req.params.id);
+      if (!event) return reply.code(404).send({ error: 'not_found' });
+      const breadcrumbs = listBreadcrumbs(db, event.id);
+
+      if (req.query.symbolicate === 'true') {
+        const frames = await symbolicateEvent(db, event.id);
+        return { event, breadcrumbs, frames };
+      }
+
+      return { event, breadcrumbs };
+    },
+  );
 };

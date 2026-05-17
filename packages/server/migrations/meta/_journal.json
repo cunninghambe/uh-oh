@@ -15,6 +15,13 @@
       "when": 1778977119572,
       "tag": "0001_webhook_dispatches",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1778977559762,
+      "tag": "0002_releases_sourcemap",
+      "breakpoints": true
     }
   ]
 }

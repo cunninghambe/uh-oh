@@ -5,6 +5,7 @@ import type { z } from 'zod';
 import { registerApiRoutes } from './api/routes.js';
 import { registerAuthRoutes } from './auth/routes.js';
 import type { Db } from './db/index.js';
+import { registerSymbolizationRoutes } from './symbolication/routes.js';
 import type { IngestEntry } from './ingest/ingest.js';
 import { makeIngest } from './ingest/ingest.js';
 import { createRateLimiter } from './ingest/rate-limit.js';
@@ -66,6 +67,7 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
 
   registerAuthRoutes(app, deps.db, secret, password);
   registerApiRoutes(app, deps.db, secret);
+  registerSymbolizationRoutes(app, deps.db, secret);
 
   app.setErrorHandler((err: FastifyError, _req, reply) => {
     const status = err.statusCode ?? 500;

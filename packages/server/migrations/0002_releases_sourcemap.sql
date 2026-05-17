@@ -1,0 +1,1 @@
+ALTER TABLE `releases` ADD `sourcemap_uploaded_at` integer;

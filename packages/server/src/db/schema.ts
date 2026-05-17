@@ -28,6 +28,7 @@ export const releases = sqliteTable(
     build: text('build').notNull(),
     platform: text('platform', { enum: ['ios', 'android'] }).notNull(),
     mappingUploadedAt: integer('mapping_uploaded_at'),
+    sourcemapUploadedAt: integer('sourcemap_uploaded_at'),
   },
   (t) => [
     uniqueIndex('releases_proj_ver_build_plat_uniq').on(

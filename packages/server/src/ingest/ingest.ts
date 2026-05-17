@@ -5,6 +5,7 @@ import { insertBreadcrumbs } from '../db/repos/breadcrumbs.js';
 import { insertEvent } from '../db/repos/events.js';
 import { upsertIssue, markIssueAlerted } from '../db/repos/issues.js';
 import { getProjectByPublicKey } from '../db/repos/projects.js';
+import { upsertRelease } from '../db/repos/releases.js';
 import { enqueueDispatch } from '../db/repos/webhook-dispatches.js';
 import type { ProjectRow } from '../db/schema.js';
 
@@ -52,10 +53,17 @@ export const ingest = (
       return { kind: 'rate-limited', issueId: issue.id, isNewIssue: isNew };
     }
 
+    const release = upsertRelease(tx, {
+      projectId: project.id,
+      version: envelope.release.version,
+      build: envelope.release.build,
+      platform: envelope.platform,
+    });
+
     const event = insertEvent(tx, {
       projectId: project.id,
       issueId: issue.id,
-      releaseId: null,
+      releaseId: release.id,
       fingerprint,
       level: envelope.level,
       platform: envelope.platform,

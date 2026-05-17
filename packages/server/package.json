@@ -13,6 +13,7 @@
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
+    "@fastify/multipart": "10.0.0",
     "@uh-oh/types": "workspace:*",
     "better-sqlite3": "12.10.0",
     "drizzle-orm": "0.45.2",
