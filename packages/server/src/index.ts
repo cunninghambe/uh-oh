@@ -2,6 +2,7 @@ import { applyMigrations, openDb } from './db/index.js';
 import { buildServer } from './server.js';
 import { secretFromEnv } from './auth/jwt.js';
 import { cleanupExpiredSessions } from './db/repos/sessions.js';
+import { startDispatcher } from './webhooks/dispatcher.js';
 
 export { applyMigrations, openDb } from './db/index.js';
 export { buildServer } from './server.js';
@@ -45,13 +46,19 @@ if (isMain) {
   );
 
   const app = buildServer({ db, logger: true, secret, password });
+  const dispatcherHandle = startDispatcher({ db, logger: app.log });
 
-  const shutdown = () => {
+  const shutdown = async () => {
     clearInterval(cleanupInterval);
+    await dispatcherHandle.stop();
     process.exit(0);
   };
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', () => {
+    void shutdown();
+  });
+  process.on('SIGINT', () => {
+    void shutdown();
+  });
 
   app.listen({ port, host }).then(
     () => {

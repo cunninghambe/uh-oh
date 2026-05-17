@@ -3,8 +3,9 @@ import type { Breadcrumb, EventEnvelope } from '@uh-oh/types';
 import type { Db } from '../db/index.js';
 import { insertBreadcrumbs } from '../db/repos/breadcrumbs.js';
 import { insertEvent } from '../db/repos/events.js';
-import { upsertIssue } from '../db/repos/issues.js';
+import { upsertIssue, markIssueAlerted } from '../db/repos/issues.js';
 import { getProjectByPublicKey } from '../db/repos/projects.js';
+import { enqueueDispatch } from '../db/repos/webhook-dispatches.js';
 import type { ProjectRow } from '../db/schema.js';
 
 import { computeFingerprint, computeTitle } from './fingerprint.js';
@@ -76,6 +77,17 @@ export const ingest = (
           data: b.data ? JSON.stringify(b.data) : null,
         })),
       );
+    }
+
+    if (project.webhookUrl) {
+      const shouldFire =
+        isNew ||
+        issue.lastAlertedAt === null ||
+        now - issue.lastAlertedAt > project.alertDedupeMinutes * 60_000;
+      if (shouldFire) {
+        enqueueDispatch(tx, { issueId: issue.id, eventId: event.id, url: project.webhookUrl }, now);
+        markIssueAlerted(tx, issue.id, now);
+      }
     }
 
     return { kind: 'stored', eventId: event.id, issueId: issue.id, isNewIssue: isNew };

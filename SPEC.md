@@ -486,7 +486,7 @@ Status legend: `[done]` `[next]` `[blocked]`.
 | 2   | `@uh-oh/types` Zod schemas                               | 1          | [done]    |
 | 3   | Server DB layer (Drizzle schema + repos)                 | 1, 2       | [done]    |
 | 4   | Server ingest endpoint                                   | 3          | [done]    |
-| 5   | Server webhook dispatcher                                | 3, 4       | [next]    |
+| 5   | Server webhook dispatcher                                | 3, 4       | [done]    |
 | 6   | Server auth + JWT middleware (retrofit /api/\*)          | 3, 4       | [done]    |
 | 7a  | Android ProGuard symbolication                           | 3          | [next]    |
 | 7c  | Hermes JS source-map symbolication                       | 3          | [next]    |

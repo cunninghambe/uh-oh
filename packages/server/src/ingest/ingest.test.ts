@@ -6,6 +6,7 @@ import { getIssue, listIssues } from '../db/repos/issues.js';
 import { createProject } from '../db/repos/projects.js';
 import { listBreadcrumbs } from '../db/repos/breadcrumbs.js';
 import { getEvent, listEventsForIssue } from '../db/repos/events.js';
+import { takeDueDispatches } from '../db/repos/webhook-dispatches.js';
 import { makeTestDb } from '../db/test-utils.js';
 import type { ProjectRow } from '../db/schema.js';
 import { buildServer } from '../server.js';
@@ -202,5 +203,48 @@ describe('POST /ingest/:publicKey', () => {
     const res = await app.inject({ method: 'GET', url: '/healthz' });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ ok: true });
+  });
+});
+
+describe('webhook dispatch hook in ingest()', () => {
+  const rl = () => createRateLimiter({ capacity: 10, refillPerSec: 1 });
+
+  it('enqueues a dispatch row when project has webhookUrl set', () => {
+    const p = createProject(db, { name: 'Hooked', webhookUrl: 'https://hooks.test/x' });
+    const r = ingestFn({ db, rateLimiter: rl(), now: () => 1_000 }, p.publicKey, validEnv);
+    expect(r.kind).toBe('stored');
+    const due = takeDueDispatches(db, 1_000, 10);
+    expect(due).toHaveLength(1);
+    expect(due[0]?.url).toBe('https://hooks.test/x');
+  });
+
+  it('does NOT enqueue when project has no webhookUrl', () => {
+    // project has no webhookUrl (created in beforeEach without one)
+    const r = ingestFn({ db, rateLimiter: rl(), now: () => 1_000 }, project.publicKey, validEnv);
+    expect(r.kind).toBe('stored');
+    const due = takeDueDispatches(db, 1_000, 10);
+    expect(due).toHaveLength(0);
+  });
+
+  it('does NOT enqueue a second dispatch for same fingerprint within dedupe window', () => {
+    const p = createProject(db, { name: 'Hooked2', webhookUrl: 'https://hooks.test/y' });
+    const deps = { db, rateLimiter: rl(), now: () => 1_000 };
+    ingestFn(deps, p.publicKey, validEnv); // first — fires
+    ingestFn(deps, p.publicKey, validEnv); // second — within 30min window
+    const due = takeDueDispatches(db, 1_000, 10);
+    expect(due).toHaveLength(1); // only one dispatch row
+  });
+
+  it('enqueues a new dispatch after the dedupe window expires', () => {
+    const dedupeMinutes = 30;
+    const p = createProject(db, { name: 'Hooked3', webhookUrl: 'https://hooks.test/z' });
+    // alertDedupeMinutes defaults to 30
+    ingestFn({ db, rateLimiter: rl(), now: () => 1_000 }, p.publicKey, validEnv);
+
+    const afterWindow = 1_000 + dedupeMinutes * 60_000 + 1;
+    ingestFn({ db, rateLimiter: rl(), now: () => afterWindow }, p.publicKey, validEnv);
+
+    const due = takeDueDispatches(db, afterWindow, 10);
+    expect(due).toHaveLength(2);
   });
 });

@@ -120,6 +120,29 @@ export const sessions = sqliteTable('sessions', {
   expiresAt: integer('expires_at').notNull(),
 });
 
+export const webhookDispatches = sqliteTable(
+  'webhook_dispatches',
+  {
+    id: text('id').primaryKey(),
+    issueId: text('issue_id')
+      .notNull()
+      .references(() => issues.id, { onDelete: 'cascade' }),
+    eventId: text('event_id')
+      .notNull()
+      .references(() => events.id, { onDelete: 'cascade' }),
+    url: text('url').notNull(),
+    attempt: integer('attempt').notNull().default(0),
+    nextAttemptAt: integer('next_attempt_at').notNull(),
+    status: text('status', { enum: ['pending', 'succeeded', 'failed'] })
+      .notNull()
+      .default('pending'),
+    lastError: text('last_error'),
+    lastResponseCode: integer('last_response_code'),
+    createdAt: integer('created_at').notNull(),
+  },
+  (t) => [index('webhook_dispatches_status_due_idx').on(t.status, t.nextAttemptAt)],
+);
+
 export type ProjectRow = typeof projects.$inferSelect;
 export type ProjectInsert = typeof projects.$inferInsert;
 export type IssueRow = typeof issues.$inferSelect;
@@ -131,3 +154,5 @@ export type BreadcrumbInsert = typeof breadcrumbs.$inferInsert;
 export type ReleaseRow = typeof releases.$inferSelect;
 export type SymbolicationRow = typeof symbolications.$inferSelect;
 export type SessionRow = typeof sessions.$inferSelect;
+export type WebhookDispatchRow = typeof webhookDispatches.$inferSelect;
+export type WebhookDispatchInsert = typeof webhookDispatches.$inferInsert;
