@@ -3,6 +3,7 @@ import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import type { z } from 'zod';
 
 import { registerApiRoutes } from './api/routes.js';
+import { registerAuthRoutes } from './auth/routes.js';
 import type { Db } from './db/index.js';
 import type { IngestEntry } from './ingest/ingest.js';
 import { makeIngest } from './ingest/ingest.js';
@@ -12,6 +13,10 @@ export type ServerDeps = {
   db: Db;
   ingest?: IngestEntry;
   logger?: boolean;
+  /** JWT secret bytes. Required in production; defaults to a test-only value if omitted. */
+  secret?: Uint8Array;
+  /** Admin password. Required in production; defaults to '' if omitted. */
+  password?: string;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -55,7 +60,12 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
 
   app.get('/healthz', () => ({ ok: true }));
 
-  registerApiRoutes(app, deps.db);
+  const secret =
+    deps.secret ?? new TextEncoder().encode('test-secret-for-vitest-do-not-use-in-prod!!!');
+  const password = deps.password ?? '';
+
+  registerAuthRoutes(app, deps.db, secret, password);
+  registerApiRoutes(app, deps.db, secret);
 
   app.setErrorHandler((err: FastifyError, _req, reply) => {
     const status = err.statusCode ?? 500;

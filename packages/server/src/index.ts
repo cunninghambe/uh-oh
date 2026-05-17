@@ -1,5 +1,7 @@
 import { applyMigrations, openDb } from './db/index.js';
 import { buildServer } from './server.js';
+import { secretFromEnv } from './auth/jwt.js';
+import { cleanupExpiredSessions } from './db/repos/sessions.js';
 
 export { applyMigrations, openDb } from './db/index.js';
 export { buildServer } from './server.js';
@@ -14,6 +16,20 @@ export * from './ingest/rate-limit.js';
 const isMain = import.meta.url === `file://${process.argv[1] ?? ''}`;
 
 if (isMain) {
+  const password = process.env['UH_OH_ADMIN_PASSWORD'];
+  if (!password || password.length < 8) {
+    console.error('UH_OH_ADMIN_PASSWORD env var required (min 8 chars)');
+    process.exit(1);
+  }
+
+  let secret: Uint8Array;
+  try {
+    secret = secretFromEnv();
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+
   const dbPath = process.env['UH_OH_DB'] ?? './uh-oh.db';
   const port = Number(process.env['UH_OH_PORT'] ?? 3300);
   const host = process.env['UH_OH_HOST'] ?? '0.0.0.0';
@@ -21,7 +37,22 @@ if (isMain) {
   const { db } = openDb(dbPath);
   applyMigrations(db);
 
-  const app = buildServer({ db, logger: true });
+  const cleanupInterval = setInterval(
+    () => {
+      cleanupExpiredSessions(db, Date.now());
+    },
+    60 * 60 * 1000,
+  );
+
+  const app = buildServer({ db, logger: true, secret, password });
+
+  const shutdown = () => {
+    clearInterval(cleanupInterval);
+    process.exit(0);
+  };
+  process.on('SIGTERM', shutdown);
+  process.on('SIGINT', shutdown);
+
   app.listen({ port, host }).then(
     () => {
       app.log.info({ port, host, dbPath }, 'uh-oh server listening');
