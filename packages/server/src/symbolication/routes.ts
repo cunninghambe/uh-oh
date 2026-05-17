@@ -9,9 +9,10 @@ import {
   getReleaseById,
   listReleasesForProject,
   markMappingUploaded,
+  markSourcemapUploaded,
 } from '../db/repos/releases.js';
 import { getProjectById } from '../db/repos/projects.js';
-import { ensureSymbolsDir, mappingPath } from './storage.js';
+import { ensureSymbolsDir, mappingPath, sourcemapPath } from './storage.js';
 import { invalidateSymbolications } from './symbolicate.js';
 
 const MAX_SYMBOL_BYTES = 50 * 1024 * 1024; // 50 MB
@@ -61,13 +62,8 @@ export const registerSymbolizationRoutes = (
           : 'false';
       const isSourcemap = sourcemapStr === 'true';
 
-      if (isSourcemap) {
-        // TODO(7c): Hermes source-map upload handled in subtask 7c
-        return reply.code(400).send({ error: 'sourcemap_not_supported_yet' });
-      }
-
       await ensureSymbolsDir(release.id);
-      const dest = mappingPath(release.id);
+      const dest = isSourcemap ? sourcemapPath(release.id) : mappingPath(release.id);
       const tmp = dest + '.tmp';
 
       try {
@@ -81,7 +77,11 @@ export const registerSymbolizationRoutes = (
       }
 
       const now = Date.now();
-      markMappingUploaded(db, release.id, now);
+      if (isSourcemap) {
+        markSourcemapUploaded(db, release.id, now);
+      } else {
+        markMappingUploaded(db, release.id, now);
+      }
       invalidateSymbolications(db, release.id);
 
       const updated = getReleaseById(db, release.id);

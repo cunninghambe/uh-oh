@@ -6,12 +6,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
-import { upsertRelease } from '../db/repos/releases.js';
+import { upsertRelease, getReleaseById } from '../db/repos/releases.js';
 import { buildServer } from '../server.js';
 import { mintTestToken, TEST_SECRET } from '../auth/test-utils.js';
 import { upsertIssue } from '../db/repos/issues.js';
 import { insertEvent } from '../db/repos/events.js';
 import { symbolications } from '../db/schema.js';
+import { SourceMapGenerator } from 'source-map';
 
 const MAPPING_TXT = `com.example.Foo -> a.b:
     void bar() -> c
@@ -239,5 +240,131 @@ describe('GET /api/projects/:id/releases', () => {
     expect(res.statusCode).toBe(200);
     const body = res.json<{ releases: unknown[] }>();
     expect(body.releases).toHaveLength(2);
+  });
+});
+
+const buildSourceMapContent = (): string => {
+  const gen = new SourceMapGenerator({ file: 'index.android.bundle' });
+  gen.addMapping({
+    generated: { line: 1, column: 0 },
+    original: { line: 1, column: 0 },
+    source: 'orig.ts',
+  });
+  return gen.toString();
+};
+
+describe('POST /api/releases/:id/symbols?sourcemap=true', () => {
+  it('writes sourcemap.map and sets sourcemap_uploaded_at', async () => {
+    const project = createProject(db, { name: 'App' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const app = buildTestServer(db);
+    const mapContent = buildSourceMapContent();
+    const body = makeMultipartBody('index.android.bundle.map', mapContent, {
+      platform: 'android',
+      sourcemap: 'true',
+    });
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/releases/${release.id}/symbols`,
+      payload: body,
+      headers: {
+        'content-type': 'multipart/form-data; boundary=----TestBoundary1234',
+        ...authHeader(),
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    const json = res.json<{ release: { sourcemapUploadedAt: number } }>();
+    expect(json.release.sourcemapUploadedAt).toBeGreaterThan(0);
+
+    // Verify file written to disk
+    const filePath = path.join(tmpDir, release.id, 'sourcemap.map');
+    const content = await fs.readFile(filePath, 'utf8');
+    expect(content).toContain('orig.ts');
+  });
+
+  it('does not overwrite mapping_uploaded_at when sourcemap uploaded', async () => {
+    const project = createProject(db, { name: 'App2' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const app = buildTestServer(db);
+    const body = makeMultipartBody('index.android.bundle.map', buildSourceMapContent(), {
+      platform: 'android',
+      sourcemap: 'true',
+    });
+    await app.inject({
+      method: 'POST',
+      url: `/api/releases/${release.id}/symbols`,
+      payload: body,
+      headers: {
+        'content-type': 'multipart/form-data; boundary=----TestBoundary1234',
+        ...authHeader(),
+      },
+    });
+    const updated = getReleaseById(db, release.id);
+    expect(updated?.mappingUploadedAt).toBeNull();
+    expect(updated?.sourcemapUploadedAt).toBeGreaterThan(0);
+  });
+
+  it('invalidates cached symbolication rows on sourcemap upload', async () => {
+    const project = createProject(db, { name: 'App3' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const { issue } = upsertIssue(db, {
+      projectId: project.id,
+      fingerprint: 'fp-sm',
+      title: 't',
+      ts: Date.now(),
+    });
+    const event = insertEvent(db, {
+      projectId: project.id,
+      issueId: issue.id,
+      releaseId: release.id,
+      fingerprint: 'fp-sm',
+      level: 'error',
+      platform: 'android',
+      payload: '{}',
+      receivedAt: Date.now(),
+      deviceInfo: '{}',
+      userInfo: null,
+    });
+    db.insert(symbolications)
+      .values({
+        eventId: event.id,
+        frameIdx: 0,
+        resolved: JSON.stringify({ status: 'no_symbols' }),
+      })
+      .run();
+
+    expect(db.select().from(symbolications).all()).toHaveLength(1);
+
+    const app = buildTestServer(db);
+    const body = makeMultipartBody('index.android.bundle.map', buildSourceMapContent(), {
+      platform: 'android',
+      sourcemap: 'true',
+    });
+    await app.inject({
+      method: 'POST',
+      url: `/api/releases/${release.id}/symbols`,
+      payload: body,
+      headers: {
+        'content-type': 'multipart/form-data; boundary=----TestBoundary1234',
+        ...authHeader(),
+      },
+    });
+
+    expect(db.select().from(symbolications).all()).toHaveLength(0);
   });
 });

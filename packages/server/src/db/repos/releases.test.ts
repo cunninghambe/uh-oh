@@ -8,6 +8,7 @@ import {
   getReleaseById,
   listReleasesForProject,
   markMappingUploaded,
+  markSourcemapUploaded,
 } from './releases.js';
 
 let db: Db;
@@ -115,5 +116,34 @@ describe('markMappingUploaded', () => {
     markMappingUploaded(db, release.id, ts);
     const updated = getReleaseById(db, release.id);
     expect(updated?.mappingUploadedAt).toBe(ts);
+  });
+});
+
+describe('markSourcemapUploaded', () => {
+  it('sets sourcemap_uploaded_at on the release', () => {
+    const release = upsertRelease(db, {
+      projectId,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    expect(release.sourcemapUploadedAt).toBeNull();
+    const ts = Date.now();
+    markSourcemapUploaded(db, release.id, ts);
+    const updated = getReleaseById(db, release.id);
+    expect(updated?.sourcemapUploadedAt).toBe(ts);
+  });
+
+  it('does not affect mapping_uploaded_at', () => {
+    const release = upsertRelease(db, {
+      projectId,
+      version: '2.0.0',
+      build: '2',
+      platform: 'android',
+    });
+    markSourcemapUploaded(db, release.id, Date.now());
+    const updated = getReleaseById(db, release.id);
+    expect(updated?.mappingUploadedAt).toBeNull();
+    expect(updated?.sourcemapUploadedAt).toBeGreaterThan(0);
   });
 });

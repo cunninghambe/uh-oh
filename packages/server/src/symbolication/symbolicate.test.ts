@@ -2,14 +2,16 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { SourceMapGenerator } from 'source-map';
 
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
-import { upsertRelease, markMappingUploaded } from '../db/repos/releases.js';
+import { upsertRelease, markMappingUploaded, markSourcemapUploaded } from '../db/repos/releases.js';
 import { insertEvent } from '../db/repos/events.js';
 import { upsertIssue } from '../db/repos/issues.js';
-import { symbolicateEvent } from './symbolicate.js';
+import { symbolicateEvent, invalidateSymbolications } from './symbolicate.js';
+import { symbolications } from '../db/schema.js';
 
 const MAPPING_TXT = `
 com.example.MainActivity -> a.b:
@@ -178,5 +180,157 @@ describe('symbolicateEvent — JS frames', () => {
     const frames = await symbolicateEvent(db, event.id);
     expect(frames[0]?.status).toBe('ok');
     expect(frames[0]?.module).toBe('src/App.tsx');
+  });
+});
+
+const buildSourceMap = (
+  mapping: {
+    genLine: number;
+    genCol: number;
+    source: string;
+    origLine: number;
+    origCol: number;
+    name?: string;
+  }[],
+): string => {
+  const gen = new SourceMapGenerator({ file: 'index.android.bundle' });
+  for (const m of mapping) {
+    gen.addMapping({
+      generated: { line: m.genLine, column: m.genCol },
+      original: { line: m.origLine, column: m.origCol },
+      source: m.source,
+      ...(m.name !== undefined ? { name: m.name } : {}),
+    });
+  }
+  return gen.toString();
+};
+
+const seedEventForRelease = (db: Db, releaseId: string, frames: object[]) => {
+  const project = createProject(db, { name: 'JsApp' });
+  const { issue } = upsertIssue(db, {
+    projectId: project.id,
+    fingerprint: `fp-${Math.random()}`,
+    title: 'js crash',
+    ts: Date.now(),
+  });
+  return insertEvent(db, {
+    projectId: project.id,
+    issueId: issue.id,
+    releaseId,
+    fingerprint: 'fp1',
+    level: 'error',
+    platform: 'android',
+    payload: makePayload(frames),
+    receivedAt: Date.now(),
+    deviceInfo: '{}',
+    userInfo: null,
+  });
+};
+
+describe('symbolicateEvent — JS frames with sourcemap', () => {
+  const setupSourcemap = async (releaseId: string, raw: string) => {
+    const dir = path.join(tmpDir, releaseId);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'sourcemap.map'), raw);
+    markSourcemapUploaded(db, releaseId, Date.now());
+  };
+
+  it('resolves JS frame to original source when sourcemap uploaded', async () => {
+    const project = createProject(db, { name: 'JsApp2' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const raw = buildSourceMap([
+      { genLine: 1, genCol: 0, source: 'src/greet.ts', origLine: 3, origCol: 0, name: 'greet' },
+    ]);
+    await setupSourcemap(release.id, raw);
+    const event = seedEventForRelease(db, release.id, [
+      { filename: 'index.android.bundle', lineno: 1, colno: 0, inApp: true },
+    ]);
+    const frames = await symbolicateEvent(db, event.id);
+    expect(frames[0]?.status).toBe('ok');
+    expect(frames[0]?.filename).toBe('src/greet.ts');
+    expect(frames[0]?.lineno).toBe(3);
+  });
+
+  it('returns no_symbols for JS frame when release exists but no sourcemap uploaded', async () => {
+    const project = createProject(db, { name: 'JsApp3' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const event = seedEventForRelease(db, release.id, [
+      { filename: 'index.android.bundle', lineno: 1, colno: 0, inApp: true },
+    ]);
+    const frames = await symbolicateEvent(db, event.id);
+    expect(frames[0]?.status).toBe('no_symbols');
+  });
+
+  it('symbolicates mixed Java + JS frames correctly', async () => {
+    const project = createProject(db, { name: 'MixedApp' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const raw = buildSourceMap([
+      { genLine: 1, genCol: 0, source: 'App.ts', origLine: 10, origCol: 0 },
+    ]);
+    await setupSourcemap(release.id, raw);
+
+    const mappingTxt = `
+com.example.MainActivity -> a.b:
+    void onCreate(android.os.Bundle) -> c
+`;
+    const dir = path.join(tmpDir, release.id);
+    await fs.writeFile(path.join(dir, 'mapping.txt'), mappingTxt);
+    markMappingUploaded(db, release.id, Date.now());
+
+    const event = seedEventForRelease(db, release.id, [
+      { module: 'a.b', function: 'c', inApp: true },
+      { filename: 'index.android.bundle', lineno: 1, colno: 0, inApp: true },
+    ]);
+    const frames = await symbolicateEvent(db, event.id);
+    expect(frames[0]?.status).toBe('ok');
+    expect(frames[0]?.module).toBe('com.example.MainActivity');
+    expect(frames[1]?.status).toBe('ok');
+    expect(frames[1]?.filename).toBe('App.ts');
+  });
+
+  it('cached symbolications survive re-call and invalidation clears cache', async () => {
+    const project = createProject(db, { name: 'CacheApp' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const raw = buildSourceMap([
+      { genLine: 1, genCol: 0, source: 'cached.ts', origLine: 5, origCol: 0 },
+    ]);
+    await setupSourcemap(release.id, raw);
+    const event = seedEventForRelease(db, release.id, [
+      { filename: 'index.android.bundle', lineno: 1, colno: 0, inApp: true },
+    ]);
+
+    const first = await symbolicateEvent(db, event.id);
+    expect(first[0]?.status).toBe('ok');
+
+    // Remove the sourcemap file — second call should still hit DB cache
+    await fs.rm(path.join(tmpDir, release.id, 'sourcemap.map'));
+    const second = await symbolicateEvent(db, event.id);
+    expect(second[0]?.status).toBe('ok');
+    expect(second[0]?.filename).toBe(first[0]?.filename);
+
+    // Invalidate clears the DB cache rows
+    invalidateSymbolications(db, release.id);
+    const countAfter = db.select().from(symbolications).all().length;
+    expect(countAfter).toBe(0);
   });
 });

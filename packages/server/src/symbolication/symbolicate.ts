@@ -2,13 +2,15 @@ import fs from 'node:fs/promises';
 
 import { EventEnvelopeSchema, type StackFrame } from '@uh-oh/types';
 import { eq, inArray } from 'drizzle-orm';
+import type { BasicSourceMapConsumer, IndexedSourceMapConsumer } from 'source-map';
 
 import type { Db } from '../db/index.js';
 import { getEvent } from '../db/repos/events.js';
 import { getReleaseById } from '../db/repos/releases.js';
 import { events as eventsTable, symbolications } from '../db/schema.js';
-import { mappingPath } from './storage.js';
+import { mappingPath, sourcemapPath } from './storage.js';
 import { parseProguardMapping } from './proguard.js';
+import { getOrLoadCachedConsumer, invalidateCachedConsumer, resolveJsFrame } from './sourcemap.js';
 
 export type SymbolicationStatus = 'ok' | 'no_symbols' | 'unsymbolicated' | 'corrupt_mapping';
 
@@ -20,17 +22,22 @@ export type ResolvedFrame = {
   status: SymbolicationStatus;
 };
 
-// Android Java/Kotlin frames: module looks like a Java class name (dot-separated)
-const ANDROID_CLASS_RE = /^[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)+$/;
+type Consumer = BasicSourceMapConsumer | IndexedSourceMapConsumer;
 
-const isAndroidFrame = (module: string | undefined): boolean => {
-  if (!module) return false;
-  return ANDROID_CLASS_RE.test(module);
+const JS_EXTENSIONS_RE = /\.(js|jsx|ts|tsx)$/;
+const BUNDLE_NAME_RE = /^index\.android\.bundle$/;
+const REMOTE_URL_RE = /^https?:\/\//;
+
+const isJsFrame = (frame: StackFrame): boolean => {
+  const filename = frame.filename;
+  if (!filename) return false;
+  return (
+    JS_EXTENSIONS_RE.test(filename) || BUNDLE_NAME_RE.test(filename) || REMOTE_URL_RE.test(filename)
+  );
 };
 
 const loadCachedFrames = (db: Db, eventId: string): Map<number, ResolvedFrame> => {
   const rows = db.select().from(symbolications).where(eq(symbolications.eventId, eventId)).all();
-
   const cache = new Map<number, ResolvedFrame>();
   for (const row of rows) {
     cache.set(row.frameIdx, JSON.parse(row.resolved) as ResolvedFrame);
@@ -81,14 +88,59 @@ const buildAndroidFrame = (
   };
 };
 
-const buildJsFrame = (frame: StackFrame): ResolvedFrame => ({
-  // TODO(7c): Hermes source-map symbolication goes here
-  ...(frame.module !== undefined ? { module: frame.module } : {}),
-  ...(frame.function !== undefined ? { function: frame.function } : {}),
-  ...(frame.filename !== undefined ? { filename: frame.filename } : {}),
-  ...(frame.lineno !== undefined ? { lineno: frame.lineno } : {}),
-  status: 'ok',
-});
+// jsConsumerState:
+//   'none'        — no release linked, return frame as-is (ok, pass-through)
+//   'no_symbols'  — release exists but no sourcemap uploaded
+//   Consumer      — ready to resolve
+type JsConsumerState = 'none' | 'no_symbols' | Consumer;
+
+const buildJsFrame = (frame: StackFrame, consumerState: JsConsumerState): ResolvedFrame => {
+  if (consumerState === 'none') {
+    return {
+      ...(frame.module !== undefined ? { module: frame.module } : {}),
+      ...(frame.filename !== undefined ? { filename: frame.filename } : {}),
+      ...(frame.function !== undefined ? { function: frame.function } : {}),
+      ...(frame.lineno !== undefined ? { lineno: frame.lineno } : {}),
+      status: 'ok',
+    };
+  }
+  if (consumerState === 'no_symbols') {
+    return {
+      ...(frame.filename !== undefined ? { filename: frame.filename } : {}),
+      ...(frame.function !== undefined ? { function: frame.function } : {}),
+      status: 'no_symbols',
+    };
+  }
+  if (frame.lineno === undefined || frame.colno === undefined) {
+    return {
+      ...(frame.filename !== undefined ? { filename: frame.filename } : {}),
+      ...(frame.function !== undefined ? { function: frame.function } : {}),
+      status: 'unsymbolicated',
+    };
+  }
+  const pos = resolveJsFrame(consumerState, { line: frame.lineno, column: frame.colno });
+  if (pos.source === null && pos.line === null) {
+    return {
+      ...(frame.filename !== undefined ? { filename: frame.filename } : {}),
+      ...(frame.function !== undefined ? { function: frame.function } : {}),
+      status: 'unsymbolicated',
+    };
+  }
+  return {
+    ...(pos.source !== null
+      ? { filename: pos.source }
+      : frame.filename !== undefined
+        ? { filename: frame.filename }
+        : {}),
+    ...(pos.name !== null
+      ? { function: pos.name }
+      : frame.function !== undefined
+        ? { function: frame.function }
+        : {}),
+    ...(pos.line !== null ? { lineno: pos.line } : {}),
+    status: 'ok',
+  };
+};
 
 export const symbolicateEvent = async (db: Db, eventId: string): Promise<ResolvedFrame[]> => {
   const event = getEvent(db, eventId);
@@ -107,6 +159,7 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
 
   let proguardMapping: ReturnType<typeof parseProguardMapping> | null = null;
   let mappingCorrupt = false;
+  let jsConsumerState: JsConsumerState = 'none';
 
   if (event.releaseId) {
     const release = getReleaseById(db, event.releaseId);
@@ -117,6 +170,18 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
       } catch {
         mappingCorrupt = true;
       }
+    }
+    // Only set no_symbols when there IS a release but no sourcemap uploaded yet.
+    // When no release is attached, frames pass through with ok.
+    if (release?.sourcemapUploadedAt) {
+      try {
+        const raw = await fs.readFile(sourcemapPath(event.releaseId), 'utf8');
+        jsConsumerState = await getOrLoadCachedConsumer(event.releaseId, raw);
+      } catch {
+        // Corrupt or missing file — frames resolve as unsymbolicated (consumer remains 'none')
+      }
+    } else {
+      jsConsumerState = 'no_symbols';
     }
   }
 
@@ -135,9 +200,9 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
       continue;
     }
 
-    const resolved = isAndroidFrame(frame.module)
-      ? buildAndroidFrame(frame, proguardMapping, mappingCorrupt)
-      : buildJsFrame(frame);
+    const resolved = isJsFrame(frame)
+      ? buildJsFrame(frame, jsConsumerState)
+      : buildAndroidFrame(frame, proguardMapping, mappingCorrupt);
 
     persistFrame(db, eventId, i, resolved);
     results.push(resolved);
@@ -147,6 +212,8 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
 };
 
 export const invalidateSymbolications = (db: Db, releaseId: string): void => {
+  invalidateCachedConsumer(releaseId);
+
   const eventIds = db
     .select({ id: eventsTable.id })
     .from(eventsTable)
