@@ -1,0 +1,7 @@
+[Unit]
+Description=Daily uh-oh SQLite backup
+
+[Service]
+Type=oneshot
+User=uh-oh
+ExecStart=/opt/uh-oh/infra/backup.sh

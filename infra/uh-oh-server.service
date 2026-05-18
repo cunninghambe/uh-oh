@@ -1,0 +1,34 @@
+[Unit]
+Description=uh-oh crash reporting server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=uh-oh
+Group=uh-oh
+WorkingDirectory=/opt/uh-oh
+Environment=UH_OH_DB=/var/lib/uh-oh/uh-oh.db
+Environment=UH_OH_SYMBOLS_DIR=/var/lib/uh-oh/symbols
+Environment=UH_OH_PORT=3300
+Environment=UH_OH_HOST=127.0.0.1
+EnvironmentFile=/etc/uh-oh/server.env
+ExecStart=/usr/bin/node /opt/uh-oh/packages/server/dist/index.js
+Restart=on-failure
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/uh-oh
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target
