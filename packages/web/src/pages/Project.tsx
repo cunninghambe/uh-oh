@@ -34,12 +34,32 @@ export const Project = () => {
         <Link to="/" className="text-sm text-zinc-500 hover:text-zinc-300">
           ← Projects
         </Link>
-        <h1 className="text-2xl font-semibold mt-2">{project?.name ?? '…'}</h1>
-        {project && (
-          <div className="text-xs font-mono text-zinc-500 mt-1 break-all">
-            DSN base: /ingest/{project.publicKey}
+        <div className="flex items-center justify-between gap-4 mt-2">
+          <div>
+            <h1 className="text-2xl font-semibold">{project?.name ?? '…'}</h1>
+            {project && (
+              <div className="text-xs font-mono text-zinc-500 mt-1 break-all">
+                DSN base: /ingest/{project.publicKey}
+              </div>
+            )}
           </div>
-        )}
+          <div className="flex gap-2 shrink-0">
+            <Link
+              to="/projects/$projectId/releases"
+              params={{ projectId }}
+              className="rounded border border-zinc-700 px-3 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 hover:border-zinc-500"
+            >
+              Releases
+            </Link>
+            <Link
+              to="/projects/$projectId/settings"
+              params={{ projectId }}
+              className="rounded border border-zinc-700 px-3 py-1.5 text-xs text-zinc-400 hover:text-zinc-200 hover:border-zinc-500"
+            >
+              Settings
+            </Link>
+          </div>
+        </div>
       </div>
 
       {issuesQ.isLoading && <div className="text-zinc-500 text-sm">Loading issues…</div>}

@@ -24,6 +24,12 @@ export const registerApiRoutes = (app: FastifyInstance, db: Db, secret: Uint8Arr
 
   app.get('/api/projects', { preHandler }, () => ({ projects: listProjects(db) }));
 
+  app.get<{ Params: { id: string } }>('/api/projects/:id', { preHandler }, (req, reply) => {
+    const project = getProjectById(db, req.params.id);
+    if (!project) return reply.code(404).send({ error: 'not_found' });
+    return { project };
+  });
+
   app.post<{ Body: unknown }>('/api/projects', { preHandler }, (req, reply) => {
     const body = req.body;
     if (typeof body !== 'object' || body === null) {

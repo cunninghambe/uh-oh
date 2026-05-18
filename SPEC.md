@@ -492,7 +492,7 @@ Status legend: `[done]` `[next]` `[blocked]`.
 | 7c  | Hermes JS source-map symbolication                       | 3          | [done]                                       |
 | 8   | Dashboard shell                                          | —          | [done]                                       |
 | 9   | Dashboard: projects + issues list + issue detail         | 8          | [done]                                       |
-| 10  | Dashboard: login + settings + symbol upload UI           | 6, 7a, 7c  | [blocked]                                    |
+| 10  | Dashboard: login + settings + symbol upload UI           | 6, 7a, 7c  | [done]                                       |
 | 11  | SDK JS core (`@uh-oh/react-native`)                      | 2, 4       | [done]                                       |
 | 13  | SDK Android native module (xCrash + UEH)                 | 11         | [done] (on-device verification pending Brad) |
 | 14  | CLI (`@uh-oh/cli`)                                       | 6          | [blocked]                                    |

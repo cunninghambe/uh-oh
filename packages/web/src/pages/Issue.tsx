@@ -1,7 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Link, useParams } from '@tanstack/react-router';
 
-import { api, type Breadcrumb, type Issue as IssueT } from '../api.js';
+import { api, type Breadcrumb, type Issue as IssueT, type ResolvedFrame } from '../api.js';
 
 type StackFrame = {
   function?: string;
@@ -27,7 +27,42 @@ const parsePayload = (raw: string): Payload => {
   }
 };
 
-const renderFrame = (frame: StackFrame, idx: number) => {
+const STATUS_BADGE: Record<ResolvedFrame['status'], string> = {
+  ok: '',
+  no_symbols: '[no symbols]',
+  unsymbolicated: '[unsymbolicated]',
+  corrupt_mapping: '[corrupt mapping]',
+};
+
+const renderSymbolicatedFrame = (rawFrame: StackFrame, resolved: ResolvedFrame, idx: number) => {
+  const isOk = resolved.status === 'ok';
+  const fn = isOk ? (resolved.function ?? rawFrame.function ?? '?') : (rawFrame.function ?? '?');
+  const location = isOk
+    ? (resolved.filename ?? resolved.module ?? rawFrame.filename ?? rawFrame.module ?? '?')
+    : (rawFrame.filename ?? rawFrame.module ?? '?');
+  const line = isOk ? resolved.lineno : rawFrame.lineno;
+  const pos = line !== undefined ? `:${String(line)}` : '';
+  const badge = STATUS_BADGE[resolved.status];
+
+  return (
+    <div
+      key={idx}
+      className={`px-3 py-1.5 font-mono text-xs border-l-2 ${
+        rawFrame.inApp ? 'border-amber-500 bg-zinc-900' : 'border-transparent text-zinc-500'
+      }`}
+    >
+      <span className="text-zinc-300">{fn}</span>
+      <span className="text-zinc-500"> at </span>
+      <span className="text-zinc-400">
+        {location}
+        {pos}
+      </span>
+      {badge && <span className="ml-2 text-zinc-600 text-xs">{badge}</span>}
+    </div>
+  );
+};
+
+const renderRawFrame = (frame: StackFrame, idx: number) => {
   const where = frame.function ?? '?';
   const where2 = frame.module ?? frame.filename ?? '?';
   const pos = frame.lineno
@@ -57,6 +92,14 @@ export const Issue = () => {
     queryKey: ['issue', issueId],
     queryFn: () => api.getIssue(issueId),
   });
+
+  const latestEventId = issueQ.data?.latestEvent?.id ?? null;
+  const eventQ = useQuery({
+    queryKey: ['event', latestEventId, 'symbolicated'],
+    queryFn: () => api.getEvent(latestEventId!, { symbolicate: true }),
+    enabled: latestEventId !== null,
+  });
+
   const statusM = useMutation({
     mutationFn: (status: IssueT['status']) => api.setIssueStatus(issueId, status),
     onSuccess: () => {
@@ -71,7 +114,13 @@ export const Issue = () => {
 
   const { issue, latestEvent, breadcrumbs } = issueQ.data;
   const payload = latestEvent ? parsePayload(latestEvent.payload) : ({} as Payload);
-  const stack = payload.exception?.stacktrace ?? [];
+  const rawStack = payload.exception?.stacktrace ?? [];
+  const resolvedFrames = eventQ.data?.frames;
+
+  // Determine if any frames need symbols (so we can show the banner)
+  const hasNoSymbols =
+    resolvedFrames !== undefined &&
+    resolvedFrames.some((f) => f.status === 'no_symbols' || f.status === 'corrupt_mapping');
 
   return (
     <div className="max-w-5xl mx-auto space-y-6">
@@ -123,13 +172,31 @@ export const Issue = () => {
         </div>
       </div>
 
+      {hasNoSymbols && (
+        <div className="rounded border border-amber-700 bg-amber-950 px-4 py-3 text-xs text-amber-300">
+          Upload symbols for this release to see deobfuscated stack frames.{' '}
+          <Link
+            to="/projects/$projectId/releases"
+            params={{ projectId: issue.projectId }}
+            className="underline hover:text-amber-100"
+          >
+            Go to releases →
+          </Link>
+        </div>
+      )}
+
       <section>
         <h2 className="text-sm uppercase tracking-wide text-zinc-500 mb-2">Stack</h2>
-        {stack.length === 0 ? (
+        {rawStack.length === 0 ? (
           <div className="text-sm text-zinc-500">No stack frames.</div>
         ) : (
           <div className="rounded border border-zinc-800 overflow-hidden divide-y divide-zinc-800">
-            {stack.map(renderFrame)}
+            {rawStack.map((frame, idx) => {
+              const resolved = resolvedFrames?.[idx];
+              return resolved
+                ? renderSymbolicatedFrame(frame, resolved, idx)
+                : renderRawFrame(frame, idx);
+            })}
           </div>
         )}
       </section>
