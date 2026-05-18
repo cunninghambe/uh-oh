@@ -223,10 +223,74 @@ On systems where `systemd-analyze verify` is unavailable (e.g. older distros), r
 
 ---
 
-## What's Not Here (subtask 15b)
+---
 
-- nginx vhost configuration
-- TLS via Let's Encrypt / certbot
-- HTTPS smoke test
+## nginx + TLS (subtask 15b)
 
-Those are documented in `infra/` after subtask 15b ships.
+### Prerequisites
+
+- DNS: create an A record pointing `<domain>` to the server's public IP.
+  Verify propagation before running the script:
+  ```bash
+  dig +short <domain>
+  # Should return the server IP
+  ```
+- Ports 80 and 443 must be open — `ufw.sh` already opens them.
+- `uh-oh-server.service` must be running (`setup-server.sh` run first).
+
+### Install nginx + issue TLS certificate
+
+```bash
+bash /opt/uh-oh/infra/setup-tls.sh errors.example.com you@example.com
+```
+
+The script:
+
+1. Installs `nginx`, `certbot`, and `python3-certbot-nginx` via apt.
+2. Creates `/var/www/letsencrypt` for ACME HTTP-01 challenges.
+3. Deploys a temporary HTTP-only vhost so certbot can complete the challenge.
+4. Runs `certbot certonly --webroot` to issue the certificate.
+5. Installs the real TLS vhost (`infra/nginx/uh-oh.conf` with `UH_OH_DOMAIN` replaced).
+6. Enables `certbot.timer` for automatic renewal.
+
+The script is idempotent — safe to re-run if the cert already exists (certbot will skip re-issuance).
+
+### Verify
+
+```bash
+# Health check over HTTPS
+curl -I https://errors.example.com/healthz
+# Expected: HTTP/2 200
+
+# TLS grade (optional)
+curl -s https://api.ssllabs.com/api/v3/analyze?host=errors.example.com | jq '.status'
+```
+
+### Cert renewal
+
+Renewal is handled automatically by `certbot.timer` (installed by the certbot package).
+
+```bash
+# Confirm the timer is active
+systemctl list-timers | grep certbot
+
+# Test a dry-run renewal
+certbot renew --dry-run
+```
+
+Nginx reloads automatically on renewal via the certbot systemd hook installed by `python3-certbot-nginx`.
+
+### vhost details
+
+`infra/nginx/uh-oh.conf` configures:
+
+- HTTP → HTTPS redirect (301).
+- TLS 1.3 + 1.2 only (`ssl_protocols TLSv1.3 TLSv1.2`).
+- Security headers: HSTS (2 years), X-Frame-Options DENY, X-Content-Type-Options nosniff, Referrer-Policy strict-origin-when-cross-origin, Content-Security-Policy.
+- Dashboard SPA served from `/opt/uh-oh/packages/web/dist/` with SPA fallback (`try_files $uri $uri/ /index.html`).
+- `/assets/` long-cache (1 year, `Cache-Control: public, immutable`).
+- `/api/` and `/ingest/` reverse-proxied to `127.0.0.1:3300`.
+- `/healthz` proxied, access log suppressed.
+- `/metrics` restricted to `127.0.0.1` (deny all external access).
+- `client_max_body_size 50m` for symbol file uploads.
+- gzip for `text/plain`, `text/css`, `text/javascript`, `application/javascript`, `application/json`, `image/svg+xml`.

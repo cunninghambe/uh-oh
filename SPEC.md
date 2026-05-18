@@ -497,7 +497,7 @@ Status legend: `[done]` `[next]` `[blocked]`.
 | 13  | SDK Android native module (xCrash + UEH)                 | 11         | [done] (on-device verification pending Brad) |
 | 14  | CLI (`@uh-oh/cli`)                                       | 6          | [done]                                       |
 | 15a | Deploy: systemd + UFW + daily backup                     | 6, 16      | [done]                                       |
-| 15b | Deploy: nginx vhost + TLS via certbot                    | 15a        | [blocked]                                    |
+| 15b | Deploy: nginx vhost + TLS via certbot                    | 15a        | [done]                                       |
 | 16  | Hardening: per-IP rate limit, payload caps, metrics, CSP | 6          | [done]                                       |
 
 Subtask numbers 7b (iOS dSYM) and 12 (iOS native) are intentionally omitted — iOS is out of scope.
