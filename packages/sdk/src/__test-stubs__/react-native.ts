@@ -22,4 +22,25 @@ export const Platform = {
   OS: 'android' as 'android' | 'ios',
 };
 
-export const NativeModules: Record<string, unknown> = {};
+type UhOhNativeStub = {
+  install: (config: { debug: boolean }) => Promise<boolean>;
+  getPendingReports: () => Promise<unknown[]>;
+};
+
+const uhOhNativeStub: UhOhNativeStub = {
+  install: (_config) => Promise.resolve(true),
+  getPendingReports: () => Promise.resolve([]),
+};
+
+export const NativeModules: Record<string, unknown> = {
+  UhOhNative: uhOhNativeStub,
+};
+
+/** Exposed so tests can override NativeModules.UhOhNative per-test. */
+export function setUhOhNativeStub(stub: Partial<UhOhNativeStub> | null): void {
+  if (stub === null) {
+    delete NativeModules['UhOhNative'];
+  } else {
+    NativeModules['UhOhNative'] = { ...uhOhNativeStub, ...stub };
+  }
+}

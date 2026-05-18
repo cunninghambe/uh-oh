@@ -1,0 +1,19 @@
+apply plugin: 'com.android.library'
+
+android {
+    namespace 'com.uhoh'
+    compileSdk 34
+    defaultConfig {
+        minSdk 21
+        targetSdk 34
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation 'com.facebook.react:react-android:0.74.+'
+    implementation 'com.iqiyi.xcrash:xcrash-android-lib:3.1.0'
+}

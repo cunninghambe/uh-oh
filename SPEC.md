@@ -480,25 +480,25 @@ Implementation: `commander` for parsing, `node:fs` for file reads, `FormData` + 
 
 Status legend: `[done]` `[next]` `[blocked]`.
 
-| #   | Subtask                                                  | Depends on | Status    |
-| --- | -------------------------------------------------------- | ---------- | --------- |
-| 1   | Repo + monorepo scaffolding                              | —          | [done]    |
-| 2   | `@uh-oh/types` Zod schemas                               | 1          | [done]    |
-| 3   | Server DB layer (Drizzle schema + repos)                 | 1, 2       | [done]    |
-| 4   | Server ingest endpoint                                   | 3          | [done]    |
-| 5   | Server webhook dispatcher                                | 3, 4       | [done]    |
-| 6   | Server auth + JWT middleware (retrofit /api/\*)          | 3, 4       | [done]    |
-| 7a  | Android ProGuard symbolication                           | 3          | [done]    |
-| 7c  | Hermes JS source-map symbolication                       | 3          | [done]    |
-| 8   | Dashboard shell                                          | —          | [done]    |
-| 9   | Dashboard: projects + issues list + issue detail         | 8          | [done]    |
-| 10  | Dashboard: login + settings + symbol upload UI           | 6, 7a, 7c  | [blocked] |
-| 11  | SDK JS core (`@uh-oh/react-native`)                      | 2, 4       | [done]    |
-| 13  | SDK Android native module (xCrash + UEH)                 | 11         | [blocked] |
-| 14  | CLI (`@uh-oh/cli`)                                       | 6          | [blocked] |
-| 15a | Deploy: systemd + UFW + daily backup                     | 6, 16      | [blocked] |
-| 15b | Deploy: nginx vhost + TLS via certbot                    | 15a        | [blocked] |
-| 16  | Hardening: per-IP rate limit, payload caps, metrics, CSP | 6          | [done]    |
+| #   | Subtask                                                  | Depends on | Status                                       |
+| --- | -------------------------------------------------------- | ---------- | -------------------------------------------- |
+| 1   | Repo + monorepo scaffolding                              | —          | [done]                                       |
+| 2   | `@uh-oh/types` Zod schemas                               | 1          | [done]                                       |
+| 3   | Server DB layer (Drizzle schema + repos)                 | 1, 2       | [done]                                       |
+| 4   | Server ingest endpoint                                   | 3          | [done]                                       |
+| 5   | Server webhook dispatcher                                | 3, 4       | [done]                                       |
+| 6   | Server auth + JWT middleware (retrofit /api/\*)          | 3, 4       | [done]                                       |
+| 7a  | Android ProGuard symbolication                           | 3          | [done]                                       |
+| 7c  | Hermes JS source-map symbolication                       | 3          | [done]                                       |
+| 8   | Dashboard shell                                          | —          | [done]                                       |
+| 9   | Dashboard: projects + issues list + issue detail         | 8          | [done]                                       |
+| 10  | Dashboard: login + settings + symbol upload UI           | 6, 7a, 7c  | [blocked]                                    |
+| 11  | SDK JS core (`@uh-oh/react-native`)                      | 2, 4       | [done]                                       |
+| 13  | SDK Android native module (xCrash + UEH)                 | 11         | [done] (on-device verification pending Brad) |
+| 14  | CLI (`@uh-oh/cli`)                                       | 6          | [blocked]                                    |
+| 15a | Deploy: systemd + UFW + daily backup                     | 6, 16      | [blocked]                                    |
+| 15b | Deploy: nginx vhost + TLS via certbot                    | 15a        | [blocked]                                    |
+| 16  | Hardening: per-IP rate limit, payload caps, metrics, CSP | 6          | [done]                                       |
 
 Subtask numbers 7b (iOS dSYM) and 12 (iOS native) are intentionally omitted — iOS is out of scope.
 

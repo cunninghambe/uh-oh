@@ -6,6 +6,7 @@ import { sendEvent } from './transport.js';
 import { parseDsn, type Dsn } from './dsn.js';
 import { platform } from './platform.js';
 import { installGlobalErrorHandler, installPromiseRejectionHandler } from './handlers.js';
+import { nativeBridge } from './native-bridge.js';
 
 export type InitOptions = {
   dsn: string;
@@ -126,7 +127,24 @@ export class Client {
       installPromiseRejectionHandler((reason) => capture(reason, 'js-promise')),
     );
 
-    void this._drain();
+    if (this.opts.enableNative !== false) {
+      void this._installNativeAndDrainPending();
+    } else {
+      void this._drain();
+    }
+  }
+
+  private async _installNativeAndDrainPending(): Promise<void> {
+    const bridge = nativeBridge();
+    if (bridge) {
+      await bridge.install({ debug: this.opts.debug ?? false });
+      const reports = await bridge.getPendingReports();
+      for (const r of reports) {
+        const fullEnv = this._buildEnvelopeFromPartial(r);
+        await this.spool.enqueue(fullEnv);
+      }
+    }
+    await this._drain();
   }
 
   stop(): void {
@@ -209,6 +227,40 @@ export class Client {
       if (result === null) return null;
       return result;
     }
+
+    return env;
+  }
+
+  /**
+   * Builds a full EventEnvelope from a partial report written by the native
+   * crash handler. The native side provides exception, timestamp, and device;
+   * this method fills in sdk, release, platform, level, breadcrumbs, and scope.
+   */
+  private _buildEnvelopeFromPartial(partial: Partial<EventEnvelope>): EventEnvelope {
+    const snap = this.scope.snapshot();
+    const { version, build } = parseRelease(this.opts.release);
+    const mergedTags = { ...(snap.tags ?? {}), ...(partial.tags ?? {}) };
+    const mergedContext = { ...(snap.context ?? {}), ...(partial.context ?? {}) };
+
+    const env: EventEnvelope = {
+      sdk: { name: '@uh-oh/react-native', version: '0.0.1' },
+      timestamp: partial.timestamp ?? new Date().toISOString(),
+      platform: 'android',
+      release: { version, build },
+      level: partial.level ?? 'fatal',
+      exception: partial.exception ?? {
+        type: 'UnknownNativeCrash',
+        value: '',
+        stacktrace: [],
+        mechanism: 'android-java-ueh',
+      },
+      breadcrumbs: [],
+      device: partial.device ?? { osName: 'Android', osVersion: 'unknown' },
+      ...(snap.user !== undefined ? { user: snap.user } : {}),
+      ...(Object.keys(mergedTags).length > 0 ? { tags: mergedTags } : {}),
+      ...(Object.keys(mergedContext).length > 0 ? { context: mergedContext } : {}),
+      ...(snap.fingerprint !== undefined ? { fingerprint: snap.fingerprint } : {}),
+    };
 
     return env;
   }
