@@ -495,7 +495,7 @@ Status legend: `[done]` `[next]` `[blocked]`.
 | 10  | Dashboard: login + settings + symbol upload UI           | 6, 7a, 7c  | [done]                                       |
 | 11  | SDK JS core (`@uh-oh/react-native`)                      | 2, 4       | [done]                                       |
 | 13  | SDK Android native module (xCrash + UEH)                 | 11         | [done] (on-device verification pending Brad) |
-| 14  | CLI (`@uh-oh/cli`)                                       | 6          | [blocked]                                    |
+| 14  | CLI (`@uh-oh/cli`)                                       | 6          | [done]                                       |
 | 15a | Deploy: systemd + UFW + daily backup                     | 6, 16      | [blocked]                                    |
 | 15b | Deploy: nginx vhost + TLS via certbot                    | 15a        | [blocked]                                    |
 | 16  | Hardening: per-IP rate limit, payload caps, metrics, CSP | 6          | [done]                                       |

@@ -1,0 +1,22 @@
+{
+  "name": "@uh-oh/cli",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "uh-oh": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "commander": "12.1.0"
+  },
+  "devDependencies": {
+    "tsx": "4.22.0",
+    "vitest": "4.1.6"
+  }
+}
