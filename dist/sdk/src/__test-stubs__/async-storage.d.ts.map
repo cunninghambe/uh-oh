@@ -1,0 +1,1 @@
+{"version":3,"file":"async-storage.d.ts","sourceRoot":"","sources":["../../../../src/__test-stubs__/async-storage.ts"],"names":[],"mappings":"AAKA,QAAA,MAAM,YAAY;iBACH,MAAM,GAAG,OAAO,CAAC,MAAM,GAAG,IAAI,CAAC;iBAG/B,MAAM,SAAS,MAAM,GAAG,OAAO,CAAC,IAAI,CAAC;oBAIlC,MAAM,GAAG,OAAO,CAAC,IAAI,CAAC;cAI5B,IAAI;CAGf,CAAC;AAEF,eAAe,YAAY,CAAC"}
