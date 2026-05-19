@@ -1,4 +1,4 @@
-import { timingSafeEqual } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
@@ -41,9 +41,8 @@ export const registerAuthRoutes = (
         return reply.code(400).send({ error: 'invalid_body' });
       }
 
-      const a = Buffer.from(submitted.padEnd(password.length));
-      const b = Buffer.from(password);
-      const match = submitted.length === password.length && timingSafeEqual(a, b);
+      const sha = (s: string) => createHash('sha256').update(s, 'utf8').digest();
+      const match = timingSafeEqual(sha(submitted), sha(password));
 
       if (!match) {
         return reply.code(401).send({ error: 'invalid_credentials' });

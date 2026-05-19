@@ -62,6 +62,29 @@ describe('POST /api/auth/login', () => {
     expect(res.statusCode).toBe(400);
   });
 
+  it('password longer than configured → 401, not 500', async () => {
+    const app = buildTestServer(db);
+    const longPassword = 'x'.repeat(5000);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { password: longPassword },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(res.json<{ error: string }>().error).toBe('invalid_credentials');
+  });
+
+  it('empty string password → 401', async () => {
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { password: '' },
+    });
+    expect(res.statusCode).toBe(401);
+    expect(res.json<{ error: string }>().error).toBe('invalid_credentials');
+  });
+
   it('11th login from same IP within rate window → 429', async () => {
     const app = buildTestServer(db);
     // Each request from same IP with a mocked recent timestamp

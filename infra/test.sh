@@ -9,6 +9,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 shellcheck "$SCRIPT_DIR/backup.sh" \
            "$SCRIPT_DIR/ufw.sh" \
            "$SCRIPT_DIR/setup-server.sh" \
+           "$SCRIPT_DIR/setup-tls.sh" \
            "$SCRIPT_DIR/test.sh"
 
 echo "shellcheck: all infra/*.sh clean"

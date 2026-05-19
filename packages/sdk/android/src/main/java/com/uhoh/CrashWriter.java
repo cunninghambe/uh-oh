@@ -50,18 +50,40 @@ public final class CrashWriter {
     }
 
     /**
-     * Writes an xCrash tombstone-path report to disk (NDK signal or ANR).
-     * The JS layer will read the tombstone path and construct the full envelope.
+     * Writes a full xCrash report to disk (NDK signal or ANR).
+     *
+     * <p>Reads and parses the tombstone file on-device so the JS layer receives a
+     * structured exception with signal, cause, and parsed backtrace frames.
+     * The raw tombstone path is preserved in {@code context.xcrash_tombstone_path}
+     * so developers can inspect the original file.
+     *
+     * @param mechanism     {@code "android-ndk-signal"} or {@code "android-anr"}
+     * @param tombstonePath absolute path to the xCrash-written tombstone file
+     * @param tombstoneContents full text content of the tombstone file
      */
-    public static File writeXCrashReport(Context context, String mechanism, String tombstonePath) {
+    public static File writeXCrashReport(
+            Context context,
+            String mechanism,
+            String tombstonePath,
+            String tombstoneContents) {
         try {
+            TombstoneParser.ParsedTombstone parsed = TombstoneParser.parse(tombstoneContents);
+
+            JSONObject exception = new JSONObject();
+            exception.put("type", parsed.signal.isEmpty() ? mechanism : parsed.signal);
+            exception.put("value", parsed.cause.isEmpty() ? parsed.signal : parsed.cause);
+            exception.put("mechanism", mechanism);
+            exception.put("stacktrace", buildNativeStacktrace(parsed.frames));
+
+            JSONObject ctx = new JSONObject();
+            ctx.put("xcrash_tombstone_path", tombstonePath);
+
             JSONObject report = new JSONObject();
             report.put("mechanism", mechanism);
             report.put("timestamp", isoNow());
-            report.put("xcrash_tombstone", tombstonePath);
-
-            JSONObject device = buildDeviceInfo();
-            report.put("device", device);
+            report.put("exception", exception);
+            report.put("context", ctx);
+            report.put("device", buildDeviceInfo());
 
             return writeReport(context, report);
         } catch (Exception ignored) {
@@ -104,6 +126,20 @@ public final class CrashWriter {
             frames.put(frame);
         }
         return frames;
+    }
+
+    private static JSONArray buildNativeStacktrace(java.util.List<TombstoneParser.NativeFrame> frames)
+            throws Exception {
+        JSONArray arr = new JSONArray();
+        for (TombstoneParser.NativeFrame frame : frames) {
+            JSONObject f = new JSONObject();
+            f.put("instructionAddr", frame.instructionAddr);
+            f.put("module", frame.module);
+            f.put("function", frame.function);
+            f.put("inApp", frame.inApp);
+            arr.put(f);
+        }
+        return arr;
     }
 
     private static boolean isInApp(String className) {

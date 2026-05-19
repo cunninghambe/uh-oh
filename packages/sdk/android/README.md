@@ -92,9 +92,11 @@ call and flushed to the server.
    handler** so the app crashes naturally (stack trace still appears in
    logcat / Play Console).
 
-2. **xCrash** — captures NDK signal crashes and ANRs. Its callback writes a
-   "tombstone path" JSON stub to the same pending directory. The JS layer
-   reads this stub and includes the tombstone path in the event payload.
+2. **xCrash** — captures NDK signal crashes and ANRs. Its callback reads the
+   xCrash tombstone file on-device and parses the backtrace into a full event
+   with signal type, cause, and structured native stack frames. The raw tombstone
+   path is preserved in `context.xcrash_tombstone_path` for manual inspection.
+   The parsed event JSON is written to the same pending directory.
 
 3. **On next launch** — `getPendingReports()` scans `<cacheDir>/uh-oh/pending/`,
    reads each file, deletes it, and returns the payloads to JS, which builds
