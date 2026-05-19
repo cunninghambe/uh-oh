@@ -6,6 +6,19 @@ app cache directory and drained on the next JS launch.
 
 ---
 
+## Requirements
+
+- React Native **0.77+** (the SDK depends on `com.facebook.react:react-android:0.77.+`, which is the first version published to Maven Central that the SDK has been verified against).
+- AndroidX must be enabled in your app's root `gradle.properties`:
+
+  ```
+  android.useAndroidX=true
+  ```
+
+  This is the default for all RN 0.71+ apps, so most consumers won't need to add it.
+
+- Android `compileSdk` 34+ and Java 17 in your app's `build.gradle`.
+
 ## Installation
 
 ### 1. Link the Gradle module
