@@ -6,7 +6,6 @@ import { takeDueDispatches, markDispatchAttempt } from '../db/repos/webhook-disp
 import { metrics } from '../metrics/registry.js';
 
 const BACKOFF_MS = [2000, 8000, 32000] as const;
-const MAX_ATTEMPTS = 3;
 const FETCH_TIMEOUT_MS = 5000;
 const DASHBOARD_URL = process.env['UH_OH_DASHBOARD_URL'] ?? '';
 
@@ -94,9 +93,7 @@ const dispatchOne = async (
   }
 
   const nextAttemptAt =
-    dispatch.attempt < MAX_ATTEMPTS - 1
-      ? now + (BACKOFF_MS[dispatch.attempt] ?? BACKOFF_MS[BACKOFF_MS.length - 1]!)
-      : null;
+    dispatch.attempt < BACKOFF_MS.length ? now + BACKOFF_MS[dispatch.attempt]! : null;
 
   if (nextAttemptAt === null) {
     metrics.webhookFailures.inc();

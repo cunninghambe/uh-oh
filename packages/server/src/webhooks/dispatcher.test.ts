@@ -86,7 +86,6 @@ describe('startDispatcher', () => {
     expect(fetchFn).toHaveBeenCalledTimes(1);
 
     // After first failure, nextAttemptAt = NOW + 2000
-    // Advance time past it
     currentNow = NOW + 2000;
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
     expect(fetchFn).toHaveBeenCalledTimes(2);
@@ -96,10 +95,15 @@ describe('startDispatcher', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
     expect(fetchFn).toHaveBeenCalledTimes(3);
 
+    // After third failure, nextAttemptAt = (NOW+2000+8000) + 32000
+    currentNow = NOW + 2000 + 8000 + 32000;
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    expect(fetchFn).toHaveBeenCalledTimes(4);
+
     await handle.stop();
   });
 
-  it('gives up after 3 attempts and marks failed', async () => {
+  it('gives up after 4 attempts (initial + 3 retries at 2s/8s/32s) and marks failed', async () => {
     enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);
 
     const fetchFn = vi.fn().mockResolvedValue({ ok: false, status: 503 });
@@ -112,27 +116,30 @@ describe('startDispatcher', () => {
       pollIntervalMs: 10,
     });
 
-    // Attempt 1
+    // Attempt 1 (initial)
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
     currentNow = NOW + 2000;
-    // Attempt 2
+    // Attempt 2 (retry 1 at +2s)
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
-    currentNow = NOW + 10000;
-    // Attempt 3
+    currentNow = NOW + 2000 + 8000;
+    // Attempt 3 (retry 2 at +8s)
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
-    // Advance far beyond last backoff — no more retries
-    currentNow = NOW + 99999;
+    currentNow = NOW + 2000 + 8000 + 32000;
+    // Attempt 4 (retry 3 at +32s)
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    // Advance far beyond — no more retries
+    currentNow = NOW + 999999;
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
     await handle.stop();
 
-    expect(fetchFn).toHaveBeenCalledTimes(3);
+    expect(fetchFn).toHaveBeenCalledTimes(4);
     // Row should be failed (no pending rows)
     const due = takeDueDispatches(db, NOW + 999999, 10);
     expect(due).toHaveLength(0);
   });
 
-  it('treats network error same as non-2xx', async () => {
+  it('treats network error same as non-2xx (4 total attempts)', async () => {
     enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);
 
     const fetchFn = vi.fn().mockRejectedValue(new Error('ECONNREFUSED'));
@@ -145,18 +152,23 @@ describe('startDispatcher', () => {
       pollIntervalMs: 10,
     });
 
-    // Attempt 1
+    // Attempt 1 (initial)
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
     currentNow = NOW + 2000;
+    // Attempt 2
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
-    currentNow = NOW + 10000;
+    currentNow = NOW + 2000 + 8000;
+    // Attempt 3
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
-    currentNow = NOW + 99999;
+    currentNow = NOW + 2000 + 8000 + 32000;
+    // Attempt 4
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+    currentNow = NOW + 999999;
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
 
     await handle.stop();
 
-    expect(fetchFn).toHaveBeenCalledTimes(3);
+    expect(fetchFn).toHaveBeenCalledTimes(4);
     const due = takeDueDispatches(db, NOW + 999999, 10);
     expect(due).toHaveLength(0);
   });

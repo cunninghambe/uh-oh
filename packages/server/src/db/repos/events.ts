@@ -1,4 +1,4 @@
-import { desc, eq } from 'drizzle-orm';
+import { desc, eq, sql } from 'drizzle-orm';
 
 import type { DbOrTx } from '../index.js';
 import { newId } from '../ids.js';
@@ -20,8 +20,8 @@ export const listEventsForIssue = (
   db: DbOrTx,
   issueId: string,
   opts: { limit?: number; offset?: number } = {},
-): EventRow[] =>
-  db
+): { rows: EventRow[]; total: number } => {
+  const rows = db
     .select()
     .from(events)
     .where(eq(events.issueId, issueId))
@@ -29,6 +29,13 @@ export const listEventsForIssue = (
     .limit(opts.limit ?? 50)
     .offset(opts.offset ?? 0)
     .all();
+  const totalRow = db
+    .select({ n: sql<number>`count(*)` })
+    .from(events)
+    .where(eq(events.issueId, issueId))
+    .get();
+  return { rows, total: totalRow?.n ?? 0 };
+};
 
 export const getLatestEventForIssue = (db: DbOrTx, issueId: string): EventRow | null =>
   db

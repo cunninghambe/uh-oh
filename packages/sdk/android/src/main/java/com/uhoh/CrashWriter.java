@@ -117,8 +117,8 @@ public final class CrashWriter {
         JSONObject device = new JSONObject();
         device.put("osName", "Android");
         device.put("osVersion", Build.VERSION.RELEASE);
-        device.put("manufacturer", Build.MANUFACTURER);
-        device.put("model", Build.MODEL);
+        device.put("deviceManufacturer", Build.MANUFACTURER);
+        device.put("deviceModel", Build.MODEL);
         device.put("sdkInt", Build.VERSION.SDK_INT);
         return device;
     }

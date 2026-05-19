@@ -2,9 +2,10 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 import { getEvent, getLatestEventForIssue, listEventsForIssue } from '../db/repos/events.js';
 import { listBreadcrumbs } from '../db/repos/breadcrumbs.js';
-import { getIssue, listIssues, setIssueStatus } from '../db/repos/issues.js';
+import { getIssue, listIssues, setIssueStatus, type IssueSort } from '../db/repos/issues.js';
 import {
   createProject,
+  deleteProject,
   getProjectById,
   listProjects,
   rotateProjectPublicKey,
@@ -17,6 +18,10 @@ import { symbolicateEvent } from '../symbolication/symbolicate.js';
 type IssueStatusInput = 'open' | 'resolved' | 'ignored';
 const isStatus = (s: unknown): s is IssueStatusInput =>
   s === 'open' || s === 'resolved' || s === 'ignored';
+
+const VALID_SORTS = new Set<IssueSort>(['lastSeen', 'eventCount', 'firstSeen']);
+const isSort = (s: unknown): s is IssueSort =>
+  typeof s === 'string' && VALID_SORTS.has(s as IssueSort);
 
 export const registerApiRoutes = (app: FastifyInstance, db: Db, secret: Uint8Array): void => {
   const auth = buildAuthMiddleware({ db, secret });
@@ -84,6 +89,12 @@ export const registerApiRoutes = (app: FastifyInstance, db: Db, secret: Uint8Arr
     },
   );
 
+  app.delete<{ Params: { id: string } }>('/api/projects/:id', { preHandler }, (req, reply) => {
+    const deleted = deleteProject(db, req.params.id);
+    if (!deleted) return reply.code(404).send({ error: 'not_found' });
+    return reply.code(204).send();
+  });
+
   app.post<{ Params: { id: string } }>(
     '/api/projects/:id/rotate-key',
     { preHandler },
@@ -96,16 +107,21 @@ export const registerApiRoutes = (app: FastifyInstance, db: Db, secret: Uint8Arr
 
   app.get<{
     Params: { id: string };
-    Querystring: { status?: string; limit?: string; offset?: string };
+    Querystring: { status?: string; sort?: string; limit?: string; offset?: string };
   }>('/api/projects/:id/issues', { preHandler }, (req, reply) => {
     const project = getProjectById(db, req.params.id);
     if (!project) return reply.code(404).send({ error: 'project_not_found' });
     const status = isStatus(req.query.status) ? req.query.status : undefined;
     const limit = req.query.limit ? Math.max(1, Math.min(200, Number(req.query.limit))) : 50;
     const offset = req.query.offset ? Math.max(0, Number(req.query.offset)) : 0;
+    if (req.query.sort !== undefined && !isSort(req.query.sort)) {
+      return reply.code(400).send({ error: 'invalid_sort' });
+    }
+    const sort = isSort(req.query.sort) ? req.query.sort : undefined;
     const result = listIssues(db, {
       projectId: project.id,
       ...(status ? { status } : {}),
+      ...(sort ? { sort } : {}),
       limit,
       offset,
     });
@@ -140,8 +156,8 @@ export const registerApiRoutes = (app: FastifyInstance, db: Db, secret: Uint8Arr
     if (!issue) return reply.code(404).send({ error: 'not_found' });
     const limit = req.query.limit ? Math.max(1, Math.min(200, Number(req.query.limit))) : 50;
     const offset = req.query.offset ? Math.max(0, Number(req.query.offset)) : 0;
-    const events = listEventsForIssue(db, issue.id, { limit, offset });
-    return { events };
+    const { rows, total } = listEventsForIssue(db, issue.id, { limit, offset });
+    return { events: rows, total };
   });
 
   app.get<{ Params: { id: string }; Querystring: { symbolicate?: string } }>(

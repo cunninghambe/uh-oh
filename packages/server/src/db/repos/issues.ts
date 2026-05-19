@@ -1,4 +1,4 @@
-import { and, desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, sql, asc } from 'drizzle-orm';
 
 import type { DbOrTx } from '../index.js';
 import { newId } from '../ids.js';
@@ -44,11 +44,20 @@ export const upsertIssue = (
   return { issue: row, isNew: true };
 };
 
+export type IssueSort = 'lastSeen' | 'eventCount' | 'firstSeen';
+
+const sortColumn = (sort: IssueSort) => {
+  if (sort === 'eventCount') return desc(issues.eventCount);
+  if (sort === 'firstSeen') return asc(issues.firstSeen);
+  return desc(issues.lastSeen);
+};
+
 export const listIssues = (
   db: DbOrTx,
   input: {
     projectId: string;
     status?: IssueStatus;
+    sort?: IssueSort;
     limit?: number;
     offset?: number;
   },
@@ -63,7 +72,7 @@ export const listIssues = (
     .select()
     .from(issues)
     .where(where)
-    .orderBy(desc(issues.lastSeen))
+    .orderBy(sortColumn(input.sort ?? 'lastSeen'))
     .limit(limit)
     .offset(offset)
     .all();

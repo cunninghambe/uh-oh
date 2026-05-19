@@ -78,7 +78,7 @@ describe('ingest()', () => {
     expect(first.issueId).toBe(second.issueId);
     const issue = getIssue(db, first.issueId);
     expect(issue?.eventCount).toBe(2);
-    expect(listEventsForIssue(db, first.issueId)).toHaveLength(2);
+    expect(listEventsForIssue(db, first.issueId).rows).toHaveLength(2);
   });
 
   it('rate-limited extra events bump count but skip event row', () => {
@@ -101,7 +101,7 @@ describe('ingest()', () => {
     expect(limited).toBe(97);
     const issue = getIssue(db, issueId);
     expect(issue?.eventCount).toBe(100);
-    expect(listEventsForIssue(db, issueId)).toHaveLength(3);
+    expect(listEventsForIssue(db, issueId).rows).toHaveLength(3);
   });
 
   it('SDK fingerprint override creates separate issue', () => {

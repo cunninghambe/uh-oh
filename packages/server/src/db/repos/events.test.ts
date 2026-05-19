@@ -50,16 +50,24 @@ describe('events repo', () => {
     insertEvent(db, buildEvent({ receivedAt: 1_000 }));
     insertEvent(db, buildEvent({ receivedAt: 3_000 }));
     insertEvent(db, buildEvent({ receivedAt: 2_000 }));
-    const rows = listEventsForIssue(db, issueId);
+    const { rows } = listEventsForIssue(db, issueId);
     expect(rows.map((r) => r.receivedAt)).toEqual([3_000, 2_000, 1_000]);
+  });
+
+  it('listEventsForIssue returns total count', () => {
+    insertEvent(db, buildEvent({ receivedAt: 1_000 }));
+    insertEvent(db, buildEvent({ receivedAt: 2_000 }));
+    const { rows, total } = listEventsForIssue(db, issueId, { limit: 1 });
+    expect(rows).toHaveLength(1);
+    expect(total).toBe(2);
   });
 
   it('listEventsForIssue paginates', () => {
     for (let i = 0; i < 5; i++) {
       insertEvent(db, buildEvent({ receivedAt: i }));
     }
-    expect(listEventsForIssue(db, issueId, { limit: 2 })).toHaveLength(2);
-    expect(listEventsForIssue(db, issueId, { limit: 2, offset: 4 })).toHaveLength(1);
+    expect(listEventsForIssue(db, issueId, { limit: 2 }).rows).toHaveLength(2);
+    expect(listEventsForIssue(db, issueId, { limit: 2, offset: 4 }).rows).toHaveLength(1);
   });
 
   it('getLatestEventForIssue returns most recent', () => {

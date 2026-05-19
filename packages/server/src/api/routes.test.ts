@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
+import { upsertIssue } from '../db/repos/issues.js';
 import type { ProjectRow, IssueRow, EventRow, BreadcrumbRow } from '../db/schema.js';
 import { buildServer } from '../server.js';
 import { mintTestToken, TEST_SECRET } from '../auth/test-utils.js';
@@ -321,5 +322,174 @@ describe('PATCH /api/issues/:id', () => {
       headers: authHeader(),
     });
     expect(res.statusCode).toBe(400);
+  });
+});
+
+describe('DELETE /api/projects/:id', () => {
+  it('returns 204 and removes project', async () => {
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/api/projects/${project.id}`,
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(204);
+  });
+
+  it('returns 404 on repeat delete', async () => {
+    const app = buildTestServer(db);
+    await app.inject({
+      method: 'DELETE',
+      url: `/api/projects/${project.id}`,
+      headers: authHeader(),
+    });
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/api/projects/${project.id}`,
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('returns 401 without auth', async () => {
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'DELETE',
+      url: `/api/projects/${project.id}`,
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('cascades: related issues and events removed', async () => {
+    const app = buildTestServer(db);
+    await seedEvent(app);
+    const listBefore = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}/issues`,
+      headers: authHeader(),
+    });
+    expect(listBefore.json<{ total: number }>().total).toBe(1);
+
+    await app.inject({
+      method: 'DELETE',
+      url: `/api/projects/${project.id}`,
+      headers: authHeader(),
+    });
+
+    // Project gone
+    const getProject = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}`,
+      headers: authHeader(),
+    });
+    expect(getProject.statusCode).toBe(404);
+  });
+});
+
+describe('GET /api/projects/:id/issues?sort=', () => {
+  it('defaults to lastSeen desc', async () => {
+    const app = buildTestServer(db);
+    await seedEvent(app);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}/issues`,
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json<{ issues: IssueRow[] }>().issues).toHaveLength(1);
+  });
+
+  it('sort=lastSeen accepted', async () => {
+    const app = buildTestServer(db);
+    await seedEvent(app);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}/issues?sort=lastSeen`,
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('sort=eventCount accepted', async () => {
+    const app = buildTestServer(db);
+    await seedEvent(app);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}/issues?sort=eventCount`,
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('sort=firstSeen accepted', async () => {
+    const app = buildTestServer(db);
+    await seedEvent(app);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}/issues?sort=firstSeen`,
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('invalid sort returns 400', async () => {
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}/issues?sort=badField`,
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('sort=eventCount orders correctly', async () => {
+    // Two issues with different event counts
+    const ts = Date.now();
+    const issue1 = upsertIssue(db, {
+      projectId: project.id,
+      fingerprint: 'fp-a',
+      title: 'A',
+      ts,
+    }).issue;
+    upsertIssue(db, { projectId: project.id, fingerprint: 'fp-a', title: 'A', ts }); // bump count
+    const issue2 = upsertIssue(db, {
+      projectId: project.id,
+      fingerprint: 'fp-b',
+      title: 'B',
+      ts,
+    }).issue;
+
+    // issue1 has eventCount=2, issue2 has eventCount=1
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}/issues?sort=eventCount`,
+      headers: authHeader(),
+    });
+    const body = res.json<{ issues: IssueRow[] }>();
+    expect(body.issues[0]?.id).toBe(issue1.id);
+    expect(body.issues[1]?.id).toBe(issue2.id);
+  });
+});
+
+describe('GET /api/issues/:id/events total', () => {
+  it('returns events and total', async () => {
+    const app = buildTestServer(db);
+    const { eventId } = await seedEvent(app);
+    const issueList = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}/issues`,
+      headers: authHeader(),
+    });
+    const issueId = issueList.json<{ issues: IssueRow[] }>().issues[0]?.id ?? '';
+    const res = await app.inject({
+      method: 'GET',
+      url: `/api/issues/${issueId}/events`,
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json<{ events: EventRow[]; total: number }>();
+    expect(body.total).toBe(1);
+    expect(body.events[0]?.id).toBe(eventId);
   });
 });
