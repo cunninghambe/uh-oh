@@ -2,7 +2,7 @@
 
 **Lightweight self-hosted crash reporting for React Native — Android only in v0.1.**
 
-A single Node process + SQLite + a small React dashboard. Designed to run on one Hetzner-sized box for one developer with a handful of apps. Replaces Sentry / Bugsnag / Crashlytics for that specific shape of need.
+A single Node process + SQLite + a small React dashboard. Designed for anyone who wants to self-host their React Native crash data on a small VPS instead of using a hosted service. **Android-only in v0.1** — iOS is reserved in the wire format but no iOS code ships yet.
 
 ## What it does
 
@@ -90,7 +90,7 @@ See [`infra/README.md`](infra/README.md) for systemd, UFW, nightly SQLite backup
 
 ## Why this exists
 
-Existing hosted crash reporting is excellent and overkill for a solo developer with a few apps and a Hetzner box. uh-oh is what falls out of "what's the smallest useful thing for that case." It's not trying to replace Sentry for an org with 50 engineers; it's the version that fits when you'd rather own your data and pay $5/mo for a VPS than the Pro tier of anyone.
+Hosted crash reporting is excellent and overkill if you ship a handful of React Native Android apps and want to own your data. uh-oh is what falls out of asking "what's the smallest useful thing for that case." It's not trying to replace Sentry for an org with 50 engineers; it's the version that fits when you'd rather run one process on your own box than pay a per-seat or per-event meter.
 
 ## License
 

@@ -1,6 +1,6 @@
 # uh-oh — v0.1 Spec (FINAL — Android only)
 
-Lightweight self-hosted crash reporting for React Native **Android apps**. Single developer, multiple projects, production-ready on a single Hetzner node.
+Lightweight self-hosted crash reporting for React Native **Android apps**. Single-operator, multiple projects, production-ready on a single small VPS.
 
 This spec is the contract for implementers. Where ambiguity exists, this document wins; if it disagrees with the code, fix the code or update this doc with a PR.
 
@@ -10,14 +10,14 @@ iOS is **out of scope** for v0.1. The wire format reserves `platform: 'ios'` for
 
 ## 1. Problem statement
 
-A single developer (Brad) ships multiple React Native **Android** apps. They need a self-hosted crash and error reporting service that:
+A single developer ships multiple React Native **Android** apps. They need a self-hosted crash and error reporting service that:
 
 - Captures JS exceptions and Android native crashes from their RN apps
 - Groups events into issues by fingerprint
 - Symbolicates stack traces server-side (Hermes JS, Android ProGuard)
 - Presents issues + breadcrumbs + context in a single-user web dashboard
 - Fires a generic outbound webhook per project when new issues appear
-- Runs on a single Hetzner box behind nginx + TLS, with daily SQLite backups
+- Runs on a single small VPS behind nginx + TLS, with daily SQLite backups
 
 v0.1 is feature-complete enough to replace Sentry for one developer's RN Android apps.
 
@@ -494,7 +494,7 @@ Status legend: `[done]` `[next]` `[blocked]`.
 | 9   | Dashboard: projects + issues list + issue detail         | 8          | [done]                                       |
 | 10  | Dashboard: login + settings + symbol upload UI           | 6, 7a, 7c  | [done]                                       |
 | 11  | SDK JS core (`@uh-oh/react-native`)                      | 2, 4       | [done]                                       |
-| 13  | SDK Android native module (xCrash + UEH)                 | 11         | [done] (on-device verification pending Brad) |
+| 13  | SDK Android native module (xCrash + UEH)                 | 11         | [done] (on-device verification pending)      |
 | 14  | CLI (`@uh-oh/cli`)                                       | 6          | [done]                                       |
 | 15a | Deploy: systemd + UFW + daily backup                     | 6, 16      | [done]                                       |
 | 15b | Deploy: nginx vhost + TLS via certbot                    | 15a        | [done]                                       |
