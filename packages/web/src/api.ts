@@ -15,7 +15,7 @@ export type Release = {
   projectId: string;
   version: string;
   build: string;
-  platform: 'ios' | 'android';
+  platform: 'ios' | 'android' | 'web' | 'node';
   mappingUploadedAt: number | null;
   sourcemapUploadedAt: number | null;
 };
@@ -39,7 +39,7 @@ export type EventRow = {
   releaseId: string | null;
   fingerprint: string;
   level: string;
-  platform: 'ios' | 'android';
+  platform: 'ios' | 'android' | 'web' | 'node';
   payload: string;
   receivedAt: number;
   deviceInfo: string;
@@ -64,6 +64,9 @@ export type ResolvedFrame = {
   status: 'ok' | 'no_symbols' | 'unsymbolicated' | 'corrupt_mapping';
 };
 
+/** Server-side cap on symbol upload size (mapping.txt / sourcemap.map). Checked client-side too. */
+export const MAX_SYMBOL_UPLOAD_BYTES = 50 * 1024 * 1024;
+
 export class ApiError extends Error {
   constructor(
     public status: number,
@@ -72,6 +75,39 @@ export class ApiError extends Error {
     super(message);
   }
 }
+
+const LOGIN_PATH = '/api/auth/login';
+
+// The global 401 handler must not fire for the login endpoint itself — a wrong-password
+// attempt returns 401 by design, and redirecting to /login (where we already are) wipes
+// the error state before it renders. See SPEC §13 "wrong password shows error".
+//
+// This is registered by the router module (router.tsx) rather than imported statically here,
+// so api.ts stays decoupled from the router and safe to unit-test without a router context.
+type UnauthorizedHandler = (redirectPath: string) => void;
+let unauthorizedHandler: UnauthorizedHandler | null = null;
+
+export const setUnauthorizedHandler = (fn: UnauthorizedHandler | null): void => {
+  unauthorizedHandler = fn;
+};
+
+const handleUnauthorized = (): void => {
+  setToken(null);
+  const redirectPath =
+    typeof window !== 'undefined' ? window.location.pathname + window.location.search : '/';
+  if (unauthorizedHandler) {
+    unauthorizedHandler(redirectPath);
+  } else if (typeof window !== 'undefined') {
+    // Fallback for the (unexpected) case navigation wasn't wired up yet — better a full
+    // reload than a stuck screen.
+    window.location.href = `/login?redirect=${encodeURIComponent(redirectPath)}`;
+  }
+};
+
+const parseErrorBody = async (res: Response): Promise<string> => {
+  const body = (await res.json().catch(() => ({}))) as { error?: string; message?: string };
+  return body.message ?? body.error ?? `HTTP ${String(res.status)}`;
+};
 
 const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
   const token = getToken();
@@ -83,36 +119,59 @@ const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
       ...(init?.headers ?? {}),
     },
   });
-  if (res.status === 401) {
-    setToken(null);
-    window.location.href = '/login';
+  if (res.status === 401 && path !== LOGIN_PATH) {
+    handleUnauthorized();
     throw new ApiError(401, 'unauthorized');
   }
   if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as { error?: string; message?: string };
-    throw new ApiError(res.status, body.message ?? body.error ?? `HTTP ${String(res.status)}`);
+    throw new ApiError(res.status, await parseErrorBody(res));
   }
   return (await res.json()) as T;
 };
 
-const requestMultipart = async <T>(path: string, formData: FormData): Promise<T> => {
-  const token = getToken();
-  const res = await fetch(path, {
-    method: 'POST',
-    body: formData,
-    headers: token ? { Authorization: `Bearer ${token}` } : {},
+const uploadWithProgress = <T>(
+  path: string,
+  form: FormData,
+  onProgress?: (percent: number) => void,
+): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', path);
+    const token = getToken();
+    if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
+
+    xhr.upload.onprogress = (e: ProgressEvent) => {
+      if (e.lengthComputable && onProgress) {
+        onProgress(Math.round((e.loaded / e.total) * 100));
+      }
+    };
+
+    xhr.onload = () => {
+      let body: unknown = {};
+      try {
+        body = xhr.responseText ? JSON.parse(xhr.responseText) : {};
+      } catch {
+        body = {};
+      }
+      if (xhr.status === 401) {
+        handleUnauthorized();
+        reject(new ApiError(401, 'unauthorized'));
+        return;
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body as T);
+        return;
+      }
+      const b = body as { error?: string; message?: string };
+      reject(new ApiError(xhr.status, b.message ?? b.error ?? `HTTP ${String(xhr.status)}`));
+    };
+
+    xhr.onerror = () => {
+      reject(new ApiError(0, 'Network error'));
+    };
+
+    xhr.send(form);
   });
-  if (res.status === 401) {
-    setToken(null);
-    window.location.href = '/login';
-    throw new ApiError(401, 'unauthorized');
-  }
-  if (!res.ok) {
-    const body = (await res.json().catch(() => ({}))) as { error?: string; message?: string };
-    throw new ApiError(res.status, body.message ?? body.error ?? `HTTP ${String(res.status)}`);
-  }
-  return (await res.json()) as T;
-};
 
 export const api = {
   login: (password: string) =>
@@ -148,18 +207,23 @@ export const api = {
   listReleases: (projectId: string) =>
     request<{ releases: Release[] }>(`/api/projects/${projectId}/releases`),
 
+  // XHR (not fetch) so upload.onprogress can drive a real progress bar — fetch has no
+  // cross-browser-reliable upload progress API. See SPEC §13 "see upload progress".
   uploadSymbols: (
     releaseId: string,
     file: File,
-    opts: { sourcemap?: boolean } = {},
+    opts: { sourcemap?: boolean; onProgress?: (percent: number) => void } = {},
   ): Promise<{ release: Release }> => {
     const form = new FormData();
     form.append('file', file);
     form.append('platform', 'android');
     if (opts.sourcemap) form.append('sourcemap', 'true');
-    return requestMultipart<{ release: Release }>(`/api/releases/${releaseId}/symbols`, form);
+    return uploadWithProgress(`/api/releases/${releaseId}/symbols`, form, opts.onProgress);
   },
 
+  // NOTE (spec delta): SPEC §9 documents this route as `?status=&sort=&page=&limit=`, but the
+  // implemented API is offset-based (`offset`, not `page`) — matches the pre-existing code
+  // here, unchanged. `sort` isn't sent: SPEC marks it `[TODO]` server-side. See final report.
   listIssues: (
     projectId: string,
     opts: { status?: string; limit?: number; offset?: number } = {},
@@ -178,6 +242,18 @@ export const api = {
     request<{ issue: Issue; latestEvent: EventRow | null; breadcrumbs: Breadcrumb[] }>(
       `/api/issues/${id}`,
     ),
+
+  // SPEC §9: GET /api/issues/:id/events?page=&limit= — page-based (1-indexed), unlike
+  // listIssues which is offset-based (see the offset-vs-page note in api.ts's listIssues).
+  listIssueEvents: (issueId: string, opts: { page?: number; limit?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (opts.page) params.set('page', String(opts.page));
+    if (opts.limit) params.set('limit', String(opts.limit));
+    const qs = params.toString();
+    return request<{ events: EventRow[]; total: number }>(
+      `/api/issues/${issueId}/events${qs ? `?${qs}` : ''}`,
+    );
+  },
 
   getEvent: (id: string, opts: { symbolicate?: boolean } = {}) => {
     const qs = opts.symbolicate ? '?symbolicate=true' : '';

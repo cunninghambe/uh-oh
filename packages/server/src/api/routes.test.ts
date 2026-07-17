@@ -58,7 +58,8 @@ const seedEvent = async (app: ReturnType<typeof buildServer>) => {
   return r.json<{ eventId: string }>();
 };
 
-const buildTestServer = (testDb: Db) => buildServer({ db: testDb, secret: TEST_SECRET });
+const buildTestServer = (testDb: Db) =>
+  buildServer({ db: testDb, secret: TEST_SECRET, password: 'test-password' });
 
 describe('GET /api/projects', () => {
   it('returns empty array when no projects', async () => {
@@ -155,12 +156,47 @@ describe('PATCH /api/projects/:id', () => {
     expect(res.statusCode).toBe(400);
   });
 
+  it('rejects an SSRF webhook URL (loopback IP)', async () => {
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${project.id}`,
+      payload: { webhookUrl: 'http://127.0.0.1/hook' },
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: string }>().error).toBe('invalid_webhookUrl');
+  });
+
+  it('rejects a non-http(s) webhook URL scheme', async () => {
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${project.id}`,
+      payload: { webhookUrl: 'ftp://example.com/hook' },
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('allows clearing the webhook URL with null', async () => {
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/projects/${project.id}`,
+      payload: { webhookUrl: null },
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json<{ project: ProjectRow }>().project.webhookUrl).toBeNull();
+  });
+
   it('404 on missing project', async () => {
     const app = buildTestServer(db);
     const res = await app.inject({
       method: 'PATCH',
       url: '/api/projects/nope',
-      payload: { webhookUrl: 'x' },
+      payload: { webhookUrl: 'https://hooks.example.com/x' },
       headers: authHeader(),
     });
     expect(res.statusCode).toBe(404);
@@ -491,5 +527,35 @@ describe('GET /api/issues/:id/events total', () => {
     const body = res.json<{ events: EventRow[]; total: number }>();
     expect(body.total).toBe(1);
     expect(body.events[0]?.id).toBe(eventId);
+  });
+
+  it('supports SPEC §9 page= (1-indexed) pagination', async () => {
+    const app = buildTestServer(db);
+    await seedEvent(app);
+    await seedEvent(app);
+    await seedEvent(app);
+    const issueList = await app.inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}/issues`,
+      headers: authHeader(),
+    });
+    const issueId = issueList.json<{ issues: IssueRow[] }>().issues[0]?.id ?? '';
+    const page1 = await app.inject({
+      method: 'GET',
+      url: `/api/issues/${issueId}/events?page=1&limit=2`,
+      headers: authHeader(),
+    });
+    const page2 = await app.inject({
+      method: 'GET',
+      url: `/api/issues/${issueId}/events?page=2&limit=2`,
+      headers: authHeader(),
+    });
+    const b1 = page1.json<{ events: EventRow[]; total: number }>();
+    const b2 = page2.json<{ events: EventRow[]; total: number }>();
+    expect(b1.total).toBe(3);
+    expect(b1.events).toHaveLength(2);
+    expect(b2.events).toHaveLength(1);
+    const ids = [...b1.events, ...b2.events].map((e) => e.id);
+    expect(new Set(ids).size).toBe(3);
   });
 });

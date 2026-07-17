@@ -14,17 +14,32 @@ export type SourcePosition = {
 type Consumer = BasicSourceMapConsumer | IndexedSourceMapConsumer;
 
 const LRU_MAX = 4;
+// Delay before destroying an evicted/invalidated consumer, so any request that
+// already grabbed a reference can finish resolving against it (destroying the
+// underlying WASM mid-use throws).
+const DESTROY_DELAY_MS = 10_000;
 
 // LRU order: head = most-recently-used
 const lruOrder: string[] = [];
 const lruCache = new Map<string, Consumer>();
+
+const deferDestroy = (consumer: Consumer): void => {
+  const timer = setTimeout(() => {
+    try {
+      consumer.destroy();
+    } catch {
+      // Already destroyed — ignore.
+    }
+  }, DESTROY_DELAY_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+};
 
 const evictLru = (): void => {
   while (lruCache.size >= LRU_MAX) {
     const oldest = lruOrder.shift();
     if (oldest === undefined) break;
     const evicted = lruCache.get(oldest);
-    evicted?.destroy();
+    if (evicted) deferDestroy(evicted);
     lruCache.delete(oldest);
   }
 };
@@ -70,7 +85,9 @@ export const getOrLoadCachedConsumer = async (
  */
 export const invalidateCachedConsumer = (releaseId: string): void => {
   const consumer = lruCache.get(releaseId);
-  consumer?.destroy();
+  // Drop from the cache immediately, but defer the destroy: another in-flight
+  // request may still hold this consumer reference.
+  if (consumer) deferDestroy(consumer);
   lruCache.delete(releaseId);
   const idx = lruOrder.indexOf(releaseId);
   if (idx !== -1) lruOrder.splice(idx, 1);

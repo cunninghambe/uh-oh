@@ -85,7 +85,7 @@ describe('POST /api/auth/login', () => {
     expect(res.json<{ error: string }>().error).toBe('invalid_credentials');
   });
 
-  it('11th login from same IP within rate window → 429', async () => {
+  it('11th login from same IP within rate window → 429 with Retry-After', async () => {
     const app = buildTestServer(db);
     // Each request from same IP with a mocked recent timestamp
     // We send 11 requests; first 10 are allowed, 11th is rate-limited
@@ -95,11 +95,32 @@ describe('POST /api/auth/login', () => {
         method: 'POST',
         url: '/api/auth/login',
         payload: { password: 'wrong' },
-        // Simulate the same IP via x-forwarded-for
+        // Peer is loopback (inject default) so trustProxy honors this header.
         headers: { 'x-forwarded-for': '10.0.0.1' },
       });
     }
     expect(lastRes?.statusCode).toBe(429);
+    expect(lastRes?.headers['retry-after']).toBeDefined();
+    expect(lastRes?.json<{ error: string }>().error).toBe('rate_limited');
+  });
+
+  it('ignores a spoofed X-Forwarded-For from a non-loopback peer', async () => {
+    const app = buildTestServer(db);
+    // Peer is a public (non-loopback) address, so trustProxy: 'loopback' must
+    // NOT trust X-Forwarded-For. All 11 requests count against 8.8.8.8 even
+    // though each carries a different forged XFF, so the 11th is limited.
+    let lastRes: Awaited<ReturnType<typeof app.inject>> | undefined;
+    for (let i = 0; i < 11; i++) {
+      lastRes = await app.inject({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { password: 'wrong' },
+        remoteAddress: '8.8.8.8',
+        headers: { 'x-forwarded-for': `1.2.3.${String(i)}` },
+      });
+    }
+    expect(lastRes?.statusCode).toBe(429);
+    expect(lastRes?.json<{ error: string }>().error).toBe('rate_limited');
   });
 });
 

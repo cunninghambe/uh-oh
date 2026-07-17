@@ -13,6 +13,8 @@ export type ProguardMapping = {
   resolveClass: (obfuscated: string) => string | null;
   /** Return original method name for an obfuscated (class, method) pair, or null. */
   resolveMethod: (obfuscatedClass: string, obfuscatedMethod: string) => string | null;
+  /** Number of class mappings parsed. Zero on non-empty input signals a corrupt file. */
+  classCount: number;
 };
 
 // Maps obfuscated class name → original class name
@@ -78,5 +80,6 @@ export const parseProguardMapping = (raw: string): ProguardMapping => {
     resolveClass: (obfuscated) => classMap.get(obfuscated) ?? null,
     resolveMethod: (obfuscatedClass, obfuscatedMethod) =>
       methodMap.get(obfuscatedClass)?.get(obfuscatedMethod) ?? null,
+    classCount: classMap.size,
   };
 };

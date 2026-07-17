@@ -2,12 +2,15 @@ import { describe, expect, it } from 'vitest';
 
 import { makeTestDb } from '../db/test-utils.js';
 import { buildServer } from '../server.js';
+import { TEST_SECRET } from '../auth/test-utils.js';
+
+const TEST_PASSWORD = 'test-password';
 
 describe('security headers', () => {
   const { db } = makeTestDb();
 
   it('sets all required security headers on /healthz', async () => {
-    const app = buildServer({ db });
+    const app = buildServer({ db, secret: TEST_SECRET, password: TEST_PASSWORD });
     const res = await app.inject({ method: 'GET', url: '/healthz' });
 
     expect(res.headers['x-content-type-options']).toBe('nosniff');
@@ -18,7 +21,7 @@ describe('security headers', () => {
   });
 
   it('sets security headers on 404 responses', async () => {
-    const app = buildServer({ db });
+    const app = buildServer({ db, secret: TEST_SECRET, password: TEST_PASSWORD });
     const res = await app.inject({ method: 'GET', url: '/nonexistent-route-xyz' });
 
     expect(res.statusCode).toBe(404);
@@ -27,7 +30,7 @@ describe('security headers', () => {
   });
 
   it('sets security headers on /metrics', async () => {
-    const app = buildServer({ db });
+    const app = buildServer({ db, secret: TEST_SECRET, password: TEST_PASSWORD });
     const res = await app.inject({ method: 'GET', url: '/metrics' });
 
     expect(res.statusCode).toBe(200);
@@ -36,7 +39,7 @@ describe('security headers', () => {
   });
 
   it('sets security headers on ingest endpoint (4xx)', async () => {
-    const app = buildServer({ db });
+    const app = buildServer({ db, secret: TEST_SECRET, password: TEST_PASSWORD });
     const res = await app.inject({
       method: 'POST',
       url: '/ingest/unknown-key',

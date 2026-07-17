@@ -12,7 +12,12 @@ import { mappingPath, sourcemapPath } from './storage.js';
 import { parseProguardMapping } from './proguard.js';
 import { getOrLoadCachedConsumer, invalidateCachedConsumer, resolveJsFrame } from './sourcemap.js';
 
-export type SymbolicationStatus = 'ok' | 'no_symbols' | 'unsymbolicated' | 'corrupt_mapping';
+export type SymbolicationStatus =
+  | 'ok'
+  | 'no_symbols'
+  | 'unsymbolicated'
+  | 'corrupt_mapping'
+  | 'corrupt_sourcemap';
 
 export type ResolvedFrame = {
   function?: string;
@@ -91,8 +96,9 @@ const buildAndroidFrame = (
 // jsConsumerState:
 //   'none'        — no release linked, return frame as-is (ok, pass-through)
 //   'no_symbols'  — release exists but no sourcemap uploaded
+//   'corrupt'     — sourcemap uploaded but unreadable/unparseable
 //   Consumer      — ready to resolve
-type JsConsumerState = 'none' | 'no_symbols' | Consumer;
+type JsConsumerState = 'none' | 'no_symbols' | 'corrupt' | Consumer;
 
 const buildJsFrame = (frame: StackFrame, consumerState: JsConsumerState): ResolvedFrame => {
   if (consumerState === 'none') {
@@ -109,6 +115,13 @@ const buildJsFrame = (frame: StackFrame, consumerState: JsConsumerState): Resolv
       ...(frame.filename !== undefined ? { filename: frame.filename } : {}),
       ...(frame.function !== undefined ? { function: frame.function } : {}),
       status: 'no_symbols',
+    };
+  }
+  if (consumerState === 'corrupt') {
+    return {
+      ...(frame.filename !== undefined ? { filename: frame.filename } : {}),
+      ...(frame.function !== undefined ? { function: frame.function } : {}),
+      status: 'corrupt_sourcemap',
     };
   }
   if (frame.lineno === undefined || frame.colno === undefined) {
@@ -161,12 +174,27 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
   let mappingCorrupt = false;
   let jsConsumerState: JsConsumerState = 'none';
 
-  if (event.releaseId) {
-    const release = getReleaseById(db, event.releaseId);
+  // Snapshot the release's symbol timestamps *before* any async file read, so we
+  // can detect a concurrent symbol upload that invalidated the cache mid-flight.
+  const releaseId = event.releaseId;
+  let mappingAtSnapshot: number | null = null;
+  let sourcemapAtSnapshot: number | null = null;
+
+  if (releaseId) {
+    const release = getReleaseById(db, releaseId);
+    mappingAtSnapshot = release?.mappingUploadedAt ?? null;
+    sourcemapAtSnapshot = release?.sourcemapUploadedAt ?? null;
+
     if (release?.mappingUploadedAt) {
       try {
-        const raw = await fs.readFile(mappingPath(event.releaseId), 'utf8');
-        proguardMapping = parseProguardMapping(raw);
+        const raw = await fs.readFile(mappingPath(releaseId), 'utf8');
+        const mapping = parseProguardMapping(raw);
+        // Non-empty file that yields zero classes is a corrupt/garbage mapping.
+        if (raw.trim().length > 0 && mapping.classCount === 0) {
+          mappingCorrupt = true;
+        } else {
+          proguardMapping = mapping;
+        }
       } catch {
         mappingCorrupt = true;
       }
@@ -175,10 +203,12 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
     // When no release is attached, frames pass through with ok.
     if (release?.sourcemapUploadedAt) {
       try {
-        const raw = await fs.readFile(sourcemapPath(event.releaseId), 'utf8');
-        jsConsumerState = await getOrLoadCachedConsumer(event.releaseId, raw);
+        const raw = await fs.readFile(sourcemapPath(releaseId), 'utf8');
+        jsConsumerState = await getOrLoadCachedConsumer(releaseId, raw);
       } catch {
-        // Corrupt or missing file — frames resolve as unsymbolicated (consumer remains 'none')
+        // Sourcemap recorded but unreadable/unparseable → surface as corrupt
+        // rather than silently passing frames through as ok.
+        jsConsumerState = 'corrupt';
       }
     } else {
       jsConsumerState = 'no_symbols';
@@ -186,6 +216,7 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
   }
 
   const results: ResolvedFrame[] = [];
+  const toPersist: Array<{ idx: number; resolved: ResolvedFrame }> = [];
 
   for (let i = 0; i < frames.length; i++) {
     const hit = cached.get(i);
@@ -204,8 +235,24 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
       ? buildJsFrame(frame, jsConsumerState)
       : buildAndroidFrame(frame, proguardMapping, mappingCorrupt);
 
-    persistFrame(db, eventId, i, resolved);
     results.push(resolved);
+    toPersist.push({ idx: i, resolved });
+  }
+
+  // If a new symbol upload landed while we were symbolicating, the mapping we
+  // used is stale — return the results but don't cache them (they'd poison the
+  // cache until the next upload).
+  if (releaseId && toPersist.length > 0) {
+    const fresh = getReleaseById(db, releaseId);
+    const stale =
+      !fresh ||
+      fresh.mappingUploadedAt !== mappingAtSnapshot ||
+      fresh.sourcemapUploadedAt !== sourcemapAtSnapshot;
+    if (stale) return results;
+  }
+
+  for (const p of toPersist) {
+    persistFrame(db, eventId, p.idx, p.resolved);
   }
 
   return results;
@@ -214,14 +261,17 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
 export const invalidateSymbolications = (db: Db, releaseId: string): void => {
   invalidateCachedConsumer(releaseId);
 
-  const eventIds = db
-    .select({ id: eventsTable.id })
-    .from(eventsTable)
-    .where(eq(eventsTable.releaseId, releaseId))
-    .all()
-    .map((r) => r.id);
-
-  if (eventIds.length === 0) return;
-
-  db.delete(symbolications).where(inArray(symbolications.eventId, eventIds)).run();
+  // Single statement with a subquery — avoids binding one variable per event id,
+  // which blows past SQLite's bound-variable cap for releases with many events.
+  db.delete(symbolications)
+    .where(
+      inArray(
+        symbolications.eventId,
+        db
+          .select({ id: eventsTable.id })
+          .from(eventsTable)
+          .where(eq(eventsTable.releaseId, releaseId)),
+      ),
+    )
+    .run();
 };

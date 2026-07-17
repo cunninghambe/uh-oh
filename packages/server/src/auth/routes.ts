@@ -4,32 +4,33 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 import type { Db } from '../db/index.js';
 import { deleteSession, insertSession } from '../db/repos/sessions.js';
-import { createRateLimiter } from '../ingest/rate-limit.js';
 import { buildAuthMiddleware } from './middleware.js';
 import { issueToken } from './jwt.js';
 import type { AuthRequest } from './middleware.js';
-
-const loginLimiter = createRateLimiter({ capacity: 10, refillPerSec: 10 / 60 });
-
-const getClientIp = (req: FastifyRequest): string =>
-  (req.headers['x-forwarded-for'] as string | undefined)?.split(',')[0]?.trim() ??
-  req.socket.remoteAddress ??
-  'unknown';
+import type { LoginLimiter } from './login-limiter.js';
+import { createLoginLimiter } from './login-limiter.js';
 
 export const registerAuthRoutes = (
   app: FastifyInstance,
   db: Db,
   secret: Uint8Array,
   password: string,
+  loginLimiter: LoginLimiter = createLoginLimiter(),
 ): void => {
   const auth = buildAuthMiddleware({ db, secret });
 
   app.post<{ Body: unknown }>(
     '/api/auth/login',
     async (req: FastifyRequest, reply: FastifyReply) => {
-      const ip = getClientIp(req);
-      if (!loginLimiter.consume(ip)) {
-        return reply.code(429).header('Retry-After', '60').send({ error: 'rate_limited' });
+      // Trust `request.ip` — with `trustProxy: 'loopback'` this is the real
+      // client IP when nginx forwards it, and the socket peer otherwise (a
+      // direct/spoofed caller cannot forge it).
+      const limit = loginLimiter.check(req.ip);
+      if (!limit.allowed) {
+        return reply
+          .code(429)
+          .header('Retry-After', String(limit.retryAfterSec))
+          .send({ error: 'rate_limited' });
       }
 
       const body = req.body;

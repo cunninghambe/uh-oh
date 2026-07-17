@@ -1,20 +1,30 @@
-import { useNavigate } from '@tanstack/react-router';
-import { type FormEvent, useState } from 'react';
+import { useRouter, useSearch } from '@tanstack/react-router';
+import { type FormEvent, useEffect, useState } from 'react';
 
 import { ApiError, api } from '../api.js';
 import { isAuthed, setToken } from '../auth.js';
 
 export const Login = () => {
-  const navigate = useNavigate();
+  // NOTE: unlike the layout.tsx bug this brief also fixes, this component never called a hook
+  // *after* its early return — so it wasn't actually a hooks-order crash. It shared the other
+  // half of that anti-pattern though (navigating as a side effect during render instead of in
+  // an effect), which is fixed here too, and all hooks are kept unconditional for safety.
+  const router = useRouter();
+  const search = useSearch({ from: '/login' });
   const [password, setPassword] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
+  const authed = isAuthed();
 
-  // Already logged in — redirect home
-  if (isAuthed()) {
-    void navigate({ to: '/', replace: true });
-    return null;
-  }
+  useEffect(() => {
+    if (authed) {
+      // `router.history.push` takes a raw path, unlike the typed `navigate({ to })` — the
+      // redirect target here is an arbitrary prior URL, not one of the app's known routes.
+      router.history.push(search.redirect ?? '/');
+    }
+  }, [authed, router, search.redirect]);
+
+  if (authed) return null;
 
   const handleSubmit = (e: FormEvent<HTMLFormElement>): void => {
     e.preventDefault();
@@ -25,7 +35,7 @@ export const Login = () => {
       .login(password)
       .then(({ token }) => {
         setToken(token);
-        void navigate({ to: '/', replace: true });
+        router.history.push(search.redirect ?? '/');
       })
       .catch((err: unknown) => {
         if (err instanceof ApiError) {

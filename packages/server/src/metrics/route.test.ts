@@ -2,12 +2,15 @@ import { describe, expect, it } from 'vitest';
 
 import { makeTestDb } from '../db/test-utils.js';
 import { buildServer } from '../server.js';
+import { TEST_SECRET } from '../auth/test-utils.js';
+
+const TEST_PASSWORD = 'test-password';
 
 describe('GET /metrics', () => {
   const { db } = makeTestDb();
 
   it('returns 200 with text/plain content-type', async () => {
-    const app = buildServer({ db });
+    const app = buildServer({ db, secret: TEST_SECRET, password: TEST_PASSWORD });
     const res = await app.inject({ method: 'GET', url: '/metrics' });
 
     expect(res.statusCode).toBe(200);
@@ -15,14 +18,14 @@ describe('GET /metrics', () => {
   });
 
   it('body includes uh_oh_events_ingested_total metric family', async () => {
-    const app = buildServer({ db });
+    const app = buildServer({ db, secret: TEST_SECRET, password: TEST_PASSWORD });
     const res = await app.inject({ method: 'GET', url: '/metrics' });
 
     expect(res.body).toContain('uh_oh_events_ingested_total');
   });
 
   it('body includes all four required metric families', async () => {
-    const app = buildServer({ db });
+    const app = buildServer({ db, secret: TEST_SECRET, password: TEST_PASSWORD });
     const res = await app.inject({ method: 'GET', url: '/metrics' });
 
     expect(res.body).toContain('uh_oh_events_ingested_total');
@@ -32,7 +35,7 @@ describe('GET /metrics', () => {
   });
 
   it('body is Prometheus text format (has # HELP lines)', async () => {
-    const app = buildServer({ db });
+    const app = buildServer({ db, secret: TEST_SECRET, password: TEST_PASSWORD });
     const res = await app.inject({ method: 'GET', url: '/metrics' });
 
     expect(res.body).toMatch(/^# HELP uh_oh_events_ingested_total/m);
@@ -40,7 +43,7 @@ describe('GET /metrics', () => {
   });
 
   it('does not require auth', async () => {
-    const app = buildServer({ db });
+    const app = buildServer({ db, secret: TEST_SECRET, password: TEST_PASSWORD });
     const res = await app.inject({ method: 'GET', url: '/metrics' });
     // No Authorization header — must still succeed
     expect(res.statusCode).toBe(200);
