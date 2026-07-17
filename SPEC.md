@@ -64,16 +64,20 @@ v0.1 is feature-complete enough to replace Sentry for one developer's RN Android
 - systemd unit for the server (`uh-oh-server.service`)
 - nginx vhost terminating TLS via Let's Encrypt / certbot
 - UFW rules: 22, 80, 443 open; 3300 closed (proxied via nginx only)
-- Daily SQLite backup: `sqlite3 .backup` to a dated file in `/var/backups/uh-oh/`, with 30-day retention
+- Daily SQLite backup: `sqlite3 .backup` to a dated file in `/var/backups/uh-oh/` plus a tarball of `/var/lib/uh-oh/symbols/`, both integrity-checked, 30-day retention, `OnFailure=` alert unit
 
 **Hardening:**
 
-- Per-IP global rate limit (separate from per-fingerprint)
+- Per-IP global rate limit (separate from per-fingerprint); all in-memory rate-limiter maps are TTL-swept and size-capped (long attacker-controlled keys are hashed)
+- Client IPs come from `request.ip` with Fastify `trustProxy: 'loopback'`; nginx overwrites `X-Forwarded-For` with `$remote_addr` (spoofed XFF is never trusted)
+- Login rate limit: 10/min/IP, then exponential backoff (doubling lockout, capped at 1h) with Retry-After
+- Webhook URLs are SSRF-validated at save AND dispatch time: http/https only; literal loopback/private/link-local/metadata IPs rejected; redirects refused (DNS-rebinding via hostnames is a known v0.1 gap)
 - Payload size cap (1 MB) — SDK trims breadcrumbs then context then retries once on 413
+- Retention: a daily in-process job prunes events older than `UH_OH_RETENTION_DAYS` (default 90; 0 disables) and terminal webhook dispatches older than 7 days; issues are kept
 - Structured logs (pino) — JSON, levels, request IDs
-- `/metrics` endpoint (Prometheus text format) — events_ingested_total, issues_total, webhook_failures_total, request_duration_seconds histogram
-- CSP + security headers on dashboard
-- CORS: ingest open, `/api/*` allows same-origin only
+- `/metrics` endpoint (Prometheus text format) — `uh_oh_events_ingested_total`, `uh_oh_issues_new_total`, `uh_oh_webhook_failures_total`, `uh_oh_request_duration_seconds` histogram; nginx restricts `/metrics` to localhost
+- Security headers on server responses; CSP is owned by nginx, which serves the dashboard static files (the server sets no CSP)
+- CORS: ingest open (`Access-Control-Allow-Origin: *` + OPTIONS preflight on `/ingest/:publicKey` only); `/api/*` emits no CORS headers (same-origin only)
 
 ### Out of scope (v0.1)
 
@@ -84,7 +88,7 @@ v0.1 is feature-complete enough to replace Sentry for one developer's RN Android
 - Email/Slack/Discord native integrations (wire those off the generic webhook)
 - Alert rules beyond "new issue + per-fingerprint dedupe"
 - Search (regex over event payloads). Filter by status + sort is enough for v0.1.
-- Runtimes other than RN (web JS, Node, Python) — phase 3+
+- Runtimes other than RN and JS (Python etc.) — phase 3+. (Browser JS + Node shipped in v0.2 via `@uh-oh/js` — see §16.)
 - Migration tooling (drizzle-kit migrations only; no zero-downtime migration patterns)
 
 ---
@@ -153,7 +157,7 @@ releases
   project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE
   version TEXT NOT NULL
   build TEXT NOT NULL
-  platform TEXT NOT NULL CHECK (platform IN ('ios','android'))   -- ios reserved, not used by SDK in v0.1
+  platform TEXT NOT NULL   -- enforced by the Drizzle TS enum ('ios','android','web','node'), no SQL CHECK shipped; ios reserved
   mapping_uploaded_at INTEGER       -- Android ProGuard
   sourcemap_uploaded_at INTEGER     -- Hermes
   UNIQUE(project_id, version, build, platform)
@@ -245,7 +249,7 @@ The package `@uh-oh/types` is the single source of truth. Zod schemas there are 
 type EventEnvelope = {
   sdk: { name: string; version: string };
   timestamp: string; // ISO 8601
-  platform: 'ios' | 'android'; // 'ios' reserved, not produced by SDK in v0.1
+  platform: 'ios' | 'android' | 'web' | 'node'; // 'ios' reserved; 'android' from the RN SDK; 'web'/'node' from @uh-oh/js (v0.2, §16)
   release: { version: string; build: string };
   level: 'fatal' | 'error' | 'warning' | 'info';
   exception: {
@@ -271,6 +275,8 @@ type EventEnvelope = {
 ```
 
 **Note:** `tags?: Record<string, string>` is not yet in `@uh-oh/types` schema. Implementer of subtask 11 (SDK) must add it to `EventEnvelopeSchema` in `packages/types/src/index.ts` with `z.record(z.string(), z.string()).optional()` and corresponding test.
+
+**Context conventions (v0.1):** the wire format has no top-level `environment` or event-id field, so the SDK rides both in `context`: `context.environment` (from `init({ environment })`) and `context.eventId` (the id returned by `captureException`/`captureMessage`). A future wire-format rev may promote them to top-level fields.
 
 ---
 
@@ -314,27 +320,29 @@ POST   /api/auth/logout                                          → 204
 
 GET    /api/projects                                             → { projects: Project[] }       [exists]
 POST   /api/projects             { name }                        → { project: Project }          [exists]
-GET    /api/projects/:id                                         → { project: Project }          [TODO subtask 10]
+GET    /api/projects/:id                                         → { project: Project }          [exists]
 PATCH  /api/projects/:id         { name?, webhookUrl?, alertDedupeMinutes? }
                                                                  → { project: Project }          [exists]
-DELETE /api/projects/:id                                         → 204                           [TODO subtask 10]
+DELETE /api/projects/:id                                         → 204                           [exists]
 POST   /api/projects/:id/rotate-key                              → { project: Project }          [exists]
 
-GET    /api/projects/:id/releases                                → { releases: Release[] }       [TODO subtask 7a/7c]
-GET    /api/projects/:id/issues?status=&sort=&page=&limit=       → { issues, total, page, limit } [exists - sort param TODO]
+GET    /api/projects/:id/releases                                → { releases: Release[] }       [exists]
+GET    /api/projects/:id/issues?status=&sort=&limit=&offset=     → { issues, total }             [exists]
 
 GET    /api/issues/:id                                           → { issue, latestEvent, breadcrumbs } [exists]
 PATCH  /api/issues/:id           { status }                      → { issue }                     [exists]
-GET    /api/issues/:id/events?page=&limit=                       → { events, total }             [exists - total TODO]
+GET    /api/issues/:id/events?page=&limit=  (or offset=)         → { events, total }             [exists]
 
-GET    /api/events/:id?symbolicate=true|false                    → { event, breadcrumbs, frames? } [exists; symbolicate=true TODO subtask 7a/7c]
+GET    /api/events/:id?symbolicate=true|false                    → { event, breadcrumbs, frames? } [exists]
 
 POST   /api/releases/:id/symbols (multipart: file, platform, sourcemap?)
-                                                                 → { release }                   [TODO subtask 7a/7c]
+                                                                 → { release }                   [exists]
 
 GET    /healthz                                                  → { ok: true }                  [exists]
-GET    /metrics                                                  → Prometheus text format        [TODO subtask 16]
+GET    /metrics                                                  → Prometheus text format        [exists]
 ```
+
+Pagination note: the issues list is **offset-based** (`limit`/`offset`, response `{ issues, total }`); the per-issue events list accepts `page=` (1-indexed) per the original spec, plus `offset=` for symmetry. PATCH `webhookUrl` is SSRF-validated (see §2 Hardening) and returns 400 for private/loopback/metadata targets.
 
 ---
 
@@ -376,42 +384,42 @@ init({
 
 ```
 uh-oh login --server https://errors.example.com
-  prompts for password, writes token to ~/.config/uh-oh/token
+  prompts for password, writes token to ~/.config/uh-oh/config.json
 
 uh-oh upload mapping --project <slug> --release <version>+<build> --file mapping.txt
 uh-oh upload sourcemap --project <slug> --release <version>+<build> --file index.android.bundle.map
 ```
 
-Implementation: `commander` for parsing, `node:fs` for file reads, `FormData` + `fetch` for upload. Token loaded from `~/.config/uh-oh/token`. Server URL persisted alongside.
+Implementation: `commander` for parsing, `node:fs` for file reads, `FormData` + `fetch` for upload. Token and server URL are persisted together in `~/.config/uh-oh/config.json` (dir mode 0700, file chmod'd 0600 after every write; both no-ops on Windows). Uploads pre-check file size against the server's 50 MB cap; 401/403 responses hint to re-run `uh-oh login`.
 
 ---
 
 ## 12. Edge cases
 
-| #   | Scenario                                   | Behavior                                                                                                                                                      |
-| --- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1   | Native crash before JS thread can report   | xCrash writes report to disk async-signal-safe; on next launch, native module reads, posts via JS transport, deletes file.                                    |
-| 2   | Offline at crash time                      | Spool to AsyncStorage (JS) or native crash store (Android); flush on connectivity + on next `init`.                                                           |
-| 3   | Spool grows unbounded                      | Cap at 100 events; drop oldest. SDK logs to debug.                                                                                                            |
-| 4   | Same crash 10,000×/min                     | Server token-bucket per `(publicKey, fingerprint)`: cap 10, refill 1/sec. Rate-limited events still bump `issues.event_count` but skip event/breadcrumb rows. |
-| 5   | Webhook endpoint down                      | 3 retries at 2s/8s/32s; then mark dispatch `failed` and log.                                                                                                  |
-| 6   | Webhook dedupe                             | `issues.last_alerted_at + project.alert_dedupe_minutes` check. Always fire on first occurrence.                                                               |
-| 7   | Unknown publicKey                          | 401, no echo.                                                                                                                                                 |
-| 8   | Malformed payload                          | 400 with field path; no partial persist.                                                                                                                      |
-| 9   | No symbols uploaded                        | Frames returned raw, marked `unsymbolicated: true`. Banner in UI: "Upload <symbol type> for this release."                                                    |
-| 10  | Corrupt symbol file                        | Cache symbolication failure, surface in UI. Re-symbolicate when a new upload arrives.                                                                         |
-| 11  | Hermes bytecode offsets without source map | Frames returned as-is; banner.                                                                                                                                |
-| 12  | Mis-grouping                               | SDK `setFingerprint` is the v0.1 escape hatch. No server-side merge UI.                                                                                       |
-| 13  | Payload > 1 MB                             | 413. SDK trims breadcrumbs to last 50, retries once; on second 413 drops event with debug log.                                                                |
-| 14  | Native handler installed twice             | xCrash no-ops on double-install; SDK asserts via flag.                                                                                                        |
-| 15  | RN reload in dev                           | Breadcrumbs in-memory; cleared on reload (matches Sentry).                                                                                                    |
-| 16  | Symbol upload race with incoming events    | Events stored raw; symbolication lazy at view-time; cache invalidated on new upload.                                                                          |
-| 17  | Clock skew                                 | Server `received_at` is authoritative; client `timestamp` is informational.                                                                                   |
-| 18  | JWT stolen                                 | 24h expiry + jti table; logout deletes jti. No refresh tokens.                                                                                                |
-| 19  | Password compromise                        | Rotate `UH_OH_ADMIN_PASSWORD`, restart, all old tokens invalid (because `UH_OH_JWT_SECRET` should also be rotated).                                           |
-| 20  | TLS cert renewal                           | certbot handles via cron; nginx reload triggered.                                                                                                             |
-| 21  | Disk fills                                 | systemd OnFailure unit logs error; basic monitoring deferred.                                                                                                 |
-| 22  | SDK loaded on iOS                          | All SDK functions no-op; debug message logged. No native module loaded.                                                                                       |
+| #   | Scenario                                   | Behavior                                                                                                                                                                                                                                          |
+| --- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1   | Native crash before JS thread can report   | xCrash writes report to disk async-signal-safe (tmp+fsync+rename); on next launch, native module hands `{id, payload}` to JS, which ACKs (deletes) each file only after it is durably spooled or sent.                                            |
+| 2   | Offline at crash time                      | Spool to AsyncStorage (JS) or native crash store (Android); flush on next `init`, on reconnect (via optional `@react-native-community/netinfo` peer if installed), or via a 30s retry timer that runs only while the spool is non-empty.          |
+| 3   | Spool grows unbounded                      | Cap at 100 events; drop oldest. SDK logs to debug.                                                                                                                                                                                                |
+| 4   | Same crash 10,000×/min                     | Server token-bucket per `(publicKey, fingerprint)`: cap 10, refill 1/sec. Rate-limited events still bump `issues.event_count` but skip event/breadcrumb rows.                                                                                     |
+| 5   | Webhook endpoint down                      | 3 retries at 2s/8s/32s; then mark dispatch `failed` and log.                                                                                                                                                                                      |
+| 6   | Webhook dedupe                             | `issues.last_alerted_at + project.alert_dedupe_minutes` check. Always fire on first occurrence.                                                                                                                                                   |
+| 7   | Unknown publicKey                          | 401, no echo.                                                                                                                                                                                                                                     |
+| 8   | Malformed payload                          | 400 with field path; no partial persist.                                                                                                                                                                                                          |
+| 9   | No symbols uploaded                        | Frames returned raw, marked `unsymbolicated: true`. Banner in UI: "Upload <symbol type> for this release."                                                                                                                                        |
+| 10  | Corrupt symbol file                        | Cache symbolication failure, surface in UI. Re-symbolicate when a new upload arrives.                                                                                                                                                             |
+| 11  | Hermes bytecode offsets without source map | Frames returned as-is; banner.                                                                                                                                                                                                                    |
+| 12  | Mis-grouping                               | SDK `setFingerprint` is the v0.1 escape hatch. No server-side merge UI.                                                                                                                                                                           |
+| 13  | Payload > 1 MB                             | 413. SDK trims breadcrumbs to last 50, retries once; on second 413 drops event with debug log (a transient non-413 failure after the trim keeps the trimmed event spooled). Other 4xx (except 429) → drop and continue; 5xx/429/network → retain. |
+| 14  | Native handler installed twice             | xCrash no-ops on double-install; SDK asserts via flag.                                                                                                                                                                                            |
+| 15  | RN reload in dev                           | Breadcrumbs in-memory; cleared on reload (matches Sentry).                                                                                                                                                                                        |
+| 16  | Symbol upload race with incoming events    | Events stored raw; symbolication lazy at view-time; cache invalidated on new upload.                                                                                                                                                              |
+| 17  | Clock skew                                 | Server `received_at` is authoritative; client `timestamp` is informational.                                                                                                                                                                       |
+| 18  | JWT stolen                                 | 24h expiry + jti table; logout deletes jti. No refresh tokens.                                                                                                                                                                                    |
+| 19  | Password compromise                        | Rotate `UH_OH_ADMIN_PASSWORD`, restart, all old tokens invalid (because `UH_OH_JWT_SECRET` should also be rotated).                                                                                                                               |
+| 20  | TLS cert renewal                           | certbot handles via cron; nginx reload triggered.                                                                                                                                                                                                 |
+| 21  | Disk fills                                 | systemd OnFailure unit logs error; basic monitoring deferred.                                                                                                                                                                                     |
+| 22  | SDK loaded on iOS                          | All SDK functions no-op; debug message logged. No native module loaded.                                                                                                                                                                           |
 
 ---
 
@@ -436,7 +444,7 @@ Implementation: `commander` for parsing, `node:fs` for file reads, `FormData` + 
 
 ### Webhook (subtask 5)
 
-- New fingerprint → webhook dispatched within 5s, body `{ type:'issue.new', project, issue, event, url }`.
+- New fingerprint → webhook dispatched within 5s, body `{ type:'issue.new', project, issue, event, dispatchId, url? }` (`dispatchId` lets receivers dedupe at-least-once delivery; `url` is omitted when `UH_OH_DASHBOARD_URL` is unset).
 - Second event same fingerprint inside dedupe window → no webhook (no row in `webhook_dispatches`).
 - Webhook 500 → retried at +2s, +8s, +32s; after third failure marked `failed`, `last_response_code` stored.
 - Webhook 200 → marked `succeeded`.
@@ -480,25 +488,25 @@ Implementation: `commander` for parsing, `node:fs` for file reads, `FormData` + 
 
 Status legend: `[done]` `[next]` `[blocked]`.
 
-| #   | Subtask                                                  | Depends on | Status                                       |
-| --- | -------------------------------------------------------- | ---------- | -------------------------------------------- |
-| 1   | Repo + monorepo scaffolding                              | —          | [done]                                       |
-| 2   | `@uh-oh/types` Zod schemas                               | 1          | [done]                                       |
-| 3   | Server DB layer (Drizzle schema + repos)                 | 1, 2       | [done]                                       |
-| 4   | Server ingest endpoint                                   | 3          | [done]                                       |
-| 5   | Server webhook dispatcher                                | 3, 4       | [done]                                       |
-| 6   | Server auth + JWT middleware (retrofit /api/\*)          | 3, 4       | [done]                                       |
-| 7a  | Android ProGuard symbolication                           | 3          | [done]                                       |
-| 7c  | Hermes JS source-map symbolication                       | 3          | [done]                                       |
-| 8   | Dashboard shell                                          | —          | [done]                                       |
-| 9   | Dashboard: projects + issues list + issue detail         | 8          | [done]                                       |
-| 10  | Dashboard: login + settings + symbol upload UI           | 6, 7a, 7c  | [done]                                       |
-| 11  | SDK JS core (`@uh-oh/react-native`)                      | 2, 4       | [done]                                       |
-| 13  | SDK Android native module (xCrash + UEH)                 | 11         | [done] (on-device verification pending)      |
-| 14  | CLI (`@uh-oh/cli`)                                       | 6          | [done]                                       |
-| 15a | Deploy: systemd + UFW + daily backup                     | 6, 16      | [done]                                       |
-| 15b | Deploy: nginx vhost + TLS via certbot                    | 15a        | [done]                                       |
-| 16  | Hardening: per-IP rate limit, payload caps, metrics, CSP | 6          | [done]                                       |
+| #   | Subtask                                                  | Depends on | Status                                  |
+| --- | -------------------------------------------------------- | ---------- | --------------------------------------- |
+| 1   | Repo + monorepo scaffolding                              | —          | [done]                                  |
+| 2   | `@uh-oh/types` Zod schemas                               | 1          | [done]                                  |
+| 3   | Server DB layer (Drizzle schema + repos)                 | 1, 2       | [done]                                  |
+| 4   | Server ingest endpoint                                   | 3          | [done]                                  |
+| 5   | Server webhook dispatcher                                | 3, 4       | [done]                                  |
+| 6   | Server auth + JWT middleware (retrofit /api/\*)          | 3, 4       | [done]                                  |
+| 7a  | Android ProGuard symbolication                           | 3          | [done]                                  |
+| 7c  | Hermes JS source-map symbolication                       | 3          | [done]                                  |
+| 8   | Dashboard shell                                          | —          | [done]                                  |
+| 9   | Dashboard: projects + issues list + issue detail         | 8          | [done]                                  |
+| 10  | Dashboard: login + settings + symbol upload UI           | 6, 7a, 7c  | [done]                                  |
+| 11  | SDK JS core (`@uh-oh/react-native`)                      | 2, 4       | [done]                                  |
+| 13  | SDK Android native module (xCrash + UEH)                 | 11         | [done] (on-device verification pending) |
+| 14  | CLI (`@uh-oh/cli`)                                       | 6          | [done]                                  |
+| 15a | Deploy: systemd + UFW + daily backup                     | 6, 16      | [done]                                  |
+| 15b | Deploy: nginx vhost + TLS via certbot                    | 15a        | [done]                                  |
+| 16  | Hardening: per-IP rate limit, payload caps, metrics, CSP | 6          | [done]                                  |
 
 Subtask numbers 7b (iOS dSYM) and 12 (iOS native) are intentionally omitted — iOS is out of scope.
 
@@ -521,4 +529,22 @@ Subtasks that touch HTTP endpoints must include integration tests using `app.inj
 Subtasks that ship UI must run `pnpm --filter @uh-oh/web build` to verify production build succeeds.
 Subtasks must update §14 status column to `[done]` when complete, and commit + push.
 
-Commit format: `<type>(<scope>): <subject>` where type ∈ {feat, fix, refactor, chore, docs, test}, scope is the package (`server`, `web`, `sdk`, `cli`, `types`, `infra`) or the subtask number (`s06`).
+Commit format: `<type>(<scope>): <subject>` where type ∈ {feat, fix, refactor, chore, docs, test}, scope is the package (`server`, `web`, `sdk`, `cli`, `types`, `infra`, `js`) or the subtask number (`s06`).
+
+---
+
+## 16. v0.2 addendum — browser + Node runtimes (`@uh-oh/js`)
+
+Shipped after the v0.1 robustness pass. Adds first-class `platform: 'web'` and `platform: 'node'` support end to end (types, ingest, dashboard) and a new client.
+
+**The client** (`packages/js/src/uh-oh-client.ts`) is a single self-contained, dependency-free TypeScript file (no imports; compiles under strict TS with neither DOM nor Node libs; contains no em-dash characters — one consumer repo lints for that). It mirrors the RN SDK's API and crash-safety posture: `init` (no-op without a DSN), `captureException`, `captureMessage`, `addBreadcrumb`, `setUser`/`setContext`/`setTag`/`setFingerprint`, `flush`, `close`; guarded handler installs; chained listeners; re-entrancy guard; public API never throws.
+
+- Browser: `error` + `unhandledrejection` listeners, fetch keepalive, sendBeacon flush on pagehide/hidden, localStorage pending-queue (`uh-oh:spool`, ~50 events, corrupt-tolerant).
+- Node: `uncaughtException` + `unhandledRejection` with bounded flush; exits(1) after capture when it was the only listener; in-memory queue only (max 50, oldest dropped) — **no disk persistence, accepted gap**.
+- Queue policy matches the RN spool rules: retain on network error/5xx/429, drop other 4xx, 413 trim-breadcrumbs-then-retry-once.
+
+**Distribution:** consumers vendor the file via `node scripts/vendor-js-client.mjs --out <path>` (GENERATED header; refuses to overwrite non-generated files). A `js-dist` orphan branch (mirroring `sdk-dist`) is the intended future path once published. Google Apps Script consumers use a hand-rolled `UrlFetchApp` reporter instead (platform `'node'`, `device.osName: 'apps-script'`) — the client's runtime requirements (fetch/AbortController) don't exist there.
+
+**Consumer conventions:** env vars `UH_OH_DSN` (server) / `NEXT_PUBLIC_UH_OH_DSN` (browser); Next.js apps wire via `instrumentation.ts` (`register()` guarded to the nodejs runtime + `onRequestError`), `instrumentation-client.ts`, and `app/global-error.tsx`.
+
+**Known v0.2 gaps:** no symbolication for web/node stacks (frames render raw; Node server stacks are usually readable anyway); no Node disk spool; symbol upload remains Android-only.
