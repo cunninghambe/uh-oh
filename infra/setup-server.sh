@@ -14,15 +14,29 @@ command -v node >/dev/null || { echo 'Install Node 22 first'; exit 1; }
 NODE_MAJOR=$(node -v | sed 's/v//' | cut -d. -f1)
 [ "$NODE_MAJOR" -ge 22 ] || { echo "Node 22+ required, found $(node -v)"; exit 1; }
 
+# 2b. sqlite3 CLI — required by infra/backup.sh (.backup + integrity_check).
+# Installed here instead of documented as a manual prerequisite so a fresh
+# box doesn't silently fail its first backup run.
+command -v sqlite3 >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y sqlite3; }
+
 # 3. Repo must already exist at /opt/uh-oh
 [ -d /opt/uh-oh/packages/server ] || { echo 'Place repo at /opt/uh-oh first'; exit 1; }
 
 # 4. Build
+# Built as root, not as the `uh-oh` user: /opt/uh-oh is root-owned (deployed
+# by whoever placed the repo there) and `uh-oh` is a --no-create-home system
+# user with no writable $HOME, so `sudo -u uh-oh pnpm install` fails outright
+# (corepack/pnpm need a writable home for their store/cache, and uh-oh can't
+# write into /opt/uh-oh anyway). Building as root avoids both problems and
+# keeps /opt/uh-oh out of the runtime user's writable surface entirely — the
+# hardened systemd unit already limits `uh-oh` to ReadWritePaths=/var/lib/uh-oh,
+# and the default umask leaves build output world-readable so the service
+# (running as `uh-oh`) can still read and execute it at runtime.
 cd /opt/uh-oh
 corepack enable
-sudo -u uh-oh pnpm install --frozen-lockfile
-sudo -u uh-oh pnpm --filter @uh-oh/server build
-sudo -u uh-oh pnpm --filter @uh-oh/web build
+pnpm install --frozen-lockfile
+pnpm --filter @uh-oh/server build
+pnpm --filter @uh-oh/web build
 
 # 5. Env file — must be created by the operator before running this script
 if [ ! -f /etc/uh-oh/server.env ]; then
@@ -38,6 +52,7 @@ Optional:
   UH_OH_LOG_LEVEL=info
   UH_OH_IP_RATE_PER_MIN=120
   UH_OH_IP_RATE_BURST=20
+  UH_OH_RETENTION_DAYS=90
 
 Then re-run this script.
 EOF
@@ -49,8 +64,15 @@ chmod 600 /etc/uh-oh/server.env
 install -m 644 /opt/uh-oh/infra/uh-oh-server.service  /etc/systemd/system/
 install -m 644 /opt/uh-oh/infra/uh-oh-backup.service  /etc/systemd/system/
 install -m 644 /opt/uh-oh/infra/uh-oh-backup.timer    /etc/systemd/system/
+install -m 644 /opt/uh-oh/infra/uh-oh-alert.service   /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now uh-oh-server.service
+# `enable --now` only starts the unit if it isn't already running, so on a
+# re-run (the documented upgrade path) it was a no-op that left the OLD
+# code running under a freshly-built dist/ on disk. enable + restart is
+# correct on both a fresh box (restart on a stopped unit just starts it)
+# and an upgrade (restart always picks up the new build).
+systemctl enable uh-oh-server.service
+systemctl restart uh-oh-server.service
 systemctl enable --now uh-oh-backup.timer
 
 # 7. Firewall

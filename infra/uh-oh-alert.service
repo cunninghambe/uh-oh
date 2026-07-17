@@ -1,0 +1,10 @@
+[Unit]
+Description=Log a loud alert when a uh-oh systemd unit fails
+# Triggered via OnFailure= from uh-oh-server.service and uh-oh-backup.service.
+# Deliberately minimal per SPEC.md §12 edge case 21 ("systemd OnFailure unit
+# logs error; basic monitoring deferred") — this just makes failures loud and
+# visible (journal + logged-in terminals), it does not page anyone.
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo "uh-oh ALERT: a uh-oh systemd unit failed - run: systemctl --failed" | systemd-cat -t uh-oh-alert -p err; wall "uh-oh ALERT: a uh-oh systemd unit failed - run: systemctl --failed" || true'

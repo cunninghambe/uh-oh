@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -45,5 +45,36 @@ describe('config', () => {
     const cfgDir = path.join(tmpDir, '.config', 'uh-oh');
     const stat = await fs.stat(cfgDir);
     expect(stat.isDirectory()).toBe(true);
+  });
+
+  it('creates the config dir with mode 0o700 and chmods the file to 0o600', async () => {
+    const mkdirSpy = vi.spyOn(fs, 'mkdir');
+    const chmodSpy = vi.spyOn(fs, 'chmod');
+
+    await writeConfig({ server: 'http://localhost:3300' });
+
+    expect(mkdirSpy).toHaveBeenCalledWith(expect.any(String), { recursive: true, mode: 0o700 });
+    expect(chmodSpy).toHaveBeenCalledWith(expect.any(String), 0o600);
+
+    mkdirSpy.mockRestore();
+    chmodSpy.mockRestore();
+  });
+
+  it('chmods on every write, not just when the file is newly created', async () => {
+    await writeConfig({ server: 'http://localhost:3300' });
+
+    const chmodSpy = vi.spyOn(fs, 'chmod');
+    await writeConfig({ server: 'http://localhost:3300', token: 'tok_2' });
+
+    expect(chmodSpy).toHaveBeenCalledWith(expect.any(String), 0o600);
+    chmodSpy.mockRestore();
+  });
+
+  it('does not throw when chmod is unsupported (e.g. Windows)', async () => {
+    const chmodSpy = vi.spyOn(fs, 'chmod').mockRejectedValueOnce(new Error('not supported'));
+
+    await expect(writeConfig({ server: 'http://localhost:3300' })).resolves.toBeUndefined();
+
+    chmodSpy.mockRestore();
   });
 });
