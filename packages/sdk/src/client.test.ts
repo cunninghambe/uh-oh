@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import type { EventEnvelope } from '@uh-oh/types';
-import { Client } from './client.js';
-import type { AsyncStorageLike } from './spool.js';
+import { Client, createLazyAsyncStorage } from './client.js';
+import { Spool, type AsyncStorageLike } from './spool.js';
 import { setUhOhNativeStub } from './__test-stubs__/react-native.js';
 
 function makeStorage(): AsyncStorageLike {
@@ -269,11 +269,320 @@ describe('Client', () => {
 
       // The spool is holding the envelope; we need to inspect it differently.
       // buildEnvelopeFromPartial is private — check via spool contents.
-      const { Spool } = await import('./spool.js');
       const s = new Spool(storage);
       expect(await s.size()).toBe(1);
       // Captured is null because beforeSend is only called for JS captures, not spool-internal ones.
       expect(captured).toBeNull();
+    });
+  });
+
+  // Force deterministic handler paths in tests: process.on for rejections (not
+  // the real `promise` polyfill) and no NetInfo unless a test injects one.
+  const testDeps = { loadRejectionTracking: () => null, loadNetInfo: () => null };
+
+  it('C1: a rejecting spool does not cause a recursive capture loop', async () => {
+    let setItemCalls = 0;
+    const rejecting: AsyncStorageLike = {
+      getItem: () => Promise.resolve(null),
+      setItem: () => {
+        setItemCalls++;
+        return Promise.reject(new Error('disk failure'));
+      },
+      removeItem: () => Promise.resolve(),
+    };
+    const client = new Client(
+      { dsn: VALID_DSN, release: '1.0.0+1', enableNative: false },
+      rejecting,
+      testDeps,
+    );
+    client.start();
+    client.captureException(new Error('boom'));
+    await new Promise((r) => setTimeout(r, 30));
+    // One capture → exactly one enqueue attempt; the .catch prevents a loop.
+    expect(setItemCalls).toBe(1);
+    client.stop();
+  });
+
+  it('C4: falls back to an in-memory spool when the AsyncStorage require throws', async () => {
+    const lazy = createLazyAsyncStorage(false, () => {
+      throw new Error('async storage absent');
+    });
+    // Construction + capture must not throw despite the failed require.
+    const client = new Client({ dsn: VALID_DSN, release: '1.0.0+1' }, lazy);
+    const id = client.captureException(new Error('offline crash'));
+    expect(id).not.toBe('');
+    await new Promise((r) => setTimeout(r, 10));
+    // Event landed in the in-memory fallback (same lazy storage instance).
+    expect(await new Spool(lazy).size()).toBe(1);
+  });
+
+  it('H3: a throwing beforeSend sends the unmodified event', async () => {
+    const client = new Client(
+      {
+        dsn: VALID_DSN,
+        release: '1.0.0+1',
+        beforeSend: () => {
+          throw new Error('beforeSend crashed');
+        },
+      },
+      storage,
+    );
+    client.captureException(new Error('boom'));
+    await new Promise((r) => setTimeout(r, 10));
+
+    const s = new Spool(storage);
+    let sent: EventEnvelope | null = null;
+    await s.drain((env) => {
+      sent = env;
+      return Promise.resolve({ ok: true, status: 202 });
+    });
+    const e = sent as EventEnvelope | null;
+    expect(e?.exception.value).toBe('boom');
+    expect(e?.level).toBe('error'); // untouched by the throwing beforeSend
+  });
+
+  it('M9: parses Hermes and anonymous stack frames', () => {
+    let captured: EventEnvelope | null = null;
+    const client = new Client(
+      {
+        dsn: VALID_DSN,
+        release: '1.0.0+1',
+        beforeSend: (e) => {
+          captured = e;
+          return null;
+        },
+      },
+      storage,
+    );
+    const err = new Error('hermes crash');
+    err.stack = [
+      'Error: hermes crash',
+      '    at foo (address at /data/app/bundle.js:1:2345)',
+      '    at /data/app/anon.js:10:20',
+      '    at bar (/data/app/plain.js:5:6)',
+    ].join('\n');
+    client.captureException(err);
+
+    const frames = (captured as EventEnvelope | null)?.exception.stacktrace ?? [];
+    expect(frames[0]).toMatchObject({ filename: '/data/app/bundle.js', lineno: 1, colno: 2345 });
+    expect(frames[1]).toMatchObject({ filename: '/data/app/anon.js', lineno: 10, colno: 20 });
+    expect(frames[2]).toMatchObject({ filename: '/data/app/plain.js', lineno: 5, colno: 6 });
+  });
+
+  it('L1: includes environment in context and a real osVersion', () => {
+    let captured: EventEnvelope | null = null;
+    const client = new Client(
+      {
+        dsn: VALID_DSN,
+        release: '1.0.0+1',
+        environment: 'staging',
+        beforeSend: (e) => {
+          captured = e;
+          return null;
+        },
+      },
+      storage,
+    );
+    client.captureException(new Error('x'));
+    const e = captured as EventEnvelope | null;
+    expect(e?.context?.['environment']).toBe('staging');
+    expect(e?.device.osVersion).toBe('34'); // stub Platform.Version = 34
+  });
+
+  it('L4: attaches the returned event id to context.eventId', () => {
+    let captured: EventEnvelope | null = null;
+    const client = new Client(
+      {
+        dsn: VALID_DSN,
+        release: '1.0.0+1',
+        beforeSend: (e) => {
+          captured = e;
+          return e;
+        },
+      },
+      storage,
+    );
+    const id = client.captureException(new Error('x'));
+    const e = captured as EventEnvelope | null;
+    expect(id).not.toBe('');
+    expect(e?.context?.['eventId']).toBe(id);
+  });
+
+  it('M6: re-init does not leak handlers (stop before recreate)', () => {
+    const base = process.listenerCount('unhandledRejection');
+    const c1 = new Client(
+      { dsn: VALID_DSN, release: '1.0.0+1', enableNative: false },
+      makeStorage(),
+      testDeps,
+    );
+    c1.start();
+    expect(process.listenerCount('unhandledRejection')).toBe(base + 1);
+
+    // Mirror index.init()'s teardown-before-recreate.
+    c1.stop();
+    const c2 = new Client(
+      { dsn: VALID_DSN, release: '1.0.0+1', enableNative: false },
+      makeStorage(),
+      testDeps,
+    );
+    c2.start();
+    expect(process.listenerCount('unhandledRejection')).toBe(base + 1); // still one, not two
+    c2.stop();
+    expect(process.listenerCount('unhandledRejection')).toBe(base); // fully cleaned
+  });
+
+  describe('native ack (M1)', () => {
+    let origFetch: typeof fetch;
+
+    beforeEach(() => {
+      origFetch = globalThis.fetch;
+      globalThis.fetch = vi
+        .fn()
+        .mockResolvedValue({ ok: true, status: 202 }) as unknown as typeof fetch;
+    });
+
+    afterEach(() => {
+      globalThis.fetch = origFetch;
+      setUhOhNativeStub({
+        install: () => Promise.resolve(true),
+        getPendingReports: () => Promise.resolve([]),
+      });
+    });
+
+    const report = (id: string) => ({
+      id,
+      payload: {
+        mechanism: 'android-java-ueh' as const,
+        timestamp: '2024-01-01T00:00:00.000Z',
+        exception: {
+          type: 'NullPointerException',
+          value: 'null ref',
+          stacktrace: [],
+          mechanism: 'android-java-ueh' as const,
+        },
+        device: { osName: 'Android', osVersion: '14' },
+      },
+    });
+
+    it('acks a native report after the spool write succeeds', async () => {
+      const ackSpy = vi.fn().mockResolvedValue(undefined);
+      setUhOhNativeStub({
+        install: () => Promise.resolve(true),
+        getPendingReports: () => Promise.resolve([report('rep-1')]),
+        ackReport: ackSpy,
+      });
+      const client = new Client({ dsn: VALID_DSN, release: '1.0.0+1' }, storage, testDeps);
+      client.start();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(ackSpy).toHaveBeenCalledWith('rep-1');
+      client.stop();
+    });
+
+    it('does NOT ack when the spool write fails', async () => {
+      const ackSpy = vi.fn();
+      setUhOhNativeStub({
+        install: () => Promise.resolve(true),
+        getPendingReports: () => Promise.resolve([report('rep-2')]),
+        ackReport: ackSpy,
+      });
+      const failing: AsyncStorageLike = {
+        getItem: () => Promise.resolve(null),
+        setItem: () => Promise.reject(new Error('disk full')),
+        removeItem: () => Promise.resolve(),
+      };
+      const client = new Client({ dsn: VALID_DSN, release: '1.0.0+1' }, failing, testDeps);
+      client.start();
+      await new Promise((r) => setTimeout(r, 50));
+      expect(ackSpy).not.toHaveBeenCalled();
+      client.stop();
+    });
+  });
+
+  describe('connectivity flush (M5)', () => {
+    let origFetch: typeof fetch;
+
+    afterEach(() => {
+      globalThis.fetch = origFetch;
+      vi.useRealTimers();
+    });
+
+    it('retry timer drains pending events once connectivity returns', async () => {
+      vi.useFakeTimers();
+      let online = false;
+      const fetchMock = vi.fn(() =>
+        online ? Promise.resolve({ ok: true, status: 202 }) : Promise.reject(new Error('offline')),
+      );
+      origFetch = globalThis.fetch;
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const client = new Client(
+        { dsn: VALID_DSN, release: '1.0.0+1', enableNative: false },
+        storage,
+        testDeps,
+      );
+      client.start();
+      client.captureException(new Error('offline crash'));
+      await vi.advanceTimersByTimeAsync(5);
+      expect(await new Spool(storage).size()).toBe(1); // spooled while offline
+
+      online = true;
+      await vi.advanceTimersByTimeAsync(30_000); // retry timer fires
+      expect(await new Spool(storage).size()).toBe(0); // drained
+      client.stop();
+    });
+
+    it('does not run a retry timer while the spool is empty', async () => {
+      vi.useFakeTimers();
+      const fetchMock = vi.fn(() => Promise.resolve({ ok: true, status: 202 }));
+      origFetch = globalThis.fetch;
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const client = new Client(
+        { dsn: VALID_DSN, release: '1.0.0+1', enableNative: false },
+        storage,
+        testDeps,
+      );
+      client.start();
+      client.captureException(new Error('x'));
+      await vi.advanceTimersByTimeAsync(5);
+      expect(await new Spool(storage).size()).toBe(0); // sent immediately
+
+      const callsAfterSend = fetchMock.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(fetchMock.mock.calls.length).toBe(callsAfterSend); // no timer-driven drains
+      client.stop();
+    });
+
+    it('drains on NetInfo reconnect when NetInfo is available', async () => {
+      let cb: ((s: { isConnected: boolean | null }) => void) | undefined;
+      const netInfo = {
+        addEventListener: (fn: (s: { isConnected: boolean | null }) => void) => {
+          cb = fn;
+          return () => undefined;
+        },
+      };
+      let online = false;
+      const fetchMock = vi.fn(() =>
+        online ? Promise.resolve({ ok: true, status: 202 }) : Promise.reject(new Error('offline')),
+      );
+      origFetch = globalThis.fetch;
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const client = new Client(
+        { dsn: VALID_DSN, release: '1.0.0+1', enableNative: false },
+        storage,
+        { loadRejectionTracking: () => null, loadNetInfo: () => netInfo },
+      );
+      client.start();
+      client.captureException(new Error('offline crash'));
+      await new Promise((r) => setTimeout(r, 20));
+      expect(await new Spool(storage).size()).toBe(1); // spooled while offline
+
+      online = true;
+      cb?.({ isConnected: true }); // reconnect event
+      await new Promise((r) => setTimeout(r, 20));
+      expect(await new Spool(storage).size()).toBe(0); // flushed on reconnect
+      client.stop();
     });
   });
 });

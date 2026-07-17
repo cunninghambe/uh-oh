@@ -147,7 +147,10 @@ describe('nativeBridge', () => {
     const { nativeBridge } = await import('./native-bridge.js');
     const reports = await nativeBridge()?.getPendingReports();
     expect(reports).toHaveLength(1);
-    expect(reports?.[0]).toMatchObject({ mechanism: 'android-java-ueh' });
+    // New bridge shape is { id, payload }. Bare envelopes from an older native
+    // module (no wrapping id) map to id '' with the whole item as payload.
+    expect(reports?.[0]?.id).toBe('');
+    expect(reports?.[0]?.payload).toMatchObject({ mechanism: 'android-java-ueh' });
     vi.doUnmock('react-native');
     vi.resetModules();
   });

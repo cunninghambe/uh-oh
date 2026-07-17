@@ -75,23 +75,36 @@ public final class TombstoneParser {
     }
 
     private static List<NativeFrame> extractFrames(String text) {
-        // Only parse lines that appear after the "backtrace:" header
-        int backtraceStart = text.indexOf("backtrace:");
-        String searchText = backtraceStart >= 0 ? text.substring(backtraceStart) : text;
-
         List<NativeFrame> frames = new ArrayList<>();
-        Matcher m = FRAME_PATTERN.matcher(searchText);
-        while (m.find()) {
-            String instructionAddr = "0x" + m.group(2);
-            String module = m.group(3);
-            String symbolAndOffset = m.group(4);
-            String function = symbolAndOffset != null ? symbolAndOffset : "";
 
-            // inApp = true if the library lives in the app's own native lib directory.
-            // /data/app/ = app-installed APK expanded libs; /system/ and /apex/ = OS.
-            boolean inApp = module.contains("/data/app/");
+        // Only parse the crashing thread's backtrace block. It begins at the
+        // first "backtrace:" header; we stop at the first non-frame line after
+        // frames begin (a blank line or the next section header) so frames from
+        // "other threads:" sections don't get merged in and pollute the
+        // fingerprint.
+        int backtraceStart = text.indexOf("backtrace:");
+        if (backtraceStart < 0) return frames;
 
-            frames.add(new NativeFrame(instructionAddr, module, function, inApp));
+        String afterHeader = text.substring(backtraceStart + "backtrace:".length());
+        boolean started = false;
+        for (String line : afterHeader.split("\n", -1)) {
+            Matcher m = FRAME_PATTERN.matcher(line);
+            if (m.find()) {
+                started = true;
+                String instructionAddr = "0x" + m.group(2);
+                String module = m.group(3);
+                String symbolAndOffset = m.group(4);
+                String function = symbolAndOffset != null ? symbolAndOffset : "";
+
+                // inApp = true if the library lives in the app's own native lib dir.
+                // /data/app/ = app-installed APK expanded libs; /system/ and /apex/ = OS.
+                boolean inApp = module.contains("/data/app/");
+
+                frames.add(new NativeFrame(instructionAddr, module, function, inApp));
+            } else if (started) {
+                // End of the crashing thread's backtrace block.
+                break;
+            }
         }
         return frames;
     }

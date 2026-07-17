@@ -16,6 +16,9 @@ export type InitOptions = {
 let client: Client | null = null;
 
 export const init = (opts: InitOptions): void => {
+  // Tear down any existing client first so a second init() (e.g. after a
+  // fast-refresh) doesn't leak the previous client's handlers (M6, SPEC §12 #14).
+  if (client) client.stop();
   client = new Client(opts);
   client.start();
 };
