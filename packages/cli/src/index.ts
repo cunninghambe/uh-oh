@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 import fs from 'node:fs/promises';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 import { readConfig, writeConfig } from './config.js';
 import { login, makePrompt } from './commands/login.js';
 import { upload } from './commands/upload.js';
+import { uploadNextSourcemaps } from './commands/next-sourcemaps.js';
+import { projectList, projectCreate, projectDsn } from './commands/project.js';
+import { listFilesRecursive } from './fsWalk.js';
 
 const program = new Command();
 program.name('uh-oh').description('CLI for uh-oh crash reporting').version('0.0.1');
@@ -20,6 +23,49 @@ program
         log: (line) => process.stdout.write(line + '\n'),
       },
       { server: opts.server },
+    );
+    process.exit(code);
+  });
+
+const projectCmd = program.command('project').description('Manage projects');
+
+projectCmd
+  .command('list')
+  .description('List projects (name, slug, publicKey, created)')
+  .action(async () => {
+    const code = await projectList({
+      config: { read: readConfig },
+      log: (line) => process.stdout.write(line + '\n'),
+    });
+    process.exit(code);
+  });
+
+projectCmd
+  .command('create')
+  .description('Create a new project and print its slug + DSN')
+  .argument('<name>', 'Project name')
+  .action(async (name: string) => {
+    const code = await projectCreate(
+      {
+        config: { read: readConfig },
+        log: (line) => process.stdout.write(line + '\n'),
+      },
+      { name },
+    );
+    process.exit(code);
+  });
+
+projectCmd
+  .command('dsn')
+  .description('Print a project DSN and the consumer env lines')
+  .argument('<slug>', 'Project slug')
+  .action(async (slug: string) => {
+    const code = await projectDsn(
+      {
+        config: { read: readConfig },
+        log: (line) => process.stdout.write(line + '\n'),
+      },
+      { slug },
     );
     process.exit(code);
   });
@@ -48,19 +94,58 @@ uploadCmd
 
 uploadCmd
   .command('sourcemap')
-  .description('Upload a Hermes source map (.map)')
+  .description('Upload a source map (.map) — defaults to the hermes/android flow')
   .requiredOption('--project <slug>', 'Project slug')
   .requiredOption('--release <version+build>', 'Release string (e.g. 1.0.0+42)')
   .requiredOption('--file <path>', 'Path to source map file')
-  .action(async (opts: { project: string; release: string; file: string }) => {
-    const code = await upload(
+  .addOption(
+    new Option(
+      '--platform <platform>',
+      'Escape hatch: upload as a web/node map instead of the default hermes/android flow',
+    ).choices(['web', 'node']),
+  )
+  .option(
+    '--bundle-path <path>',
+    'Bundle path relative to the app build (forward slashes, e.g. static/chunks/123.js)',
+  )
+  .action(
+    async (opts: {
+      project: string;
+      release: string;
+      file: string;
+      platform?: 'web' | 'node';
+      bundlePath?: string;
+    }) => {
+      const code = await upload(
+        {
+          config: { read: readConfig },
+          readFile: (p) => fs.readFile(p),
+          statFile: (p) => fs.stat(p),
+          log: (line) => process.stdout.write(line + '\n'),
+        },
+        'sourcemap',
+        opts,
+      );
+      process.exit(code);
+    },
+  );
+
+uploadCmd
+  .command('next-sourcemaps')
+  .description('Upload every browser + server source map from a Next.js .next build')
+  .requiredOption('--project <slug>', 'Project slug')
+  .requiredOption('--release <version+build>', 'Release string (e.g. 1.0.0+42)')
+  .requiredOption('--dir <path>', 'Path to the .next build directory')
+  .option('--dry-run', 'Print what would be uploaded without making any network calls')
+  .action(async (opts: { project: string; release: string; dir: string; dryRun?: boolean }) => {
+    const code = await uploadNextSourcemaps(
       {
         config: { read: readConfig },
         readFile: (p) => fs.readFile(p),
         statFile: (p) => fs.stat(p),
+        listFiles: listFilesRecursive,
         log: (line) => process.stdout.write(line + '\n'),
       },
-      'sourcemap',
       opts,
     );
     process.exit(code);

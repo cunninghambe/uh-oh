@@ -80,3 +80,25 @@ export const validateWebhookUrl = (raw: string): UrlGuardResult => {
 };
 
 export const isWebhookUrlSafe = (raw: string): boolean => validateWebhookUrl(raw).ok;
+
+/**
+ * True when `address` (a bare IP literal, e.g. a `dns.lookup` result) is a
+ * loopback/private/link-local/metadata address that must never be fetched.
+ * Shared with the dispatcher's dispatch-time DNS re-check so both call sites
+ * apply identical IP-blocking rules (no duplicated range logic).
+ */
+export const isBlockedIp = (address: string): boolean =>
+  isBlockedIpv4(address) || isBlockedIpv6(address);
+
+/**
+ * True when a URL hostname is a literal IP address (dotted-quad IPv4 or a
+ * bracketed IPv6 literal). Literal-IP hosts are fully covered by the
+ * synchronous {@link validateWebhookUrl} guard, so the dispatcher skips the
+ * async DNS re-check for them.
+ */
+export const isIpLiteralHost = (hostname: string): boolean => {
+  if (hostname.startsWith('[')) return true; // bracketed IPv6 literal
+  const m = IPV4_RE.exec(hostname);
+  if (!m) return false;
+  return [m[1], m[2], m[3], m[4]].every((o) => Number(o) <= 255);
+};

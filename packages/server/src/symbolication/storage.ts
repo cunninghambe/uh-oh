@@ -6,6 +6,12 @@ const getSymbolsRoot = (): string =>
 
 export const symbolsDir = (releaseId: string): string => path.join(getSymbolsRoot(), releaseId);
 
+// Web/node per-bundle source maps live under a per-platform subdirectory so they
+// never collide with the Android mapping.txt / sourcemap.map sitting directly
+// under the release dir.
+export const platformSymbolsDir = (releaseId: string, platform: string): string =>
+  path.join(symbolsDir(releaseId), platform);
+
 export const mappingPath = (releaseId: string): string =>
   path.join(symbolsDir(releaseId), 'mapping.txt');
 

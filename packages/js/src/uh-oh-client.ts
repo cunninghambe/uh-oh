@@ -14,6 +14,13 @@
 //     installs are guarded, the internal pipeline has a re-entrancy guard, and
 //     async work is catch-all'd so it can never surface an unhandled rejection
 //     (which our own promise handler would otherwise re-capture in a loop).
+//   * Usage analytics (trackPageview/trackEvent) is a second, INDEPENDENT
+//     pipeline from the crash queue above: its own bounded queue, its own
+//     batching timer, and no retry/spool on send failure. It is lossy by
+//     design - low-value, high-volume data - and, per privacy requirements,
+//     this file never mints, stores, or sends any identifier of its own (no
+//     cookies, no localStorage id); it only ships the event payloads the
+//     caller/browser hands it, and identity is established server-side.
 //
 // NOTE: this file must contain no U+2014 (em dash) characters - one consumer
 // repo lints for them and the file is vendored in verbatim. Use hyphens.
@@ -101,6 +108,16 @@ export interface EventEnvelope {
 // Public options.
 // ---------------------------------------------------------------------------
 
+export interface AnalyticsOptions {
+  /**
+   * Browser runtime only; ignored on node (trackEvent still works there,
+   * trackPageview does not - pageviews are a browser concept). Default off.
+   * When true: sends an initial pageview on install, then tracks SPA
+   * navigation via wrapped History pushState/replaceState + popstate.
+   */
+  auto?: boolean;
+}
+
 export interface InitOptions {
   /** http(s)://<publicKey>@<host>[:port][/path]. Absent/empty = silent no-op. */
   dsn?: string;
@@ -113,6 +130,16 @@ export interface InitOptions {
   maxBreadcrumbs?: number;
   /** Override auto-detection (window+document => browser, else node). */
   runtime?: 'browser' | 'node';
+  /** Usage analytics (trackPageview/trackEvent); see AnalyticsOptions. */
+  analytics?: AnalyticsOptions;
+  /**
+   * Node runtime only (ignored on browser): directory in which to persist the
+   * pending queue as `<spoolDir>/uh-oh-spool.json`, so events captured while
+   * offline survive a process restart. Writes are atomic (tmp + rename) and
+   * debounced (~1s); any filesystem failure is swallowed (never throws). No
+   * effect when the host has no reachable `node:fs`.
+   */
+  spoolDir?: string;
 }
 
 export interface CaptureOptions {
@@ -120,11 +147,40 @@ export interface CaptureOptions {
   mechanism?: Mechanism;
 }
 
+export interface CheckInOptions {
+  /**
+   * Minutes between expected check-ins. Required by the server on a
+   * monitor's first-ever ping (it 400s without it); optional on later pings
+   * (omit to leave the monitor's configured interval unchanged).
+   */
+  intervalMinutes?: number;
+}
+
 export interface BreadcrumbInput {
   category: string;
   message: string;
   level?: BreadcrumbLevel;
   data?: Record<string, unknown>;
+}
+
+/**
+ * Wire shape for one usage-analytics event, mirroring CONTRACT U-IN's
+ * `POST /ingest/:publicKey/usage` body element. Deliberately lean (no sdk/
+ * device/release metadata like EventEnvelope) - it carries no identifier of
+ * any kind; the server derives identity from the request itself.
+ */
+export interface UsageEvent {
+  type: 'pageview' | 'event';
+  /** Epoch ms; informational only - the server's receivedAt is authoritative. */
+  ts: number;
+  /** Required for 'pageview'. <=512 chars. */
+  path?: string;
+  /** Only ever set on the first pageview after init; raw (server reduces to domain). */
+  referrer?: string;
+  /** Required for 'event'. /^[a-zA-Z0-9_-]{1,64}$/ */
+  name?: string;
+  /** <=10 keys, keys <=64 chars, string values <=256 chars. */
+  props?: Record<string, string | number | boolean>;
 }
 
 // ---------------------------------------------------------------------------
@@ -167,6 +223,23 @@ interface StorageLike {
   removeItem: (key: string) => void;
 }
 
+/**
+ * Minimal synchronous `node:fs` surface used by the optional Node disk spool.
+ * Self-declared (not the ambient Node types) so the file still compiles with
+ * `types: []`. `existsSync`/`unlinkSync` are optional: the spool tolerates a
+ * fake that omits them.
+ */
+export interface FsLike {
+  mkdirSync: (path: string, opts?: { recursive?: boolean }) => unknown;
+  writeFileSync: (path: string, data: string) => void;
+  renameSync: (from: string, to: string) => void;
+  readFileSync: (path: string, encoding: string) => string;
+  existsSync?: (path: string) => boolean;
+  unlinkSync?: (path: string) => void;
+}
+
+type RequireLike = (id: string) => unknown;
+
 interface NavigatorLike {
   userAgent?: string;
   language?: string;
@@ -175,6 +248,16 @@ interface NavigatorLike {
 
 interface DocumentLike {
   visibilityState?: string;
+  referrer?: string;
+}
+
+interface LocationLike {
+  pathname?: string;
+}
+
+interface HistoryLike {
+  pushState: (...args: unknown[]) => unknown;
+  replaceState: (...args: unknown[]) => unknown;
 }
 
 interface CryptoLike {
@@ -215,8 +298,11 @@ interface GlobalScope {
   window?: unknown;
   document?: DocumentLike;
   navigator?: NavigatorLike;
+  location?: LocationLike;
+  history?: HistoryLike;
   localStorage?: StorageLike;
   process?: ProcessLike;
+  require?: RequireLike;
   fetch?: FetchLike;
   crypto?: CryptoLike;
   URL?: new (input: string) => UrlLike;
@@ -239,7 +325,13 @@ export interface ClientDeps {
   doc?: DocumentLike | null;
   navigator?: NavigatorLike | null;
   storage?: StorageLike | null;
+  /** Test/advanced seam for auto-mode pageviews (defaults to location.pathname). */
+  location?: LocationLike | null;
+  /** Test/advanced seam for auto-mode SPA-navigation hooks (pushState/replaceState). */
+  history?: HistoryLike | null;
   cryptoObj?: CryptoLike | null;
+  /** Inject a fake `node:fs` for the Node disk-spool tests. */
+  fs?: FsLike | null;
   now?: () => number;
   setTimeoutFn?: TimerSet;
   clearTimeoutFn?: TimerClear;
@@ -252,8 +344,10 @@ export interface ClientDeps {
 // ---------------------------------------------------------------------------
 
 const SDK_NAME = '@uh-oh/js';
-const SDK_VERSION = '0.2.0';
+const SDK_VERSION = '0.5.0';
 const SPOOL_KEY = 'uh-oh:spool';
+const SPOOL_FILE = 'uh-oh-spool.json';
+const SPOOL_DEBOUNCE_MS = 1_000;
 const MAX_QUEUE = 50;
 const MAX_SPOOL_BYTES = 500_000;
 const WIRE_BREADCRUMB_MAX = 100;
@@ -265,6 +359,17 @@ const TYPE_MAX = 256;
 const VALUE_MAX = 4096;
 const CATEGORY_MAX = 64;
 const MESSAGE_MAX = 1024;
+const SLUG_RE = /^[a-z0-9-]{1,64}$/;
+
+// -- usage analytics: batching + validation (mirrors CONTRACT U-IN server-side) --
+const ANALYTICS_MAX_QUEUE = 20;
+const ANALYTICS_DEBOUNCE_MS = 5_000;
+const USAGE_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+const USAGE_PATH_MAX = 512;
+const USAGE_REFERRER_MAX = 512;
+const USAGE_PROPS_MAX_KEYS = 10;
+const USAGE_PROP_KEY_MAX = 64;
+const USAGE_PROP_VALUE_MAX = 256;
 
 const G: GlobalScope = globalThis as unknown as GlobalScope;
 
@@ -289,6 +394,33 @@ function genId(cryptoObj: CryptoLike | undefined): string {
     // fall through to the manual id
   }
   return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+}
+
+/**
+ * Resolves a usable `node:fs` via a guarded `require`, reached through the
+ * globalThis view (same discipline as every other runtime global here). Returns
+ * undefined - never throws - when `require` or the module is unavailable
+ * (browsers, or an ESM host with no reachable `require`), which disables the
+ * disk spool silently.
+ */
+function loadFs(): FsLike | undefined {
+  try {
+    const req = G.require;
+    if (typeof req !== 'function') return undefined;
+    const mod = req('node:fs') as Partial<FsLike> | undefined;
+    if (
+      mod &&
+      typeof mod.mkdirSync === 'function' &&
+      typeof mod.writeFileSync === 'function' &&
+      typeof mod.renameSync === 'function' &&
+      typeof mod.readFileSync === 'function'
+    ) {
+      return mod as FsLike;
+    }
+  } catch {
+    // node:fs unavailable; the disk spool stays disabled.
+  }
+  return undefined;
 }
 
 export interface ParsedDsn {
@@ -443,6 +575,8 @@ export class Client {
   private readonly nav: NavigatorLike | undefined;
   private readonly storage: StorageLike | undefined;
   private readonly cryptoObj: CryptoLike | undefined;
+  private readonly location: LocationLike | undefined;
+  private readonly history: HistoryLike | undefined;
   private readonly now: () => number;
   private readonly setTimeoutFn: TimerSet;
   private readonly clearTimeoutFn: TimerClear;
@@ -471,6 +605,22 @@ export class Client {
   private uninstallers: Array<() => void> = [];
   private wasOnlyUncaughtListener = false;
 
+  // Usage analytics: independent queue, batching timer, and state - see the
+  // "analytics (usage tracking)" section below.
+  private analyticsQueue: UsageEvent[] = [];
+  private analyticsTimer: unknown = null;
+  private referrerSent = false;
+  private lastAutoPath: string | undefined;
+
+  // Node disk spool (opts.spoolDir; node runtime only). All undefined unless a
+  // spoolDir was given on a node runtime AND a node:fs was resolved.
+  private readonly fs: FsLike | undefined;
+  private readonly spoolDir: string | undefined;
+  private readonly spoolFile: string | undefined;
+  private readonly spoolTmp: string | undefined;
+  private spoolTimer: unknown = null;
+  private spoolDirty = false;
+
   constructor(opts: InitOptions, deps: ClientDeps = {}) {
     this.opts = opts;
     this.fetchFn = pick(deps.fetchFn, G.fetch);
@@ -479,6 +629,8 @@ export class Client {
     this.nav = pick(deps.navigator, G.navigator);
     this.storage = pick(deps.storage, G.localStorage);
     this.cryptoObj = pick(deps.cryptoObj, G.crypto);
+    this.location = pick(deps.location, G.location);
+    this.history = pick(deps.history, G.history);
     this.win =
       deps.win !== undefined
         ? deps.win === null
@@ -496,6 +648,23 @@ export class Client {
 
     const detected = this.win !== undefined && this.doc !== undefined ? 'browser' : 'node';
     this.runtime = opts.runtime ?? detected;
+
+    const spoolDir =
+      typeof opts.spoolDir === 'string' && opts.spoolDir.length > 0 ? opts.spoolDir : undefined;
+    if (this.runtime === 'node' && spoolDir !== undefined) {
+      this.spoolDir = spoolDir;
+      // Node accepts forward slashes on every platform, so a POSIX join is safe
+      // here and avoids pulling in node:path.
+      const sep = /[\\/]$/.test(spoolDir) ? '' : '/';
+      this.spoolFile = `${spoolDir}${sep}${SPOOL_FILE}`;
+      this.spoolTmp = `${this.spoolFile}.tmp`;
+      this.fs = deps.fs !== undefined ? (deps.fs === null ? undefined : deps.fs) : loadFs();
+    } else {
+      this.spoolDir = undefined;
+      this.spoolFile = undefined;
+      this.spoolTmp = undefined;
+      this.fs = undefined;
+    }
 
     const max = opts.maxBreadcrumbs;
     this.maxBreadcrumbs =
@@ -527,6 +696,7 @@ export class Client {
     if (this.runtime === 'browser') {
       this.installBrowserHandlers();
       this.installLifecycleFlush();
+      this.installAutoAnalytics();
     } else {
       this.installNodeHandlers();
     }
@@ -569,9 +739,15 @@ export class Client {
     const target = this.win;
     if (!target || typeof target.addEventListener !== 'function') return;
     try {
-      const onHide = (): void => this.beaconFlush();
+      const onHide = (): void => {
+        this.beaconFlush();
+        this.beaconFlushAnalytics();
+      };
       const onVisibility = (): void => {
-        if (this.doc && this.doc.visibilityState === 'hidden') this.beaconFlush();
+        if (this.doc && this.doc.visibilityState === 'hidden') {
+          this.beaconFlush();
+          this.beaconFlushAnalytics();
+        }
       };
       target.addEventListener('pagehide', onHide);
       target.addEventListener('visibilitychange', onVisibility);
@@ -633,6 +809,8 @@ export class Client {
     } catch {
       // best-effort flush
     }
+    // Anything that could not be sent gets spooled so the next start drains it.
+    this.flushSpool(true);
     if (this.wasOnlyUncaughtListener && !this.closed) {
       this.writeStderr(err);
       try {
@@ -824,6 +1002,75 @@ export class Client {
     this.fingerprint = parts;
   }
 
+  // ---- check-in (dead-man's-switch monitors) ------------------------------
+
+  /**
+   * Fire-and-forget check-in ping for a named monitor. One attempt only -
+   * never queued, spooled, or retried, since a late check-in is worthless.
+   * Silent no-op when uninitialised/no dsn; an invalid slug is dropped (debug
+   * log only). Never throws. No re-entrancy guard needed: unlike capture,
+   * this has no pipeline for a failure to loop back through.
+   */
+  checkIn(slug: string, opts?: CheckInOptions): void {
+    if (this.noop || this.closed) return;
+    try {
+      const dsn = this.dsn;
+      const fetchFn = this.fetchFn;
+      if (!dsn || !fetchFn) return;
+      if (typeof slug !== 'string' || !SLUG_RE.test(slug)) {
+        this.log('debug', `checkIn: invalid slug ${JSON.stringify(safeStr(slug, 80))}; dropped`);
+        return;
+      }
+      let url = `${dsn.ingestUrl}/check-in/${slug}`;
+      const interval = opts?.intervalMinutes;
+      if (typeof interval === 'number' && Number.isFinite(interval) && interval > 0) {
+        url += `?intervalMinutes=${String(Math.floor(interval))}`;
+      }
+      void this.sendCheckIn(url);
+    } catch (e) {
+      this.log('debug', 'checkIn failed internally', e);
+    }
+  }
+
+  /**
+   * Single-attempt POST for a check-in ping. Swallows every failure (network
+   * error, timeout, non-2xx) - there is no queue or retry timer for check-ins.
+   */
+  private async sendCheckIn(url: string): Promise<void> {
+    const fetchFn = this.fetchFn;
+    if (!fetchFn) return;
+    let controller: AbortControllerLike | undefined;
+    try {
+      const Ctor = G.AbortController;
+      if (Ctor) controller = new Ctor();
+    } catch {
+      controller = undefined;
+    }
+    const timer = controller
+      ? this.setTimeoutFn(() => {
+          try {
+            controller?.abort();
+          } catch {
+            // ignore
+          }
+        }, SEND_TIMEOUT_MS)
+      : null;
+    try {
+      const init: FetchInit = {
+        method: 'POST',
+        headers: {},
+        body: '',
+        ...(this.runtime === 'browser' ? { keepalive: true } : {}),
+        ...(controller ? { signal: controller.signal } : {}),
+      };
+      await fetchFn(url, init);
+    } catch {
+      // one attempt only - never retried, never throws
+    } finally {
+      if (timer !== null) this.clearTimeoutFn(timer);
+    }
+  }
+
   // ---- queue + transport -------------------------------------------------
 
   private enqueue(env: EventEnvelope): void {
@@ -986,7 +1233,14 @@ export class Client {
   // ---- browser persistence ----------------------------------------------
 
   private persist(): void {
-    if (this.runtime !== 'browser') return;
+    if (this.runtime === 'browser') {
+      this.persistBrowser();
+      return;
+    }
+    this.scheduleSpool();
+  }
+
+  private persistBrowser(): void {
     const storage = this.storage;
     if (!storage) return;
     try {
@@ -1004,7 +1258,14 @@ export class Client {
   }
 
   private restore(): void {
-    if (this.runtime !== 'browser') return;
+    if (this.runtime === 'browser') {
+      this.restoreBrowser();
+      return;
+    }
+    this.restoreNode();
+  }
+
+  private restoreBrowser(): void {
     const storage = this.storage;
     if (!storage) return;
     let raw: string | null = null;
@@ -1030,9 +1291,23 @@ export class Client {
       return;
     }
 
+    // Restored events are older, so they go in front, then cap.
+    this.queue = [...this.coerceEntries(parsed), ...this.queue].slice(-MAX_QUEUE);
+  }
+
+  private safeRemoveSpool(): void {
+    try {
+      this.storage?.removeItem(SPOOL_KEY);
+    } catch {
+      // ignore
+    }
+  }
+
+  /** Validates raw spool entries; drops (with a debug log) any malformed one. */
+  private coerceEntries(parsed: unknown[]): QueueItem[] {
     const valid: QueueItem[] = [];
-    for (const raw2 of parsed) {
-      const it = raw2 as { id?: unknown; env?: unknown };
+    for (const raw of parsed) {
+      const it = raw as { id?: unknown; env?: unknown };
       if (
         it &&
         typeof it === 'object' &&
@@ -1045,15 +1320,113 @@ export class Client {
         this.log('debug', 'discarded malformed spool entry');
       }
     }
-    // Restored events are older, so they go in front, then cap.
-    this.queue = [...valid, ...this.queue].slice(-MAX_QUEUE);
+    return valid;
   }
 
-  private safeRemoveSpool(): void {
+  // ---- node disk spool ---------------------------------------------------
+
+  /** Debounced (~1s) request to write the queue to disk. No-op without spool. */
+  private scheduleSpool(): void {
+    if (this.runtime !== 'node' || !this.fs || !this.spoolFile) return;
+    this.spoolDirty = true;
+    if (this.spoolTimer !== null) return;
+    this.spoolTimer = this.setTimeoutFn(() => {
+      this.spoolTimer = null;
+      this.flushSpool();
+    }, SPOOL_DEBOUNCE_MS);
+    // Do not keep a Node event loop alive purely for a pending spool write.
     try {
-      this.storage?.removeItem(SPOOL_KEY);
+      const t = this.spoolTimer as { unref?: () => void };
+      if (t && typeof t.unref === 'function') t.unref();
     } catch {
-      // ignore
+      // unref unavailable; harmless
+    }
+  }
+
+  /**
+   * Writes the queue to `<spoolDir>/uh-oh-spool.json` atomically: serialize to
+   * a sibling `.tmp` file then rename over the target, so a concurrent reader
+   * never sees a partially written file. Force-flushes bypass the dirty check
+   * (used on close and on the uncaught-exception exit path). Never throws.
+   */
+  private flushSpool(force = false): void {
+    if (this.runtime !== 'node') return;
+    const fs = this.fs;
+    const file = this.spoolFile;
+    const tmp = this.spoolTmp;
+    const dir = this.spoolDir;
+    if (!fs || !file || !tmp || dir === undefined) return;
+    if (!force && !this.spoolDirty) return;
+    this.spoolDirty = false;
+    try {
+      let items = this.queue.slice(-MAX_QUEUE);
+      let serialized = JSON.stringify(items);
+      while (serialized.length > MAX_SPOOL_BYTES && items.length > 1) {
+        items = items.slice(1);
+        serialized = JSON.stringify(items);
+      }
+      if (items.length === 0) {
+        this.safeUnlink(file);
+        return;
+      }
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(tmp, serialized);
+      fs.renameSync(tmp, file);
+    } catch (e) {
+      this.log('debug', 'node spool persist failed', e);
+      // Leave no half-written tmp file behind on failure.
+      this.safeUnlink(tmp);
+    }
+  }
+
+  private restoreNode(): void {
+    const fs = this.fs;
+    const file = this.spoolFile;
+    if (!fs || !file) return;
+    let raw: string;
+    try {
+      if (typeof fs.existsSync === 'function' && !fs.existsSync(file)) return;
+      raw = fs.readFileSync(file, 'utf8');
+    } catch (e) {
+      // Missing or unreadable file: nothing to restore.
+      this.log('debug', 'node spool read failed', e);
+      return;
+    }
+    if (!raw) return;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      this.log('debug', 'node spool JSON parse failed; discarding corrupt spool');
+      this.safeUnlink(file);
+      return;
+    }
+    if (!Array.isArray(parsed)) {
+      this.log('debug', 'node spool was not an array; discarding corrupt spool');
+      this.safeUnlink(file);
+      return;
+    }
+
+    this.queue = [...this.coerceEntries(parsed), ...this.queue].slice(-MAX_QUEUE);
+  }
+
+  private safeUnlink(path: string): void {
+    try {
+      this.fs?.unlinkSync?.(path);
+    } catch {
+      // best-effort
+    }
+  }
+
+  private clearSpoolTimer(): void {
+    if (this.spoolTimer !== null) {
+      try {
+        this.clearTimeoutFn(this.spoolTimer);
+      } catch {
+        // ignore
+      }
+      this.spoolTimer = null;
     }
   }
 
@@ -1079,8 +1452,8 @@ export class Client {
     this.persist();
   }
 
-  private beaconBody(env: EventEnvelope): unknown {
-    const json = JSON.stringify(env);
+  private beaconBody(payload: unknown): unknown {
+    const json = JSON.stringify(payload);
     try {
       const BlobCtorRef = G.Blob;
       if (BlobCtorRef) return new BlobCtorRef([json], { type: 'application/json' });
@@ -1088,6 +1461,362 @@ export class Client {
       // fall through to string
     }
     return json;
+  }
+
+  // ---- analytics (usage tracking) ----------------------------------------
+  //
+  // Independent of the crash queue above: its own bounded queue (cap 20),
+  // its own 5s debounce-after-first-enqueue batching timer, and NO retry or
+  // spool on send failure - a dropped analytics batch is simply gone. This
+  // is intentional: usage analytics is high-volume, low-value-per-event data
+  // where holding memory/disk to retry a failed batch is the wrong trade,
+  // unlike a crash report. Never mints/stores/sends any identifier of its
+  // own; identity is entirely server-side (see CONTRACT U-IN).
+
+  /**
+   * Records a pageview. Browser: defaults `path` to `location.pathname`.
+   * Node: always dropped (with a debug log) - pageviews are a browser
+   * concept. Silent no-op when uninitialised/no dsn/closed. Never throws.
+   */
+  trackPageview(path?: string): void {
+    if (this.noop || this.closed) return;
+    try {
+      if (this.runtime === 'node') {
+        this.log(
+          'debug',
+          'trackPageview: dropped on node runtime (pageviews are a browser concept)',
+        );
+        return;
+      }
+      this.sendPageview(path);
+    } catch (e) {
+      this.log('debug', 'trackPageview failed internally', e);
+    }
+  }
+
+  /**
+   * Records a named custom event with optional props. Works on both
+   * runtimes. Validates client-side against the same shape the server
+   * enforces (name regex, <=10 props, key/value length caps); any violation
+   * drops the WHOLE call (not a partial/truncated send) with a debug log, so
+   * the client never ships something the server would reject anyway. Never
+   * throws.
+   */
+  trackEvent(name: string, props?: Record<string, string | number | boolean>): void {
+    if (this.noop || this.closed) return;
+    try {
+      if (typeof name !== 'string' || !USAGE_NAME_RE.test(name)) {
+        this.log('debug', `trackEvent: invalid name ${JSON.stringify(safeStr(name, 80))}; dropped`);
+        return;
+      }
+      const validated = this.validateProps(props);
+      if (!validated.ok) return; // reason already logged by validateProps
+      const evt: UsageEvent = {
+        type: 'event',
+        ts: this.now(),
+        name,
+        ...(validated.props ? { props: validated.props } : {}),
+      };
+      this.enqueueAnalytics(evt);
+    } catch (e) {
+      this.log('debug', 'trackEvent failed internally', e);
+    }
+  }
+
+  private resolvePath(explicitPath: string | undefined): string {
+    if (typeof explicitPath === 'string' && explicitPath.length > 0) return explicitPath;
+    const loc = this.location;
+    return loc && typeof loc.pathname === 'string' ? loc.pathname : '';
+  }
+
+  /**
+   * Builds and enqueues one pageview. `path` falls back to
+   * `location.pathname` when omitted (used both for manual trackPageview()
+   * calls and for auto-mode navigation). A missing/empty resolved path, or
+   * one over the 512-char wire cap, drops the whole pageview (structural
+   * violation - mirrors what the server would reject). An over-length
+   * referrer instead just omits the referrer field and keeps the pageview:
+   * referrer is optional/best-effort, so degrading gracefully beats losing
+   * an entire pageview count over an incidental field.
+   */
+  private sendPageview(explicitPath: string | undefined): void {
+    const path = this.resolvePath(explicitPath);
+    if (!path) {
+      this.log('debug', 'trackPageview: dropped (no path available)');
+      return;
+    }
+    if (path.length > USAGE_PATH_MAX) {
+      this.log('debug', 'trackPageview: dropped (path exceeds 512 chars)');
+      return;
+    }
+    const evt: UsageEvent = { type: 'pageview', ts: this.now(), path };
+    if (!this.referrerSent) {
+      this.referrerSent = true;
+      const doc = this.doc;
+      const ref = doc && typeof doc.referrer === 'string' ? doc.referrer : '';
+      if (ref) {
+        if (ref.length > USAGE_REFERRER_MAX) {
+          this.log('debug', 'trackPageview: referrer exceeds 512 chars; omitted');
+        } else {
+          evt.referrer = ref;
+        }
+      }
+    }
+    this.enqueueAnalytics(evt);
+  }
+
+  /** Validates trackEvent's `props`; ok:false means "drop the whole event" (reason logged here). */
+  private validateProps(props: Record<string, string | number | boolean> | undefined): {
+    ok: boolean;
+    props?: Record<string, string | number | boolean>;
+  } {
+    if (props === undefined) return { ok: true };
+    if (typeof props !== 'object' || props === null) {
+      this.log('debug', 'trackEvent: props must be an object; dropped');
+      return { ok: false };
+    }
+    const keys = Object.keys(props);
+    if (keys.length > USAGE_PROPS_MAX_KEYS) {
+      this.log('debug', `trackEvent: too many props (${String(keys.length)} > 10); dropped`);
+      return { ok: false };
+    }
+    const clean: Record<string, string | number | boolean> = {};
+    for (const key of keys) {
+      if (key.length > USAGE_PROP_KEY_MAX) {
+        this.log(
+          'debug',
+          `trackEvent: prop key ${JSON.stringify(safeStr(key, 80))} too long; dropped`,
+        );
+        return { ok: false };
+      }
+      const value = props[key];
+      if (typeof value === 'string') {
+        if (value.length > USAGE_PROP_VALUE_MAX) {
+          this.log('debug', `trackEvent: prop "${key}" value exceeds 256 chars; dropped`);
+          return { ok: false };
+        }
+        clean[key] = value;
+      } else if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+          this.log('debug', `trackEvent: prop "${key}" is not a finite number; dropped`);
+          return { ok: false };
+        }
+        clean[key] = value;
+      } else if (typeof value === 'boolean') {
+        clean[key] = value;
+      } else {
+        this.log('debug', `trackEvent: prop "${key}" has an unsupported value type; dropped`);
+        return { ok: false };
+      }
+    }
+    return keys.length > 0 ? { ok: true, props: clean } : { ok: true };
+  }
+
+  private enqueueAnalytics(evt: UsageEvent): void {
+    if (!this.dsn) return;
+    this.analyticsQueue.push(evt);
+    if (this.analyticsQueue.length >= ANALYTICS_MAX_QUEUE) {
+      void this.flushAnalytics();
+      return;
+    }
+    this.ensureAnalyticsTimer();
+  }
+
+  private ensureAnalyticsTimer(): void {
+    if (this.analyticsTimer !== null) return;
+    this.analyticsTimer = this.setTimeoutFn(() => {
+      this.analyticsTimer = null;
+      void this.flushAnalytics();
+    }, ANALYTICS_DEBOUNCE_MS);
+    // Do not keep a Node event loop alive purely for a pending analytics batch.
+    try {
+      const t = this.analyticsTimer as { unref?: () => void };
+      if (t && typeof t.unref === 'function') t.unref();
+    } catch {
+      // unref unavailable (browser); harmless
+    }
+  }
+
+  private clearAnalyticsTimer(): void {
+    if (this.analyticsTimer !== null) {
+      try {
+        this.clearTimeoutFn(this.analyticsTimer);
+      } catch {
+        // ignore
+      }
+      this.analyticsTimer = null;
+    }
+  }
+
+  /** Drains the analytics queue with a single POST. Resolves once sent (or immediately if empty). */
+  private flushAnalytics(): Promise<void> {
+    this.clearAnalyticsTimer();
+    if (!this.dsn || this.analyticsQueue.length === 0) return Promise.resolve();
+    const batch = this.analyticsQueue;
+    this.analyticsQueue = [];
+    return this.sendAnalyticsBatch(batch);
+  }
+
+  /**
+   * Single-attempt POST of `{ events }` to `<ingestUrl>/usage`. Lossy by
+   * design: the batch is already removed from the queue by the caller
+   * before this runs, so on any failure (network error, non-2xx response)
+   * it is simply dropped - no retry, no spool, matching the crash queue's
+   * discipline is deliberately NOT done here.
+   */
+  private async sendAnalyticsBatch(events: UsageEvent[]): Promise<void> {
+    const dsn = this.dsn;
+    const fetchFn = this.fetchFn;
+    if (!dsn || !fetchFn) return;
+
+    let controller: AbortControllerLike | undefined;
+    try {
+      const Ctor = G.AbortController;
+      if (Ctor) controller = new Ctor();
+    } catch {
+      controller = undefined;
+    }
+    const timer = controller
+      ? this.setTimeoutFn(() => {
+          try {
+            controller?.abort();
+          } catch {
+            // ignore
+          }
+        }, SEND_TIMEOUT_MS)
+      : null;
+
+    try {
+      const init: FetchInit = {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ events }),
+        ...(this.runtime === 'browser' ? { keepalive: true } : {}),
+        ...(controller ? { signal: controller.signal } : {}),
+      };
+      const res = await fetchFn(`${dsn.ingestUrl}/usage`, init);
+      if (!res.ok) {
+        this.log('debug', `analytics batch dropped on non-2xx response (${String(res.status)})`);
+      }
+    } catch {
+      this.log('debug', 'analytics batch dropped: send failed (no retry, no spool)');
+    } finally {
+      if (timer !== null) this.clearTimeoutFn(timer);
+    }
+  }
+
+  /** Beacon-based batch flush for pagehide/hidden, mirroring the crash queue's beaconFlush discipline. */
+  private beaconFlushAnalytics(): void {
+    if (!this.dsn || this.analyticsQueue.length === 0) return;
+    this.clearAnalyticsTimer();
+    const batch = this.analyticsQueue;
+    this.analyticsQueue = [];
+    const nav = this.nav;
+    const beacon = nav && typeof nav.sendBeacon === 'function' ? nav.sendBeacon.bind(nav) : null;
+    if (!beacon) {
+      // No beacon support: best-effort async send. The page may unload
+      // before this completes - acceptable, analytics is lossy by design.
+      void this.sendAnalyticsBatch(batch);
+      return;
+    }
+    try {
+      const ok = beacon(`${this.dsn.ingestUrl}/usage`, this.beaconBody({ events: batch }));
+      if (!ok) this.log('debug', 'analytics beacon flush rejected by the browser; batch dropped');
+    } catch {
+      this.log('debug', 'analytics beacon flush failed; batch dropped');
+    }
+  }
+
+  /**
+   * Browser-only. When `analytics.auto` is set: sends one initial pageview,
+   * then hooks History pushState/replaceState + popstate to auto-track SPA
+   * navigation, de-duping consecutive identical paths. No-op otherwise.
+   */
+  private installAutoAnalytics(): void {
+    if (!this.opts.analytics?.auto) return;
+    try {
+      this.sendPageview(undefined);
+      this.lastAutoPath = this.resolvePath(undefined);
+      this.installHistoryHooks();
+      this.installPopstateHook();
+    } catch (e) {
+      this.log('debug', 'failed to install auto analytics', e);
+    }
+  }
+
+  /**
+   * Wraps history.pushState/replaceState: always calls the original through
+   * (via apply, forwarding `this` and args) and always rethrows exactly what
+   * the original threw, if anything - our tracking hook runs regardless and
+   * never itself alters that call's outcome. Restored verbatim on close().
+   */
+  private installHistoryHooks(): void {
+    const hist = this.history;
+    if (!hist) return;
+    const handleNavigation = (): void => this.handleAutoNavigation();
+    const wrap = (method: 'pushState' | 'replaceState'): void => {
+      const original = hist[method];
+      if (typeof original !== 'function') return;
+      const wrapped = function (this: unknown, ...args: unknown[]): unknown {
+        let threw = false;
+        let err: unknown;
+        let result: unknown;
+        try {
+          result = original.apply(this, args);
+        } catch (e) {
+          threw = true;
+          err = e;
+        }
+        try {
+          handleNavigation();
+        } catch {
+          // tracking must never affect the original call's outcome
+        }
+        if (threw) throw err;
+        return result;
+      };
+      hist[method] = wrapped;
+      this.uninstallers.push(() => {
+        try {
+          if (hist[method] === wrapped) hist[method] = original;
+        } catch {
+          // best-effort teardown
+        }
+      });
+    };
+    wrap('pushState');
+    wrap('replaceState');
+  }
+
+  private installPopstateHook(): void {
+    const target = this.win;
+    if (!target || typeof target.addEventListener !== 'function') return;
+    const onPopState = (): void => this.handleAutoNavigation();
+    target.addEventListener('popstate', onPopState);
+    this.uninstallers.push(() => {
+      try {
+        target.removeEventListener?.('popstate', onPopState);
+      } catch {
+        // best-effort teardown
+      }
+    });
+  }
+
+  /** Sends an auto-mode pageview for the current location, de-duping consecutive identical paths. */
+  private handleAutoNavigation(): void {
+    try {
+      const path = this.resolvePath(undefined);
+      if (path === this.lastAutoPath) return;
+      this.lastAutoPath = path;
+      this.sendPageview(path);
+    } catch (e) {
+      this.log('debug', 'auto pageview tracking failed', e);
+    }
+  }
+
+  /** Pending analytics-queue length (test/introspection helper). */
+  analyticsSize(): number {
+    return this.analyticsQueue.length;
   }
 
   // ---- lifecycle ---------------------------------------------------------
@@ -1114,7 +1843,7 @@ export class Client {
         resolve();
       };
       timer = this.setTimeoutFn(finish, ms);
-      this.drainQueue().then(finish, finish);
+      Promise.all([this.drainQueue(), this.flushAnalytics()]).then(finish, finish);
     });
   }
 
@@ -1129,6 +1858,12 @@ export class Client {
     }
     this.uninstallers = [];
     this.clearRetryTimer();
+    // Best-effort, fire-and-forget final flush of any pending analytics
+    // (lossy by design - close() does not await or retry this).
+    void this.flushAnalytics();
+    // Persist any still-pending events before we go, then stop the debounce.
+    this.flushSpool(true);
+    this.clearSpoolTimer();
   }
 
   /** Pending queue length (test/introspection helper). */
@@ -1219,6 +1954,30 @@ export function setTag(key: string, value: string | null): void {
 export function setFingerprint(parts: string[] | null): void {
   try {
     current?.setFingerprint(parts);
+  } catch {
+    // never throw
+  }
+}
+
+export function checkIn(slug: string, opts?: CheckInOptions): void {
+  try {
+    current?.checkIn(slug, opts);
+  } catch {
+    // never throw
+  }
+}
+
+export function trackPageview(path?: string): void {
+  try {
+    current?.trackPageview(path);
+  } catch {
+    // never throw
+  }
+}
+
+export function trackEvent(name: string, props?: Record<string, string | number | boolean>): void {
+  try {
+    current?.trackEvent(name, props);
   } catch {
     // never throw
   }

@@ -1,9 +1,11 @@
 import path from 'node:path';
 import type { readConfig } from '../config.js';
-import { apiFetch } from '../client.js';
-import type { ApiError } from '../client.js';
+import { apiFetch, describeAuthError } from '../client.js';
 
 type UploadKind = 'mapping' | 'sourcemap';
+// Web/node uploads are the Next.js escape-hatch surface (§ CONTRACT); mapping
+// and plain hermes sourcemap uploads stay on the original android-only path.
+type UploadPlatform = 'web' | 'node';
 
 export type UploadDeps = {
   config: { read: typeof readConfig };
@@ -16,26 +18,24 @@ export type UploadDeps = {
 type ProjectRow = { id: string; slug: string };
 type ReleaseRow = { id: string; version: string; build: string; platform: string };
 
-const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB — server accepts multipart; see report re: streaming.
+export const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB — server accepts multipart; see report re: streaming.
 
-const parseRelease = (release: string): { version: string; build: string } | null => {
+export const parseRelease = (release: string): { version: string; build: string } | null => {
   const plus = release.lastIndexOf('+');
   if (plus <= 0 || plus === release.length - 1) return null;
   return { version: release.slice(0, plus), build: release.slice(plus + 1) };
 };
 
-// A 401/403 on any command almost always means the stored token expired or
-// was revoked (logout, JWT secret rotation) — point the user at the fix
-// instead of just surfacing the raw server error.
-const describeError = (prefix: string, error: ApiError): string =>
-  error.kind === 'auth'
-    ? `${prefix}: ${error.message} — run \`uh-oh login\` to refresh your token`
-    : `${prefix}: ${error.message}`;
-
 export const upload = async (
   deps: UploadDeps,
   kind: UploadKind,
-  args: { project: string; release: string; file: string },
+  args: {
+    project: string;
+    release: string;
+    file: string;
+    platform?: UploadPlatform;
+    bundlePath?: string;
+  },
 ): Promise<number> => {
   const cfg = await deps.config.read();
   if (!cfg?.token) {
@@ -56,7 +56,7 @@ export const upload = async (
   );
 
   if (!projectsResult.ok) {
-    deps.log(describeError('Error fetching projects', projectsResult.error));
+    deps.log(describeAuthError('Error fetching projects', projectsResult.error));
     return 2;
   }
 
@@ -73,13 +73,55 @@ export const upload = async (
   );
 
   if (!releasesResult.ok) {
-    deps.log(describeError('Error fetching releases', releasesResult.error));
+    deps.log(describeAuthError('Error fetching releases', releasesResult.error));
     return 2;
   }
 
-  const rel = releasesResult.data.releases.find(
-    (r) => r.version === parsed.version && r.build === parsed.build && r.platform === 'android',
+  // Release rows are scoped per-platform (schema: unique on project+version+build+platform), so
+  // the lookup platform must track what we're about to upload, not stay hardcoded to 'android'.
+  // Only `upload sourcemap` exposes --platform; mapping uploads and hermes sourcemaps (the
+  // pre-existing behavior, --platform omitted) always resolve against the 'android' release.
+  const effectivePlatform: string =
+    kind === 'sourcemap' && args.platform ? args.platform : 'android';
+
+  let rel = releasesResult.data.releases.find(
+    (r) =>
+      r.version === parsed.version && r.build === parsed.build && r.platform === effectivePlatform,
   );
+
+  // Web/node CONTRACT flow only (`upload sourcemap --platform`): source-map
+  // uploads run in deploy pipelines BEFORE the first crash event of a release,
+  // so a missing row is normal — create it via the idempotent upsert
+  // (POST /api/projects/:id/releases → 201 created / 200 existing). The legacy
+  // android flows keep requiring a device-seen release, unchanged.
+  if (!rel && kind === 'sourcemap' && args.platform) {
+    const createdResult = await apiFetch<{ release: ReleaseRow }>(
+      `${cfg.server}/api/projects/${project.id}/releases`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          version: parsed.version,
+          build: parsed.build,
+          platform: effectivePlatform,
+        }),
+        token: cfg.token,
+      },
+      deps.fetchFn,
+    );
+    if (!createdResult.ok) {
+      deps.log(
+        describeAuthError(
+          `Could not create release ${args.release} for platform ${effectivePlatform}`,
+          createdResult.error,
+        ),
+      );
+      return 2;
+    }
+    deps.log(`Created release ${args.release} for platform ${effectivePlatform}`);
+    rel = createdResult.data.release;
+  }
+
   if (!rel) {
     deps.log(
       'Release not yet seen by the server — send at least one event from this release first',
@@ -113,13 +155,21 @@ export const upload = async (
   }
 
   const form = new FormData();
-  // path.basename, not split('/').pop(): the latter passes a Windows path
-  // like "C:\Users\dev\mapping.txt" through unmangled since it has no "/",
-  // so the server would receive the whole path as the filename.
-  form.append('file', new Blob([fileBuffer]), path.basename(args.file) || 'file');
-  form.append('platform', 'android');
-  if (kind === 'sourcemap') {
+  // path.win32.basename, not plain basename: the win32 parser treats BOTH
+  // separators as separators, so a Windows path like "C:\Users\dev\mapping.txt"
+  // reduces to its filename even when the CLI runs on POSIX (plain
+  // path.basename on Linux passes the whole string through, and
+  // split('/').pop() has the same failure).
+  form.append('file', new Blob([fileBuffer]), path.win32.basename(args.file) || 'file');
+  form.append('platform', effectivePlatform);
+  if (kind === 'sourcemap' && !args.platform) {
+    // Legacy hermes flow (no --platform given): keep sending the sourcemap
+    // marker exactly as before. The web/node CONTRACT fields (platform +
+    // bundlePath) replace this marker when --platform is explicitly used.
     form.append('sourcemap', 'true');
+  }
+  if (args.bundlePath) {
+    form.append('bundlePath', args.bundlePath);
   }
 
   const uploadResult = await apiFetch<{ release: ReleaseRow }>(
@@ -129,7 +179,7 @@ export const upload = async (
   );
 
   if (!uploadResult.ok) {
-    deps.log(describeError('Upload failed', uploadResult.error));
+    deps.log(describeAuthError('Upload failed', uploadResult.error));
     return 2;
   }
 

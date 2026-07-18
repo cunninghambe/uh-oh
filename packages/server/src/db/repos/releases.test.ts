@@ -5,6 +5,7 @@ import { makeTestDb } from '../test-utils.js';
 import { createProject } from './projects.js';
 import {
   upsertRelease,
+  upsertReleaseWithStatus,
   getReleaseById,
   listReleasesForProject,
   markMappingUploaded,
@@ -64,6 +65,29 @@ describe('upsertRelease', () => {
       platform: 'android',
     });
     expect(a.id).not.toBe(b.id);
+  });
+});
+
+describe('upsertReleaseWithStatus', () => {
+  it('reports created=true on first insert and created=false on a duplicate', () => {
+    const input = { projectId, version: '1.0.0', build: '42', platform: 'web' as const };
+    const first = upsertReleaseWithStatus(db, input);
+    expect(first.created).toBe(true);
+    const second = upsertReleaseWithStatus(db, input);
+    expect(second.created).toBe(false);
+    // Idempotent: same row on the second call.
+    expect(second.release.id).toBe(first.release.id);
+  });
+
+  it('created=true again for a different platform of the same version+build', () => {
+    upsertReleaseWithStatus(db, { projectId, version: '1.0.0', build: '1', platform: 'web' });
+    const node = upsertReleaseWithStatus(db, {
+      projectId,
+      version: '1.0.0',
+      build: '1',
+      platform: 'node',
+    });
+    expect(node.created).toBe(true);
   });
 });
 

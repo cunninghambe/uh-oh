@@ -51,6 +51,35 @@ export function mockFetch(script: FetchStep[] = []): MockFetch {
   return { fn, calls };
 }
 
+export interface RawFetchCall {
+  url: string;
+  init: FetchInitShape;
+}
+
+export interface MockRawFetch {
+  fn: (url: string, init: FetchInitShape) => Promise<{ ok: boolean; status: number }>;
+  calls: RawFetchCall[];
+}
+
+/**
+ * A fetch stub for endpoints with no JSON body (e.g. checkIn pings, whose
+ * body is the empty string). Behaves like `mockFetch` but records calls
+ * verbatim instead of parsing `init.body` as an envelope.
+ */
+export function mockRawFetch(script: FetchStep[] = []): MockRawFetch {
+  const calls: RawFetchCall[] = [];
+  const last = script.length > 0 ? script[script.length - 1] : undefined;
+  let i = 0;
+  const fn = (url: string, init: FetchInitShape): Promise<{ ok: boolean; status: number }> => {
+    calls.push({ url, init });
+    const step = script[i] ?? last ?? {};
+    i += 1;
+    if (step.reject) return Promise.reject(new Error('network down'));
+    return Promise.resolve({ ok: step.ok ?? true, status: step.status ?? 202 });
+  };
+  return { fn, calls };
+}
+
 export interface FakeStorage {
   storage: {
     getItem: (k: string) => string | null;
@@ -215,5 +244,91 @@ export function fakeNavigator(
         return opts.beaconOk ?? true;
       },
     },
+  };
+}
+
+export interface FakeLocation {
+  loc: { pathname?: string };
+  setPath: (p: string) => void;
+}
+
+/** A mutable `location`-like fake for auto-analytics tests (defaults to '/'). */
+export function fakeLocation(pathname = '/'): FakeLocation {
+  const loc: { pathname?: string } = { pathname };
+  return {
+    loc,
+    setPath: (p: string): void => {
+      loc.pathname = p;
+    },
+  };
+}
+
+export interface FakeHistory {
+  history: {
+    pushState: (...args: unknown[]) => unknown;
+    replaceState: (...args: unknown[]) => unknown;
+  };
+  pushCalls: unknown[][];
+  replaceCalls: unknown[][];
+}
+
+/** A fake `history` for auto-analytics SPA-navigation tests; can be made to throw. */
+export function fakeHistory(
+  opts: { throwOnPush?: boolean; throwOnReplace?: boolean } = {},
+): FakeHistory {
+  const pushCalls: unknown[][] = [];
+  const replaceCalls: unknown[][] = [];
+  return {
+    pushCalls,
+    replaceCalls,
+    history: {
+      pushState: (...args: unknown[]): unknown => {
+        pushCalls.push(args);
+        if (opts.throwOnPush) throw new Error('pushState boom');
+        return undefined;
+      },
+      replaceState: (...args: unknown[]): unknown => {
+        replaceCalls.push(args);
+        if (opts.throwOnReplace) throw new Error('replaceState boom');
+        return undefined;
+      },
+    },
+  };
+}
+
+export interface FakeTimers {
+  setTimeoutFn: (cb: () => void, ms: number) => unknown;
+  clearTimeoutFn: (handle: unknown) => void;
+  /** Fires every currently-pending timer callback (and clears them). */
+  fireAll: () => void;
+  /** Number of timers currently pending (not yet fired or cleared). */
+  pending: () => number;
+}
+
+/**
+ * A controllable fake for setTimeout/clearTimeout: schedules callbacks
+ * without a real delay, letting a test assert nothing fired yet, then fire
+ * them deterministically via `fireAll()`. Used for the analytics batching
+ * debounce, where a real 5s wait (or firing immediately, which would hide a
+ * debounce bug) would not do.
+ */
+export function fakeTimers(): FakeTimers {
+  const pending = new Map<number, () => void>();
+  let nextId = 1;
+  return {
+    setTimeoutFn: (cb: () => void): unknown => {
+      const id = nextId++;
+      pending.set(id, cb);
+      return id;
+    },
+    clearTimeoutFn: (handle: unknown): void => {
+      pending.delete(handle as number);
+    },
+    fireAll: (): void => {
+      const cbs = [...pending.values()];
+      pending.clear();
+      for (const cb of cbs) cb();
+    },
+    pending: () => pending.size,
   };
 }

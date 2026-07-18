@@ -3,17 +3,23 @@ import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import type { z } from 'zod';
 
 import { registerApiRoutes } from './api/routes.js';
+import { registerMonitorRoutes } from './api/monitors-routes.js';
 import { registerAuthRoutes } from './auth/routes.js';
 import { createLoginLimiter } from './auth/login-limiter.js';
 import type { Db } from './db/index.js';
 import { registerSymbolizationRoutes } from './symbolication/routes.js';
 import type { IngestEntry } from './ingest/ingest.js';
 import { makeIngest } from './ingest/ingest.js';
+import { registerCheckInRoute } from './ingest/check-in.js';
+import { registerUsageIngestRoute } from './ingest/usage.js';
 import { createRateLimiter } from './ingest/rate-limit.js';
 import { createIpRateLimiter } from './hardening/ip-rate-limit.js';
 import { securityHeadersHook } from './hardening/security-headers.js';
 import { registerMetricsRoute } from './metrics/route.js';
 import { metrics } from './metrics/registry.js';
+import { registerMcpRoute } from './mcp/route.js';
+import { InProcessBackend } from './mcp/in-process-backend.js';
+import { MIN_SYMBOL_TOKEN_LENGTH } from './auth/symbol-token.js';
 
 export type ServerDeps = {
   db: Db;
@@ -27,6 +33,12 @@ export type ServerDeps = {
   ipRateBurst?: number;
   /** Max symbol upload size in bytes (default 50 MB). */
   maxSymbolBytes?: number;
+  /**
+   * Scoped symbol-upload token (CONTRACT T). When set (≥16 chars), requests
+   * bearing `X-Uh-Oh-Symbol-Token` are authorized on the upload-flow endpoints
+   * WITHOUT a JWT. Unset = feature off.
+   */
+  symbolToken?: string | undefined;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -39,6 +51,13 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   }
   if (!deps.password || deps.password.length === 0) {
     throw new Error('buildServer requires a non-empty admin password');
+  }
+  // Defense in depth: the env layer (symbolTokenFromEnv) already rejects a short
+  // token before boot, but enforce the floor here too so any caller fails fast.
+  if (deps.symbolToken !== undefined && deps.symbolToken.length < MIN_SYMBOL_TOKEN_LENGTH) {
+    throw new Error(
+      `buildServer: symbolToken must be at least ${String(MIN_SYMBOL_TOKEN_LENGTH)} characters`,
+    );
   }
 
   const app = Fastify({
@@ -54,6 +73,14 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   const ingestRateLimiter = createRateLimiter({ capacity: 10, refillPerSec: 1 });
   const ingest = deps.ingest ?? makeIngest({ db: deps.db, rateLimiter: ingestRateLimiter });
 
+  // Check-in limiter: generous, keyed per (publicKey, slug). A healthy monitor
+  // pings every few minutes, so a big bucket tolerates retries/bursts.
+  const checkInLimiter = createRateLimiter({ capacity: 30, refillPerSec: 1 });
+
+  // Usage limiter: keyed per publicKey. Usage analytics is high-volume by design
+  // (every pageview), so the bucket is large with a fast refill.
+  const usageLimiter = createRateLimiter({ capacity: 200, refillPerSec: 20 });
+
   const ipLimiter = createIpRateLimiter({
     perMinute: deps.ipRatePerMinute ?? 600,
     burst: deps.ipRateBurst ?? 100,
@@ -66,6 +93,8 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
       const now = Date.now();
       ipLimiter.cleanup(now);
       ingestRateLimiter.cleanup(now);
+      checkInLimiter.cleanup(now);
+      usageLimiter.cleanup(now);
       loginLimiter.cleanup(now);
     },
     5 * 60 * 1000,
@@ -134,15 +163,23 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
 
   app.get('/healthz', () => ({ ok: true }));
 
+  registerCheckInRoute(app, deps.db, checkInLimiter);
+  registerUsageIngestRoute(app, deps.db, usageLimiter);
+
   registerAuthRoutes(app, deps.db, deps.secret, deps.password, loginLimiter);
-  registerApiRoutes(app, deps.db, deps.secret);
+  registerApiRoutes(app, deps.db, deps.secret, deps.symbolToken);
+  registerMonitorRoutes(app, deps.db, deps.secret);
   registerSymbolizationRoutes(
     app,
     deps.db,
     deps.secret,
     deps.maxSymbolBytes ?? DEFAULT_MAX_SYMBOL_BYTES,
+    deps.symbolToken,
   );
   registerMetricsRoute(app);
+  // MCP (Streamable HTTP) over the same tool registry the stdio bin uses,
+  // backed by an in-process backend (no HTTP hop). JWT-gated like /api/*.
+  registerMcpRoute(app, deps.db, deps.secret, new InProcessBackend(deps.db));
 
   app.setErrorHandler((err: FastifyError, _req, reply) => {
     const status = err.statusCode ?? 500;

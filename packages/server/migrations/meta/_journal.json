@@ -22,6 +22,34 @@
       "when": 1778977559762,
       "tag": "0002_releases_sourcemap",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1778977600000,
+      "tag": "0003_webhook_dispatch_type",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1778977700000,
+      "tag": "0004_issues_platform",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1784344317487,
+      "tag": "0005_monitors_and_dispatch_nullable",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1784381382070,
+      "tag": "0006_usage_analytics",
+      "breakpoints": true
     }
   ]
 }

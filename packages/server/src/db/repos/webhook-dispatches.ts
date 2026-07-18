@@ -4,10 +4,17 @@ import type { DbOrTx } from '../index.js';
 import { newId } from '../ids.js';
 import { webhookDispatches, type WebhookDispatchRow } from '../schema.js';
 
+export type DispatchType = 'issue.new' | 'issue.regressed' | 'monitor.missed' | 'monitor.recovered';
+
 export type DispatchInsert = {
-  issueId: string;
-  eventId: string;
+  // Set for issue.* dispatches; null/omitted for monitor.* dispatches.
+  issueId?: string | null;
+  eventId?: string | null;
+  // Set for monitor.* dispatches; null/omitted for issue.* dispatches.
+  monitorId?: string | null;
   url: string;
+  /** Webhook body `type`. Defaults to 'issue.new' when omitted. */
+  type?: DispatchType;
 };
 
 export const enqueueDispatch = (
@@ -17,9 +24,11 @@ export const enqueueDispatch = (
 ): WebhookDispatchRow => {
   const row: WebhookDispatchRow = {
     id: newId(),
-    issueId: input.issueId,
-    eventId: input.eventId,
+    issueId: input.issueId ?? null,
+    eventId: input.eventId ?? null,
+    monitorId: input.monitorId ?? null,
     url: input.url,
+    type: input.type ?? 'issue.new',
     attempt: 0,
     nextAttemptAt: now,
     status: 'pending',

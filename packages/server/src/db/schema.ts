@@ -52,10 +52,14 @@ export const issues = sqliteTable(
     firstSeen: integer('first_seen').notNull(),
     lastSeen: integer('last_seen').notNull(),
     eventCount: integer('event_count').notNull().default(1),
-    status: text('status', { enum: ['open', 'resolved', 'ignored'] })
+    status: text('status', { enum: ['open', 'resolved', 'ignored', 'regressed'] })
       .notNull()
       .default('open'),
     lastAlertedAt: integer('last_alerted_at'),
+    // Nullable: reflects the issue's latest event platform (§CONTRACT P). Old
+    // issues predating migration 0004 are backfilled from their most recent
+    // event; an issue with no events stays null.
+    platform: text('platform', { enum: ['ios', 'android', 'web', 'node'] }),
   },
   (t) => [
     uniqueIndex('issues_proj_fp_uniq').on(t.projectId, t.fingerprint),
@@ -121,17 +125,49 @@ export const sessions = sqliteTable('sessions', {
   expiresAt: integer('expires_at').notNull(),
 });
 
+// Check-in monitors (dead-man's-switch, §CONTRACT M). A monitor is "ok" while it
+// keeps pinging within interval+grace; a 60s sweep flips overdue monitors to
+// "missed" (dispatching once); the next ping recovers it. "paused" opts out.
+export const monitors = sqliteTable(
+  'monitors',
+  {
+    id: text('id').primaryKey(),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    // Unique per project; validated against `[a-z0-9-]{1,64}` at the route.
+    slug: text('slug').notNull(),
+    name: text('name'),
+    intervalMinutes: integer('interval_minutes').notNull(),
+    graceMinutes: integer('grace_minutes').notNull(),
+    status: text('status', { enum: ['ok', 'missed', 'paused'] })
+      .notNull()
+      .default('ok'),
+    lastCheckInAt: integer('last_check_in_at'),
+    createdAt: integer('created_at').notNull(),
+  },
+  (t) => [uniqueIndex('monitors_project_slug_uniq').on(t.projectId, t.slug)],
+);
+
 export const webhookDispatches = sqliteTable(
   'webhook_dispatches',
   {
     id: text('id').primaryKey(),
-    issueId: text('issue_id')
-      .notNull()
-      .references(() => issues.id, { onDelete: 'cascade' }),
-    eventId: text('event_id')
-      .notNull()
-      .references(() => events.id, { onDelete: 'cascade' }),
+    // Nullable since v0.5: monitor dispatches (monitor.missed / monitor.recovered)
+    // carry no issue/event, only a monitorId. Issue dispatches keep both set.
+    issueId: text('issue_id').references(() => issues.id, { onDelete: 'cascade' }),
+    eventId: text('event_id').references(() => events.id, { onDelete: 'cascade' }),
+    // Set only for monitor.* dispatches; null for issue.* dispatches.
+    monitorId: text('monitor_id').references(() => monitors.id, { onDelete: 'cascade' }),
     url: text('url').notNull(),
+    // Webhook body `type` — 'issue.new' (default, preserves existing rows),
+    // 'issue.regressed' for the resolved->regressed transition, or the v0.5
+    // monitor lifecycle types.
+    type: text('type', {
+      enum: ['issue.new', 'issue.regressed', 'monitor.missed', 'monitor.recovered'],
+    })
+      .notNull()
+      .default('issue.new'),
     attempt: integer('attempt').notNull().default(0),
     nextAttemptAt: integer('next_attempt_at').notNull(),
     status: text('status', { enum: ['pending', 'succeeded', 'failed'] })
@@ -142,6 +178,45 @@ export const webhookDispatches = sqliteTable(
     createdAt: integer('created_at').notNull(),
   },
   (t) => [index('webhook_dispatches_status_due_idx').on(t.status, t.nextAttemptAt)],
+);
+
+// ── Usage analytics (v0.6, CONTRACT U-IN / U-API) ─────────────────────────────
+// Privacy is the product: raw IP and raw User-Agent are NEVER persisted here.
+// They feed the visitor hash and are discarded. The daily salt rotates the hash
+// so a visitor is uncorrelatable across UTC days.
+
+// One crypto-random salt per UTC day, created lazily on first usage event that
+// day and pruned (>2 days old) by the retention job. Never appears in any API
+// response or log.
+export const usageSalts = sqliteTable('usage_salts', {
+  // UTC day the salt is valid for, as 'YYYY-MM-DD'.
+  date: text('date').primaryKey(),
+  // 32 random bytes, hex.
+  salt: text('salt').notNull(),
+});
+
+export const usageEvents = sqliteTable(
+  'usage_events',
+  {
+    id: text('id').primaryKey(),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    type: text('type', { enum: ['pageview', 'event'] }).notNull(),
+    // Set for 'event' rows (the event name); null for pageviews.
+    name: text('name'),
+    // Set for 'pageview' rows (query + fragment stripped); null for events.
+    path: text('path'),
+    // Referrer DOMAIN only (never the full URL); null for direct / same-origin /
+    // unparseable referrers.
+    referrerDomain: text('referrer_domain'),
+    // 16-char truncated sha256 daily visitor hash — the ONLY identity artifact.
+    visitor: text('visitor').notNull(),
+    // Small JSON blob (<=10 keys), or null.
+    props: text('props'),
+    receivedAt: integer('received_at').notNull(),
+  },
+  (t) => [index('usage_events_project_received_idx').on(t.projectId, t.receivedAt)],
 );
 
 export type ProjectRow = typeof projects.$inferSelect;
@@ -157,3 +232,8 @@ export type SymbolicationRow = typeof symbolications.$inferSelect;
 export type SessionRow = typeof sessions.$inferSelect;
 export type WebhookDispatchRow = typeof webhookDispatches.$inferSelect;
 export type WebhookDispatchInsert = typeof webhookDispatches.$inferInsert;
+export type MonitorRow = typeof monitors.$inferSelect;
+export type MonitorInsert = typeof monitors.$inferInsert;
+export type UsageEventRow = typeof usageEvents.$inferSelect;
+export type UsageEventInsert = typeof usageEvents.$inferInsert;
+export type UsageSaltRow = typeof usageSalts.$inferSelect;

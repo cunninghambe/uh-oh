@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { EventEnvelopeSchema } from '@uh-oh/types';
 
 import { Client } from './uh-oh-client.js';
-import { fakeProcess, mockFetch, type FetchInitShape } from './test-support.js';
+import { fakeProcess, mockFetch, mockRawFetch, type FetchInitShape } from './test-support.js';
 
 const DSN = 'https://pk@errors.example.com';
 
@@ -87,6 +87,23 @@ describe('node handlers', () => {
     expect(f.calls).toHaveLength(1);
     expect(EventEnvelopeSchema.parse(f.calls[0]?.env).exception.mechanism).toBe('js-promise');
     expect(p.exitCalls).toEqual([]);
+    c.close();
+  });
+});
+
+describe('node checkIn', () => {
+  it('posts to the check-in url without keepalive (node has no such fetch option)', async () => {
+    const f = mockRawFetch();
+    const p = fakeProcess();
+    const c = new Client({ dsn: DSN, release: '1.0.0' }, { fetchFn: f.fn, proc: p.proc });
+    c.checkIn('worker', { intervalMinutes: 5 });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]?.url).toBe(
+      'https://errors.example.com/ingest/pk/check-in/worker?intervalMinutes=5',
+    );
+    expect(f.calls[0]?.init.method).toBe('POST');
+    expect(f.calls[0]?.init.keepalive).toBeUndefined();
     c.close();
   });
 });

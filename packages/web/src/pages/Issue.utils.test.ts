@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import type { ResolvedFrame } from '../api.js';
-import { hasSymbolIssue, statusLabel } from './Issue.utils.js';
+import type { EventRow, Issue, ResolvedFrame } from '../api.js';
+import {
+  hasSymbolIssue,
+  resolvedPlatform,
+  statusLabel,
+  statusToggleOptions,
+} from './Issue.utils.js';
 
 const frame = (status: ResolvedFrame['status']): ResolvedFrame => ({ status });
 
@@ -42,5 +47,62 @@ describe('statusLabel', () => {
   it('falls back to the raw status string for anything unrecognized', () => {
     const futureStatus = 'corrupt_sourcemap' as ResolvedFrame['status'];
     expect(statusLabel(futureStatus)).toBe('corrupt_sourcemap');
+  });
+});
+
+describe('statusToggleOptions (v0.3: regression surfacing)', () => {
+  it('a regressed issue offers resolve/ignore/reopen, none disabled-by-default', () => {
+    const options = statusToggleOptions('regressed');
+    expect(options).toEqual([
+      { value: 'resolved', label: 'resolve' },
+      { value: 'ignored', label: 'ignore' },
+      { value: 'open', label: 'reopen' },
+    ]);
+    // 'regressed' is never a toggle target — it's system-set, not user-settable.
+    expect(options.some((o) => (o.value as string) === 'regressed')).toBe(false);
+  });
+
+  it('an open issue keeps the pre-existing open/resolved/ignored toggle', () => {
+    expect(statusToggleOptions('open')).toEqual([
+      { value: 'open', label: 'open' },
+      { value: 'resolved', label: 'resolved' },
+      { value: 'ignored', label: 'ignored' },
+    ]);
+  });
+
+  it('resolved and ignored issues also keep the pre-existing three-way toggle', () => {
+    const expected: ReturnType<typeof statusToggleOptions> = [
+      { value: 'open', label: 'open' },
+      { value: 'resolved', label: 'resolved' },
+      { value: 'ignored', label: 'ignored' },
+    ];
+    expect(statusToggleOptions('resolved')).toEqual(expected);
+    expect(statusToggleOptions('ignored')).toEqual(expected);
+  });
+
+  it('every status value in the non-regressed toggle is a valid Issue status', () => {
+    const statuses: Issue['status'][] = statusToggleOptions('open').map((o) => o.value);
+    expect(statuses).toEqual(['open', 'resolved', 'ignored']);
+  });
+});
+
+describe('resolvedPlatform (v0.4 CONTRACT P)', () => {
+  const event = (platform: EventRow['platform']): Pick<EventRow, 'platform'> => ({ platform });
+
+  it("prefers the issue's own platform over the latest event's, even when they differ", () => {
+    expect(resolvedPlatform({ platform: 'web' }, event('android'))).toBe('web');
+  });
+
+  it("falls back to the latest event's platform when the issue has none", () => {
+    expect(resolvedPlatform({ platform: null }, event('ios'))).toBe('ios');
+    // `{}` (property omitted, not set to undefined) is how an older server response — one that
+    // predates CONTRACT P — would deserialize; exactOptionalPropertyTypes forbids the literal
+    // `{ platform: undefined }` here since that's a distinct (disallowed) shape.
+    expect(resolvedPlatform({}, event('node'))).toBe('node');
+  });
+
+  it('is null when neither the issue nor a latest event has a platform', () => {
+    expect(resolvedPlatform({ platform: null }, null)).toBeNull();
+    expect(resolvedPlatform({}, null)).toBeNull();
   });
 });

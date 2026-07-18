@@ -13,6 +13,17 @@ export type SourcePosition = {
 
 type Consumer = BasicSourceMapConsumer | IndexedSourceMapConsumer;
 
+// Cache-key separator. Android/Hermes uses the bare `releaseId` as key; web/node
+// uses a composite `releaseId::platform::bundlePath` so one release can hold many
+// per-bundle maps. `::` never appears in a releaseId (a UUID), and because the
+// platform is always exactly `web` or `node`, the composite is unambiguous for
+// every (releaseId, platform, bundlePath) triple regardless of the bundlePath.
+const KEY_SEP = '::';
+
+/** Composite consumer-cache key for a web/node per-bundle source map. */
+export const webConsumerKey = (releaseId: string, platform: string, bundlePath: string): string =>
+  `${releaseId}${KEY_SEP}${platform}${KEY_SEP}${bundlePath}`;
+
 const LRU_MAX = 4;
 // Delay before destroying an evicted/invalidated consumer, so any request that
 // already grabbed a reference can finish resolving against it (destroying the
@@ -61,36 +72,40 @@ export const loadSourceMap = async (raw: string): Promise<Consumer> => {
 };
 
 /**
- * Get or load a cached source map consumer for a release.
+ * Get or load a cached source map consumer for a cache key (a bare releaseId for
+ * Android/Hermes, or a webConsumerKey for a web/node per-bundle map).
  * The cache holds at most LRU_MAX consumers; oldest is evicted on overflow.
  */
-export const getOrLoadCachedConsumer = async (
-  releaseId: string,
-  raw: string,
-): Promise<Consumer> => {
-  const hit = lruCache.get(releaseId);
+export const getOrLoadCachedConsumer = async (key: string, raw: string): Promise<Consumer> => {
+  const hit = lruCache.get(key);
   if (hit) {
-    touchLru(releaseId);
+    touchLru(key);
     return hit;
   }
   evictLru();
   const consumer = await loadSourceMap(raw);
-  lruCache.set(releaseId, consumer);
-  lruOrder.push(releaseId);
+  lruCache.set(key, consumer);
+  lruOrder.push(key);
   return consumer;
 };
 
 /**
- * Invalidate the cached consumer for a release (e.g. after a new upload).
+ * Invalidate every cached consumer for a release (e.g. after a new upload).
+ * Clears the bare-releaseId key (Android/Hermes) and every composite web/node
+ * key whose releaseId prefix matches.
  */
 export const invalidateCachedConsumer = (releaseId: string): void => {
-  const consumer = lruCache.get(releaseId);
-  // Drop from the cache immediately, but defer the destroy: another in-flight
-  // request may still hold this consumer reference.
-  if (consumer) deferDestroy(consumer);
-  lruCache.delete(releaseId);
-  const idx = lruOrder.indexOf(releaseId);
-  if (idx !== -1) lruOrder.splice(idx, 1);
+  const prefix = `${releaseId}${KEY_SEP}`;
+  const keys = [...lruCache.keys()].filter((k) => k === releaseId || k.startsWith(prefix));
+  for (const key of keys) {
+    const consumer = lruCache.get(key);
+    // Drop from the cache immediately, but defer the destroy: another in-flight
+    // request may still hold this consumer reference.
+    if (consumer) deferDestroy(consumer);
+    lruCache.delete(key);
+    const idx = lruOrder.indexOf(key);
+    if (idx !== -1) lruOrder.splice(idx, 1);
+  }
 };
 
 export const resolveJsFrame = (

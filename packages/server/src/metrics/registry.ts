@@ -16,9 +16,27 @@ export const metrics = {
     registers: [registry],
   }),
 
+  issuesRegressed: new Counter({
+    name: 'uh_oh_issues_regressed_total',
+    help: 'Total issues that transitioned resolved -> regressed',
+    registers: [registry],
+  }),
+
   webhookFailures: new Counter({
     name: 'uh_oh_webhook_failures_total',
     help: 'Total webhook attempts that failed permanently',
+    registers: [registry],
+  }),
+
+  monitorMissed: new Counter({
+    name: 'uh_oh_monitor_missed_total',
+    help: 'Total monitor miss episodes (ok -> missed transitions)',
+    registers: [registry],
+  }),
+
+  usageEvents: new Counter({
+    name: 'uh_oh_usage_events_total',
+    help: 'Total usage analytics events stored (pageviews + custom events)',
     registers: [registry],
   }),
 

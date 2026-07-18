@@ -6,10 +6,19 @@ import { createProject } from '../db/repos/projects.js';
 import { upsertIssue } from '../db/repos/issues.js';
 import { insertEvent } from '../db/repos/events.js';
 import { enqueueDispatch, takeDueDispatches } from '../db/repos/webhook-dispatches.js';
-import { startDispatcher } from './dispatcher.js';
+import { startDispatcher as startDispatcherRaw, type DnsLookupAll } from './dispatcher.js';
 
 const NOW = 1_000_000;
 const WEBHOOK_URL = 'https://hooks.example/test';
+
+// The existing suites target a hostname (`hooks.example`); the dispatch-time DNS
+// re-check would otherwise hit the real resolver. Resolve it to a public address
+// by default so these tests stay hermetic. Tests that pass their own `lookupFn`
+// override this via the spread below.
+const publicLookup: DnsLookupAll = () => Promise.resolve([{ address: '93.184.216.34', family: 4 }]);
+
+const startDispatcher: typeof startDispatcherRaw = (deps) =>
+  startDispatcherRaw({ lookupFn: publicLookup, ...deps });
 
 let db: Db;
 let close: () => void;
@@ -320,6 +329,166 @@ describe('startDispatcher — SSRF guard at dispatch time (H3)', () => {
     // Permanently failed → no pending rows.
     expect(takeDueDispatches(db, NOW + 999999, 10)).toHaveLength(0);
     expect(logger.error).toHaveBeenCalled();
+  });
+});
+
+describe('startDispatcher — dispatch-time DNS re-check (D)', () => {
+  it('fails permanently without fetching when a hostname resolves to a private address', async () => {
+    enqueueDispatch(db, { issueId, eventId, url: 'https://rebind.example/hook' }, NOW);
+    const fetchFn = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const logger = { error: vi.fn(), warn: vi.fn() };
+    const lookupFn: DnsLookupAll = vi.fn().mockResolvedValue([{ address: '10.0.0.5', family: 4 }]);
+
+    const handle = startDispatcherRaw({
+      db,
+      fetchFn,
+      lookupFn,
+      now: () => NOW,
+      pollIntervalMs: 10,
+      logger,
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    await handle.stop();
+
+    expect(fetchFn).not.toHaveBeenCalled();
+    // Permanent failure → no pending rows remain.
+    expect(takeDueDispatches(db, NOW + 999999, 10)).toHaveLength(0);
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  it('fetches normally when a hostname resolves only to public addresses', async () => {
+    enqueueDispatch(db, { issueId, eventId, url: 'https://ok.example/hook' }, NOW);
+    const fetchFn = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const lookupFn: DnsLookupAll = vi
+      .fn()
+      .mockResolvedValue([{ address: '93.184.216.34', family: 4 }]);
+
+    const handle = startDispatcherRaw({
+      db,
+      fetchFn,
+      lookupFn,
+      now: () => NOW,
+      pollIntervalMs: 10,
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    await handle.stop();
+
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(takeDueDispatches(db, NOW + 999999, 10)).toHaveLength(0); // succeeded
+  });
+
+  it('blocks when ANY of several resolved addresses is private (mixed A/AAAA)', async () => {
+    enqueueDispatch(db, { issueId, eventId, url: 'https://mixed.example/hook' }, NOW);
+    const fetchFn = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const logger = { error: vi.fn(), warn: vi.fn() };
+    // A public A record plus a loopback AAAA record — the presence of the
+    // blocked one must fail the dispatch.
+    const lookupFn: DnsLookupAll = vi.fn().mockResolvedValue([
+      { address: '93.184.216.34', family: 4 },
+      { address: '::1', family: 6 },
+    ]);
+
+    const handle = startDispatcherRaw({
+      db,
+      fetchFn,
+      lookupFn,
+      now: () => NOW,
+      pollIntervalMs: 10,
+      logger,
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    await handle.stop();
+
+    expect(fetchFn).not.toHaveBeenCalled();
+    expect(takeDueDispatches(db, NOW + 999999, 10)).toHaveLength(0);
+    expect(logger.error).toHaveBeenCalled();
+  });
+
+  it('proceeds to fetch (transient) when the DNS lookup rejects', async () => {
+    enqueueDispatch(db, { issueId, eventId, url: 'https://flaky.example/hook' }, NOW);
+    const fetchFn = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const logger = { error: vi.fn(), warn: vi.fn() };
+    const lookupFn: DnsLookupAll = vi.fn().mockRejectedValue(new Error('EAI_AGAIN'));
+
+    const handle = startDispatcherRaw({
+      db,
+      fetchFn,
+      lookupFn,
+      now: () => NOW,
+      pollIntervalMs: 10,
+      logger,
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    await handle.stop();
+
+    // Transient DNS error must NOT fail the dispatch — fetch still runs.
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(logger.warn).toHaveBeenCalled();
+    expect(takeDueDispatches(db, NOW + 999999, 10)).toHaveLength(0); // succeeded via fetch
+  });
+
+  it('proceeds to fetch (transient) when the DNS lookup exceeds the 2s timeout', async () => {
+    enqueueDispatch(db, { issueId, eventId, url: 'https://slow.example/hook' }, NOW);
+    const fetchFn = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const logger = { error: vi.fn(), warn: vi.fn() };
+    // Never resolves → the 2s internal timeout wins and is treated as transient.
+    const lookupFn: DnsLookupAll = vi.fn().mockImplementation(() => new Promise(() => undefined));
+
+    const handle = startDispatcherRaw({
+      db,
+      fetchFn,
+      lookupFn,
+      now: () => NOW,
+      pollIntervalMs: 10,
+      logger,
+    });
+    // Wait past the 2s DNS timeout.
+    await new Promise<void>((resolve) => setTimeout(resolve, 2300));
+    await handle.stop();
+
+    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(logger.warn).toHaveBeenCalled();
+    expect(takeDueDispatches(db, NOW + 999999, 10)).toHaveLength(0);
+  }, 10_000);
+
+  it('skips the DNS lookup entirely for literal-IP targets (already vetted)', async () => {
+    // Public literal IP — passes the synchronous guard, must NOT trigger lookup.
+    enqueueDispatch(db, { issueId, eventId, url: 'https://93.184.216.34/hook' }, NOW);
+    const fetchFn = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const lookupFn: DnsLookupAll = vi.fn();
+
+    const handle = startDispatcherRaw({
+      db,
+      fetchFn,
+      lookupFn,
+      now: () => NOW,
+      pollIntervalMs: 10,
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    await handle.stop();
+
+    expect(lookupFn).not.toHaveBeenCalled();
+    expect(fetchFn).toHaveBeenCalledOnce();
+  });
+});
+
+describe('startDispatcher — dispatch type (issue.regressed)', () => {
+  it('emits the row type in the payload (issue.new default, issue.regressed when set)', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchFn = vi.fn().mockImplementation((_url: string, opts: { body: string }) => {
+      bodies.push(JSON.parse(opts.body) as Record<string, unknown>);
+      return Promise.resolve({ ok: true, status: 200 });
+    });
+    enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW); // default type
+    enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL, type: 'issue.regressed' }, NOW);
+
+    const handle = startDispatcher({ db, fetchFn, now: () => NOW, pollIntervalMs: 10 });
+    await new Promise<void>((resolve) => setTimeout(resolve, 80));
+    await handle.stop();
+
+    const types = bodies.map((b) => b['type']);
+    expect(types).toContain('issue.new');
+    expect(types).toContain('issue.regressed');
   });
 });
 

@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@fastify/multipart": "10.0.0",
+    "@uh-oh/mcp": "workspace:*",
     "@uh-oh/types": "workspace:*",
     "better-sqlite3": "12.10.0",
     "drizzle-orm": "0.45.2",

@@ -10,7 +10,19 @@ import { getReleaseById } from '../db/repos/releases.js';
 import { events as eventsTable, symbolications } from '../db/schema.js';
 import { mappingPath, sourcemapPath } from './storage.js';
 import { parseProguardMapping } from './proguard.js';
-import { getOrLoadCachedConsumer, invalidateCachedConsumer, resolveJsFrame } from './sourcemap.js';
+import {
+  getOrLoadCachedConsumer,
+  invalidateCachedConsumer,
+  resolveJsFrame,
+  webConsumerKey,
+} from './sourcemap.js';
+import {
+  listBundlePathsForPlatform,
+  matchBundlePath,
+  readWebSymbolMap,
+  type WebPlatform,
+} from './web-symbols.js';
+import { extractContext, MAX_CONTEXT_FRAMES, type SourceContext } from './source-context.js';
 
 export type SymbolicationStatus =
   | 'ok'
@@ -25,9 +37,25 @@ export type ResolvedFrame = {
   filename?: string;
   lineno?: number;
   status: SymbolicationStatus;
+  // CONTRACT S: surrounding source lines, present only for the first few in-app
+  // frames whose map embeds the original source. Absent otherwise.
+  context?: SourceContext;
 };
 
 type Consumer = BasicSourceMapConsumer | IndexedSourceMapConsumer;
+
+/**
+ * Source context for a freshly-resolved frame, or null when it isn't applicable
+ * (frame didn't resolve, or the map has no embedded content for the source).
+ * `resolved.filename` is the original source and `resolved.lineno` its 1-indexed
+ * line whenever status is 'ok'.
+ */
+const contextForResolved = (consumer: Consumer, resolved: ResolvedFrame): SourceContext | null => {
+  if (resolved.status !== 'ok') return null;
+  const { filename, lineno } = resolved;
+  if (typeof filename !== 'string' || typeof lineno !== 'number') return null;
+  return extractContext(consumer, filename, lineno);
+};
 
 const JS_EXTENSIONS_RE = /\.(js|jsx|ts|tsx)$/;
 const BUNDLE_NAME_RE = /^index\.android\.bundle$/;
@@ -155,6 +183,140 @@ const buildJsFrame = (frame: StackFrame, consumerState: JsConsumerState): Resolv
   };
 };
 
+// --- web/node per-bundle source-map symbolication ---
+
+type WebBundleState = { kind: 'resolved'; consumer: Consumer } | { kind: 'corrupt' };
+
+const buildWebPassthrough = (frame: StackFrame, status: SymbolicationStatus): ResolvedFrame => ({
+  ...(frame.filename !== undefined ? { filename: frame.filename } : {}),
+  ...(frame.function !== undefined ? { function: frame.function } : {}),
+  status,
+});
+
+const buildWebResolvedFrame = (frame: StackFrame, consumer: Consumer): ResolvedFrame => {
+  if (frame.lineno === undefined || frame.colno === undefined) {
+    return buildWebPassthrough(frame, 'unsymbolicated');
+  }
+  const pos = resolveJsFrame(consumer, { line: frame.lineno, column: frame.colno });
+  if (pos.source === null && pos.line === null) {
+    return buildWebPassthrough(frame, 'unsymbolicated');
+  }
+  return {
+    ...(pos.source !== null
+      ? { filename: pos.source }
+      : frame.filename !== undefined
+        ? { filename: frame.filename }
+        : {}),
+    ...(pos.name !== null
+      ? { function: pos.name }
+      : frame.function !== undefined
+        ? { function: frame.function }
+        : {}),
+    ...(pos.line !== null ? { lineno: pos.line } : {}),
+    status: 'ok',
+  };
+};
+
+const symbolicateWebFrames = async (
+  db: Db,
+  event: ReturnType<typeof getEvent>,
+  frames: StackFrame[],
+  cached: Map<number, ResolvedFrame>,
+  platform: WebPlatform,
+): Promise<ResolvedFrame[]> => {
+  if (!event) return [];
+  const releaseId = event.releaseId;
+
+  // Snapshot the sourcemap timestamp before any async file read so a concurrent
+  // upload (which bumps it + invalidates the cache) can be detected mid-flight.
+  let sourcemapAtSnapshot: number | null = null;
+  let bundlePaths: string[] = [];
+  if (releaseId) {
+    const release = getReleaseById(db, releaseId);
+    sourcemapAtSnapshot = release?.sourcemapUploadedAt ?? null;
+    if (release?.sourcemapUploadedAt) {
+      bundlePaths = await listBundlePathsForPlatform(releaseId, platform);
+    }
+  }
+
+  // Load each matched bundle's consumer at most once per event.
+  const stateByBundle = new Map<string, WebBundleState>();
+  const stateFor = async (bundlePath: string): Promise<WebBundleState> => {
+    const existing = stateByBundle.get(bundlePath);
+    if (existing) return existing;
+    let state: WebBundleState;
+    try {
+      // releaseId is non-null here: bundlePaths is only populated when it is.
+      const raw = await readWebSymbolMap(releaseId as string, platform, bundlePath);
+      const consumer = await getOrLoadCachedConsumer(
+        webConsumerKey(releaseId as string, platform, bundlePath),
+        raw,
+      );
+      state = { kind: 'resolved', consumer };
+    } catch {
+      state = { kind: 'corrupt' };
+    }
+    stateByBundle.set(bundlePath, state);
+    return state;
+  };
+
+  const results: ResolvedFrame[] = [];
+  const toPersist: Array<{ idx: number; resolved: ResolvedFrame }> = [];
+  // Bound how many in-app frames carry source context (CONTRACT S).
+  let inAppContext = 0;
+
+  for (let i = 0; i < frames.length; i++) {
+    const hit = cached.get(i);
+    if (hit) {
+      results.push(hit);
+      continue;
+    }
+    const frame = frames[i];
+    if (!frame) {
+      results.push({ status: 'unsymbolicated' });
+      continue;
+    }
+
+    const matched =
+      bundlePaths.length > 0 && frame.filename !== undefined
+        ? matchBundlePath(frame.filename, bundlePaths)
+        : null;
+
+    let resolved: ResolvedFrame;
+    if (!matched) {
+      // No stored map covers this frame (or no maps uploaded / no release).
+      resolved = buildWebPassthrough(frame, 'no_symbols');
+    } else {
+      const state = await stateFor(matched);
+      if (state.kind === 'corrupt') {
+        resolved = buildWebPassthrough(frame, 'corrupt_sourcemap');
+      } else {
+        resolved = buildWebResolvedFrame(frame, state.consumer);
+        if (frame.inApp) {
+          if (inAppContext < MAX_CONTEXT_FRAMES) {
+            const ctx = contextForResolved(state.consumer, resolved);
+            if (ctx) resolved = { ...resolved, context: ctx };
+          }
+          inAppContext++;
+        }
+      }
+    }
+    results.push(resolved);
+    toPersist.push({ idx: i, resolved });
+  }
+
+  // If an upload landed while we were symbolicating, the maps we used are stale —
+  // return results but don't cache them (they'd poison the cache until the next upload).
+  if (releaseId && toPersist.length > 0) {
+    const fresh = getReleaseById(db, releaseId);
+    if (!fresh || fresh.sourcemapUploadedAt !== sourcemapAtSnapshot) return results;
+  }
+  for (const p of toPersist) {
+    persistFrame(db, event.id, p.idx, p.resolved);
+  }
+  return results;
+};
+
 export const symbolicateEvent = async (db: Db, eventId: string): Promise<ResolvedFrame[]> => {
   const event = getEvent(db, eventId);
   if (!event) return [];
@@ -168,6 +330,12 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
   const cached = loadCachedFrames(db, eventId);
   if (cached.size === frames.length) {
     return frames.map((_, i) => cached.get(i) ?? { status: 'unsymbolicated' });
+  }
+
+  // Web/node events use per-bundle source maps matched by filename suffix, a
+  // distinct path from the Android ProGuard + single-Hermes-map flow below.
+  if (event.platform === 'web' || event.platform === 'node') {
+    return symbolicateWebFrames(db, event, frames, cached, event.platform);
   }
 
   let proguardMapping: ReturnType<typeof parseProguardMapping> | null = null;
@@ -217,6 +385,8 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
 
   const results: ResolvedFrame[] = [];
   const toPersist: Array<{ idx: number; resolved: ResolvedFrame }> = [];
+  // Bound how many in-app frames carry source context (CONTRACT S).
+  let inAppContext = 0;
 
   for (let i = 0; i < frames.length; i++) {
     const hit = cached.get(i);
@@ -231,9 +401,20 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
       continue;
     }
 
-    const resolved = isJsFrame(frame)
+    let resolved = isJsFrame(frame)
       ? buildJsFrame(frame, jsConsumerState)
       : buildAndroidFrame(frame, proguardMapping, mappingCorrupt);
+
+    // Attach source context for in-app JS frames when a real consumer resolved
+    // them (Hermes single-map path). `jsConsumerState` is a Consumer object only
+    // when a source map was loaded successfully.
+    if (frame.inApp && typeof jsConsumerState === 'object') {
+      if (inAppContext < MAX_CONTEXT_FRAMES) {
+        const ctx = contextForResolved(jsConsumerState, resolved);
+        if (ctx) resolved = { ...resolved, context: ctx };
+      }
+      inAppContext++;
+    }
 
     results.push(resolved);
     toPersist.push({ idx: i, resolved });

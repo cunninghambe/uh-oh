@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { validateWebhookUrl, isWebhookUrlSafe } from './url-guard.js';
+import { validateWebhookUrl, isWebhookUrlSafe, isBlockedIp, isIpLiteralHost } from './url-guard.js';
 
 describe('validateWebhookUrl', () => {
   it('accepts a normal public https URL', () => {
@@ -94,5 +94,48 @@ describe('validateWebhookUrl', () => {
   it('isWebhookUrlSafe mirrors validateWebhookUrl', () => {
     expect(isWebhookUrlSafe('https://ok.example.com')).toBe(true);
     expect(isWebhookUrlSafe('http://127.0.0.1')).toBe(false);
+  });
+});
+
+describe('isBlockedIp (resolved-address check, shared with the DNS re-check)', () => {
+  it('blocks loopback / private / link-local / metadata IPv4', () => {
+    expect(isBlockedIp('127.0.0.1')).toBe(true);
+    expect(isBlockedIp('10.0.0.5')).toBe(true);
+    expect(isBlockedIp('172.16.9.9')).toBe(true);
+    expect(isBlockedIp('192.168.1.1')).toBe(true);
+    expect(isBlockedIp('169.254.169.254')).toBe(true); // cloud metadata
+    expect(isBlockedIp('0.0.0.0')).toBe(true);
+  });
+
+  it('blocks loopback / ULA / link-local / mapped IPv6', () => {
+    expect(isBlockedIp('::1')).toBe(true);
+    expect(isBlockedIp('fd00::1')).toBe(true);
+    expect(isBlockedIp('fe80::1')).toBe(true);
+    expect(isBlockedIp('::ffff:127.0.0.1')).toBe(true);
+  });
+
+  it('allows public IPv4 and IPv6 addresses', () => {
+    expect(isBlockedIp('93.184.216.34')).toBe(false);
+    expect(isBlockedIp('8.8.8.8')).toBe(false);
+    expect(isBlockedIp('2606:4700:4700::1111')).toBe(false);
+  });
+});
+
+describe('isIpLiteralHost', () => {
+  it('recognizes dotted-quad IPv4 literals', () => {
+    expect(isIpLiteralHost('127.0.0.1')).toBe(true);
+    expect(isIpLiteralHost('93.184.216.34')).toBe(true);
+  });
+
+  it('recognizes bracketed IPv6 literals', () => {
+    expect(isIpLiteralHost('[::1]')).toBe(true);
+    expect(isIpLiteralHost('[2606:4700:4700::1111]')).toBe(true);
+  });
+
+  it('treats real hostnames as non-literals', () => {
+    expect(isIpLiteralHost('hooks.example.com')).toBe(false);
+    expect(isIpLiteralHost('localhost')).toBe(false);
+    // A shape with an out-of-range octet is not a valid IPv4 literal.
+    expect(isIpLiteralHost('999.1.1.1')).toBe(false);
   });
 });

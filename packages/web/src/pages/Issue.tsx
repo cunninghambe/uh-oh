@@ -3,7 +3,17 @@ import { Link, useParams } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 
 import { api, type Breadcrumb, type Issue as IssueT, type ResolvedFrame } from '../api.js';
-import { hasSymbolIssue, statusLabel } from './Issue.utils.js';
+import { CodeContext } from '../components/CodeContext.js';
+import { ImpactPanel } from '../components/ImpactPanel.js';
+import { PlatformBadge } from '../components/PlatformBadge.js';
+import { RegressedBadge } from '../components/RegressedBadge.js';
+import { Sparkline } from '../components/Sparkline.js';
+import {
+  hasSymbolIssue,
+  resolvedPlatform,
+  statusLabel,
+  statusToggleOptions,
+} from './Issue.utils.js';
 
 const EVENTS_PAGE_SIZE = 5;
 
@@ -46,17 +56,23 @@ const renderSymbolicatedFrame = (rawFrame: StackFrame, resolved: ResolvedFrame, 
   return (
     <div
       key={idx}
-      className={`px-3 py-1.5 font-mono text-xs border-l-2 ${
+      className={`border-l-2 ${
         rawFrame.inApp ? 'border-amber-500 bg-zinc-900' : 'border-transparent text-zinc-500'
       }`}
     >
-      <span className="text-zinc-300">{fn}</span>
-      <span className="text-zinc-500"> at </span>
-      <span className="text-zinc-400">
-        {location}
-        {pos}
-      </span>
-      {badge && <span className="ml-2 text-zinc-600 text-xs">{badge}</span>}
+      <div className="px-3 py-1.5 font-mono text-xs">
+        <span className="text-zinc-300">{fn}</span>
+        <span className="text-zinc-500"> at </span>
+        <span className="text-zinc-400">
+          {location}
+          {pos}
+        </span>
+        {badge && <span className="ml-2 text-zinc-600 text-xs">{badge}</span>}
+      </div>
+      {/* v0.5 CONTRACT S: absent whenever the server couldn't attach source context (older
+          build, out-of-app frame, no source map, beyond the first-8-in-app cap, etc.) — the
+          frame above renders identically to pre-v0.5 either way. */}
+      {resolved.context && <CodeContext context={resolved.context} lineno={resolved.lineno} />}
     </div>
   );
 };
@@ -118,6 +134,23 @@ export const Issue = () => {
     queryFn: () => api.listIssueEvents(issueId, { page: eventsPage, limit: EVENTS_PAGE_SIZE }),
   });
 
+  // v0.3 CONTRACT C: server agent work landing concurrently, may 404 until it does.
+  // retry: false so an absent endpoint fails fast instead of retrying a guaranteed-404 —
+  // isError then just means "hide the sparkline" (see render below).
+  const statsQ = useQuery({
+    queryKey: ['issue-stats', issueId],
+    queryFn: () => api.getIssueStats(issueId, 14),
+    retry: false,
+  });
+
+  // v0.5 CONTRACT I: server agent work landing concurrently, may 404 until it does. Same
+  // degrade-gracefully rule as statsQ above — isError just means "hide the Impact panel".
+  const impactQ = useQuery({
+    queryKey: ['issue-impact', issueId],
+    queryFn: () => api.getIssueImpact(issueId),
+    retry: false,
+  });
+
   const statusM = useMutation({
     mutationFn: (status: IssueT['status']) => api.setIssueStatus(issueId, status),
     onSuccess: () => {
@@ -164,26 +197,40 @@ export const Issue = () => {
         </Link>
         <div className="flex items-start justify-between gap-4 mt-2">
           <div className="min-w-0">
-            <h1 className="text-xl font-semibold break-words">{issue.title}</h1>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h1 className="text-xl font-semibold break-words">{issue.title}</h1>
+              {issue.status === 'regressed' && <RegressedBadge />}
+              <PlatformBadge platform={resolvedPlatform(issue, latestEvent)} />
+            </div>
             <div className="font-mono text-xs text-zinc-500 mt-1 break-all">
               {issue.fingerprint}
             </div>
+            {statsQ.data && (
+              <div className="mt-2">
+                <Sparkline
+                  points={statsQ.data.days}
+                  width={80}
+                  height={20}
+                  srLabel="Issue events"
+                />
+              </div>
+            )}
           </div>
           <div className="flex gap-2 shrink-0">
-            {(['open', 'resolved', 'ignored'] as const).map((s) => (
+            {statusToggleOptions(issue.status).map(({ value, label }) => (
               <button
-                key={s}
+                key={value}
                 onClick={() => {
-                  statusM.mutate(s);
+                  statusM.mutate(value);
                 }}
-                disabled={statusM.isPending || issue.status === s}
+                disabled={statusM.isPending || issue.status === value}
                 className={`text-xs px-2 py-1 rounded border ${
-                  issue.status === s
+                  issue.status === value
                     ? 'border-amber-500 text-amber-400'
                     : 'border-zinc-700 text-zinc-400 hover:border-zinc-500'
                 } disabled:opacity-50`}
               >
-                {s}
+                {label}
               </button>
             ))}
           </div>
@@ -203,6 +250,10 @@ export const Issue = () => {
           )}
         </div>
       </div>
+
+      {/* v0.5 CONTRACT I: renders nothing itself (impactQ.data undefined, or an empty payload)
+          if the impact endpoint 404s or the issue genuinely has no impact data yet. */}
+      {impactQ.data && <ImpactPanel impact={impactQ.data} />}
 
       <section>
         <div className="flex items-center justify-between mb-2">

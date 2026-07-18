@@ -31,6 +31,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Build all workspace packages before typechecking: cross-package type
+      # resolution (e.g. the server importing @uh-oh/types and @uh-oh/mcp, and
+      # the web e2e tsconfig reaching into server source) resolves against each
+      # package's built dist/, which exists locally but not on a fresh runner.
+      - name: Build packages
+        run: pnpm -r build
+
       - name: Typecheck
         run: pnpm typecheck
 
@@ -47,7 +54,7 @@ jobs:
         run: pnpm --filter @uh-oh/web build
 
       - name: Unit test scripts/ (node:test — no vitest dep at the repo root)
-        run: node --test scripts/build-sdk-dist.test.mjs scripts/vendor-js-client.test.mjs scripts/build-js-dist.test.mjs
+        run: node --test scripts/build-sdk-dist.test.mjs scripts/vendor-js-client.test.mjs scripts/build-js-dist.test.mjs scripts/build-mcp-dist.test.mjs scripts/vendor-sourcemap-uploader.test.mjs
 
       # shellcheck ships preinstalled on the ubuntu-latest runner image, but
       # install explicitly anyway so this step doesn't silently start
@@ -57,3 +64,51 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y shellcheck
           bash infra/test.sh
+
+  e2e:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Compiles-cleanly gate for @uh-oh/server (the main `ci` job above never builds it).
+      # The e2e run itself boots the server via `tsx` against source, not this dist output —
+      # see packages/web/e2e/server-runner.ts for why — but this still catches a broken build.
+      # Recursive, not just the server: the server's own build type-resolves against
+      # @uh-oh/types and @uh-oh/mcp dist/, which don't exist on a fresh runner.
+      - name: Build server (and its workspace deps)
+        run: pnpm -r build
+
+      # Also done inside packages/web/e2e/global-setup.ts (it runs `vite build` itself right
+      # before `vite preview`), but kept here too as a fast, clearly-labeled CI gate.
+      - name: Build web
+        run: pnpm --filter @uh-oh/web build
+
+      - name: Install Playwright's chromium
+        run: pnpm --filter @uh-oh/web exec playwright install --with-deps chromium
+
+      - name: Run e2e suite
+        run: pnpm --filter @uh-oh/web e2e
+
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: packages/web/build/playwright-report/
+          retention-days: 7

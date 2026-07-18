@@ -170,7 +170,7 @@ issues
   first_seen INTEGER NOT NULL
   last_seen INTEGER NOT NULL
   event_count INTEGER NOT NULL DEFAULT 1
-  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved','ignored'))
+  status TEXT NOT NULL DEFAULT 'open'   -- open|resolved|ignored|regressed (TS-enforced, no SQL CHECK shipped; 'regressed' is system-set — see §18)
   last_alerted_at INTEGER
   UNIQUE(project_id, fingerprint)
   INDEX (project_id, last_seen DESC)
@@ -340,6 +340,9 @@ POST   /api/releases/:id/symbols (multipart: file, platform, sourcemap?)
 
 GET    /healthz                                                  → { ok: true }                  [exists]
 GET    /metrics                                                  → Prometheus text format        [exists]
+
+POST   /mcp   (Authorization: Bearer <jwt>)                      → MCP Streamable HTTP, stateless [exists — §17]
+GET/DELETE /mcp                                                  → 405 (POST-only, stateless)     [exists — §17]
 ```
 
 Pagination note: the issues list is **offset-based** (`limit`/`offset`, response `{ issues, total }`); the per-issue events list accepts `page=` (1-indexed) per the original spec, plus `offset=` for symmetry. PATCH `webhookUrl` is SSRF-validated (see §2 Hardening) and returns 400 for private/loopback/metadata targets.
@@ -547,4 +550,104 @@ Shipped after the v0.1 robustness pass. Adds first-class `platform: 'web'` and `
 
 **Consumer conventions:** env vars `UH_OH_DSN` (server) / `NEXT_PUBLIC_UH_OH_DSN` (browser); Next.js apps wire via `instrumentation.ts` (`register()` guarded to the nodejs runtime + `onRequestError`), `instrumentation-client.ts`, and `app/global-error.tsx`.
 
-**Known v0.2 gaps:** no symbolication for web/node stacks (frames render raw; Node server stacks are usually readable anyway); no Node disk spool; symbol upload remains Android-only.
+**Known v0.2 gaps:** ~~no symbolication for web/node stacks~~ (shipped in v0.3 — §18); ~~no Node disk spool~~ (shipped in v0.4 — §19); RN symbol upload remains Android-only.
+
+---
+
+## 17. MCP addendum — `@uh-oh/mcp` + `/mcp` endpoint
+
+uh-oh is MCP-native: the same tool registry (defined once in `packages/mcp` against a `UhOhBackend` interface) is served two ways.
+
+**Tools (10):** `list_projects`, `create_project`, `update_project` (webhook URL passes SSRF validation), `list_issues` (project by id or slug; status/sort/pagination), `get_issue` (latest event + symbolicated frames + last-20 breadcrumbs), `list_issue_events`, `get_event` (symbolicated), `set_issue_status` (`open|resolved|ignored`), `list_releases`, `get_server_health` (healthz + parsed metrics subset). Read-only tools carry `readOnlyHint: true`; nothing is `destructiveHint`. Outputs are LLM-shaped: compact JSON, nulls dropped, ISO timestamps, frames reduced to `{ function, file, line, col, inApp, status }`, list caps ≤ 100.
+
+**Stdio (primary):** the `uh-oh-mcp` bin (HttpBackend over `/api/*`) — env `UH_OH_SERVER_URL` + `UH_OH_ADMIN_PASSWORD`, auto-login with one re-login on 401, all diagnostics on stderr, stdout reserved for the protocol.
+
+```
+claude mcp add uh-oh \
+  --env UH_OH_SERVER_URL=https://errors.example.com \
+  --env UH_OH_ADMIN_PASSWORD=<admin-password> \
+  -- uh-oh-mcp
+```
+
+**Streamable HTTP:** `POST /mcp` on the server itself (InProcessBackend, no HTTP hop), stateless with a fresh transport per request, gated by the same JWT middleware as `/api/*`; `GET`/`DELETE` → 405. nginx proxies `location = /mcp` (1 MB body cap). Because JWTs expire in 24h, stdio (auto-login) is the durable path; the HTTP form suits ad-hoc token-scoped access:
+
+```
+claude mcp add --transport http uh-oh-remote https://errors.example.com/mcp \
+  --header "Authorization: Bearer <jwt>"
+```
+
+**Distribution:** `mcp-dist` orphan branch (mirrors `sdk-dist`/`js-dist`), produced by `scripts/build-mcp-dist.mjs`; install via `pnpm add github:cunninghambe/uh-oh#mcp-dist`.
+
+---
+
+## 18. v0.3 addendum — web/node symbolication, regression detection, fleet dashboard
+
+Driven by the first four production consumers (Next.js apps reporting `web` + `node` events).
+
+**Multi-file source maps (web/node).** `POST /api/releases/:id/symbols` with `platform=web|node` accepts one `.map` per call with a `bundlePath` field (path of the JS file relative to the app build; sanitized: no absolute paths, no `..`, ≤512 chars, containment-checked). Stored at `<symbols>/<release-id>/<platform>/<bundlePath>.map`; cap 500 maps/release (409 beyond; same-path re-upload overwrites). `GET /api/releases/:id/symbols` lists `{ maps: [{ platform, bundlePath, size }] }`. At symbolicate time, frames match stored maps by longest segment-boundary suffix of the filename's path component (handles full URLs, bare `/_next/...` paths, and `file:///` URLs); consumers cached per `(releaseId, platform, bundlePath)` with the existing deferred-destroy semantics. Unmatched → `no_symbols`; corrupt → `corrupt_sourcemap`.
+
+**Regression detection.** A new event on a `resolved` issue flips it to `regressed` (system-set; users PATCH only `open|resolved|ignored`; re-resolving re-arms detection). The transition dispatches an immediate `type: 'issue.regressed'` webhook bypassing the dedupe window (recorded per-dispatch via the new `webhook_dispatches.type` column, migration 0003); subsequent events respect the window. Metric: `uh_oh_issues_regressed_total`. `ignored` issues stay ignored.
+
+**Stats.** `GET /api/projects/:id/stats?days=N` → `{ days: [{ date, events }], totalOpenIssues }`; `GET /api/issues/:id/stats?days=N` → `{ days }`. N clamped 1..90 (default 14), UTC-bucketed, zero-filled, ascending.
+
+**Dashboard.** Sort control (lastSeen/eventCount/firstSeen); status tabs Open/Regressed/Resolved/Ignored with regressed badges; platform badge on issue detail; 14-day SVG sparklines on project and issue pages (hidden gracefully if stats are unavailable).
+
+**CLI.** `uh-oh project list`, `uh-oh project create <name>` (prints slug + DSN), `uh-oh project dsn <slug>` (prints DSN + paste-ready `UH_OH_DSN=`/`NEXT_PUBLIC_UH_OH_DSN=` lines), `uh-oh upload next-sourcemaps --project <slug> --release <v+b> --dir <.next> [--dry-run]` (uploads `static/**` maps as `web` and `server/**` maps as `node`, per-platform release resolution), and `uh-oh upload sourcemap --platform web|node --bundle-path <p>` as the generic escape hatch.
+
+**Known v0.3 gaps:** consumer build pipelines don't yet generate/upload/strip source maps (per-app follow-up once a server is deployed); ~~`@uh-oh/mcp` Issue type~~ and ~~per-issue platform on the list payload~~ both closed in v0.4 (§19).
+
+---
+
+## 19. v0.4 addendum — CI upload auth, fleet polish, Node spool, e2e
+
+**Scoped symbol-upload token.** Optional env `UH_OH_SYMBOL_TOKEN` (min 16 chars; boot fails if set shorter). Requests carrying `X-Uh-Oh-Symbol-Token` (constant-time compared, never logged) are authorized on exactly five endpoints — `GET /api/projects`, `GET/POST /api/projects/:id/releases`, `GET/POST /api/releases/:id/symbols` — and rejected everywhere else. This lets deploy pipelines upload source maps without the admin JWT.
+
+**Release upsert.** `POST /api/projects/:id/releases` `{ version, build, platform }` → 201 created / 200 existing (idempotent). Closes the pre-first-event upload gap: release rows previously existed only after ingest.
+
+**Issues carry platform.** Migration 0004 adds `issues.platform` (nullable; backfilled from each issue's latest event; latest-wins on new events). List + detail payloads expose it; the dashboard badges list rows.
+
+**SSRF DNS re-check.** Hostname webhook targets are `dns.lookup`-checked at dispatch time (all addresses; private/loopback/link-local/metadata → permanent failure `blocked_dns:<addr>`; 2s timeout, transient DNS errors fall through to the fetch). TOCTOU caveat documented — this raises the bar, it is not pinning.
+
+**@uh-oh/mcp regressed.** MCP Issue status includes `regressed`; the `list_issues` filter accepts it; `set_issue_status` stays 3-value (regressed is system-set).
+
+**@uh-oh/js 0.3.0 — Node disk spool.** `InitOptions.spoolDir` (Node only): pending queue persists to `<spoolDir>/uh-oh-spool.json` (atomic tmp+rename, ~1s debounce, force-flush on close and on the uncaught-exception path, corrupt-tolerant, same 50-event/500KB caps). Browser ignores the option.
+
+**Vendorable source-map uploader.** `node scripts/vendor-sourcemap-uploader.mjs --out <path>` emits a zero-dependency `uh-oh-upload-sourcemaps.mjs` for consumer deploy pipelines: env `UH_OH_SERVER_URL`/`UH_OH_SYMBOL_TOKEN`/`UH_OH_PROJECT` (missing env → clean no-op, `--require` to enforce), uploads `static/**` as web and `server/**` as node, auto-creates missing releases via the upsert, `--delete-browser-maps` (only after full success), `--dry-run`.
+
+**RN SDK.** `@react-native-community/netinfo` declared as an optional peer (`>=9`) — the runtime guarded-require existed since v0.1's hardening pass.
+
+**Playwright e2e.** 6-test chromium smoke (`packages/web/e2e`) boots the real server (temp SQLite, ephemeral config) + built dashboard via `vite preview` proxy: login errors, project create, ingest→issue→detail→resolve flows. CI runs it as a separate job with report artifacts. Fixed also: the server's `isMain` entry check now uses `pathToFileURL` (the old string comparison silently never matched on Windows).
+
+**Dashboard.** Per-release uploaded-map counts (eager ≤10 rows, lazy beyond); platform badges on issue list rows.
+
+---
+
+## 20. v0.5 addendum — fix dossier + silence detection
+
+The "exceptional" release: uh-oh becomes a deterministic fix-dossier substrate for agents (no LLM calls in the server) plus a dead-man's-switch for the fleet.
+
+**Source context.** At symbolication time, in-app frames that resolve `ok` against a map exposing `sourcesContent` gain `context: { pre, line, post }` (≤5 lines each side, right-trimmed, 300-char cap, tabs preserved; first 8 in-app frames per event). Stored inside `symbolications.resolved` (no migration), cached/invalidated with existing semantics, rendered as collapsible highlighted code frames in the dashboard.
+
+**Impact.** `GET /api/issues/:id/impact` → `{ distinctUsers (null when unknowable), topDevices, topOs, releases, platforms }` (top-5s, deterministic ordering) — indexed JSON1 aggregates, no new tables. Dashboard shows an Impact panel on issue detail.
+
+**Issue bundle.** `GET /api/issues/:id/bundle` — project + issue + impact + symbolicated latest event (with source context) + last-20 breadcrumbs + ≤3 recent-event summaries + symbol availability, deterministically truncated to 64KB (context lines first, then breadcrumbs; always-present `truncated` flags). MCP tools `get_issue_bundle` and `list_top_issues` (volume-ranked open+regressed across all projects, backed by `GET /api/top-issues`) in both backends, plus the `fix_crash` MCP prompt. One tool call = everything an agent needs to fix a crash.
+
+**Monitors.** `POST /ingest/:publicKey/check-in/:slug[?intervalMinutes=N]` (public-key auth, slug `[a-z0-9-]{1,64}`, per-(key,slug) token bucket, 202 `{monitorId}`). First ping auto-creates (interval required; grace `max(5, ceil(interval/4))`); later pings bump `lastCheckInAt` and recover `missed→ok` with a `monitor.recovered` webhook. A 60s in-process sweep flips overdue monitors to `missed` and fires `monitor.missed` once per episode (status transition = dedupe) through the normal dispatcher — migration 0005 creates `monitors` and rebuilds `webhook_dispatches` with nullable `issue_id`/`event_id` + `monitor_id`. JWT CRUD under `/api/projects/:id/monitors` + `/api/monitors/:id`; MCP `list_monitors`; metric `uh_oh_monitor_missed_total`. Dashboard: Monitors section on the project page (status pills, overdue chip, pause/edit/delete, empty state showing the project's real check-in URL).
+
+**Client.** `@uh-oh/js` 0.4.0 adds `checkIn(slug, { intervalMinutes? })` — fire-and-forget, single attempt, no spooling, never throws, silent no-op without a DSN. Copy-paste consumer snippets (Next.js worker, Apps Script sender, curl-for-cron) live in `docs/check-ins.md`.
+
+---
+
+## 21. v0.6 addendum — privacy-first usage analytics
+
+Cookie-less, self-hosted product analytics on the same rails as crash reporting. Plausible-style, not GA-style: **no cookies, no client identifiers, no fingerprinting stored**.
+
+**Privacy model.** The client sends only event payloads. Daily uniques come from a server-side hash `sha256(dailySalt | publicKey | clientIp | userAgent)` truncated to 16 hex chars; salts are crypto-random per UTC day (`usage_salts`, pruned after 2 days) so visitors are uncorrelatable across days (repeat visitors over-count across days — the accepted trade). Raw IP and UA feed the hash and are discarded — never stored, never logged; paths are stripped of query/fragment; referrers reduce to domain only (same-origin → null). Tests prove the store contains no IP/UA/salt.
+
+**Ingest.** `POST /ingest/:publicKey/usage` — public-key auth, `application/json` or `text/plain` (sendBeacon), `{ events: [{ type: 'pageview'|'event', ts?, path?, referrer?, name?, props? }] }`, batch ≤50 (413 beyond), per-event validation drops the event not the batch (`202 { accepted, dropped }`), generous per-key token bucket (200 cap / 20 per s). Storage: `usage_events` (migration 0006) with `(project_id, received_at)` index; pruned by the standard retention window. Metric `uh_oh_usage_events_total`.
+
+**Summary.** `GET /api/projects/:id/usage/summary?days=30` (JWT; days 1..90) → zero-filled ascending `days` (pageviews/visitors/events), `topPages` / `topReferrers` (direct excluded) / `topEvents` (≤10 each, deterministic ordering), `totals`. MCP tool `get_usage_summary` in both backends.
+
+**Client (`@uh-oh/js` 0.5.0).** `trackPageview(path?)`, `trackEvent(name, props?)`, and opt-in `init({ analytics: { auto: true } })` — initial pageview (with raw referrer, first pageview only), History pushState/replaceState + popstate hooks with consecutive-path dedupe, restored cleanly on `close()`. Separate lossy batch queue (cap 20, 5s debounce, sendBeacon on pagehide, no retry/spool — analytics is best-effort by design). Validation mirrors the server; nothing here can throw or mint an identifier.
+
+**Dashboard.** Usage section per project: visitors/pageviews/events headline, dual-series 30-day trend (SVG, shared-scale fitting), top pages/referrers/events bars, 7/30/90-day toggle; hidden entirely when the endpoint is absent.

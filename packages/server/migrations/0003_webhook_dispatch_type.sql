@@ -1,0 +1,1 @@
+ALTER TABLE `webhook_dispatches` ADD `type` text DEFAULT 'issue.new' NOT NULL;
