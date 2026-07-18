@@ -89,8 +89,10 @@ jobs:
       # Compiles-cleanly gate for @uh-oh/server (the main `ci` job above never builds it).
       # The e2e run itself boots the server via `tsx` against source, not this dist output —
       # see packages/web/e2e/server-runner.ts for why — but this still catches a broken build.
-      - name: Build server
-        run: pnpm --filter @uh-oh/server build
+      # Recursive, not just the server: the server's own build type-resolves against
+      # @uh-oh/types and @uh-oh/mcp dist/, which don't exist on a fresh runner.
+      - name: Build server (and its workspace deps)
+        run: pnpm -r build
 
       # Also done inside packages/web/e2e/global-setup.ts (it runs `vite build` itself right
       # before `vite preview`), but kept here too as a fast, clearly-labeled CI gate.
