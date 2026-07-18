@@ -32,6 +32,10 @@ export type Issue = {
   // PATCH the other three values but never set 'regressed' directly.
   status: 'open' | 'resolved' | 'ignored' | 'regressed';
   lastAlertedAt: number | null;
+  // v0.4 CONTRACT P: server-set from the issue's latest event, nullable (an issue with no
+  // events, or one predating migration 0004, has none). Optional too so this type stays
+  // forward-compatible if an older server build omits the field entirely.
+  platform?: 'ios' | 'android' | 'web' | 'node' | null;
 };
 
 export type EventRow = {
@@ -84,6 +88,14 @@ export type IssueStats = {
 
 /** Server-side cap on symbol upload size (mapping.txt / sourcemap.map). Checked client-side too. */
 export const MAX_SYMBOL_UPLOAD_BYTES = 50 * 1024 * 1024;
+
+// v0.4 item 2: GET /api/releases/:id/symbols (exists since v0.3) — one entry per uploaded
+// per-bundle web/node source map for a release.
+export type ReleaseSymbolMap = {
+  platform: 'web' | 'node';
+  bundlePath: string;
+  size: number;
+};
 
 export class ApiError extends Error {
   constructor(
@@ -298,4 +310,9 @@ export const api = {
 
   getIssueStats: (issueId: string, days = 14) =>
     request<IssueStats>(`/api/issues/${issueId}/stats?days=${String(days)}`),
+
+  // v0.4 item 2. Callers must treat any failure (404 for an unknown/deleted release, or
+  // anything else) as "no maps to show" — see Releases.tsx's ReleaseMapsCount.
+  getReleaseSymbols: (releaseId: string) =>
+    request<{ maps: ReleaseSymbolMap[] }>(`/api/releases/${releaseId}/symbols`),
 };

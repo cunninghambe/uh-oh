@@ -16,6 +16,7 @@ import { registerMetricsRoute } from './metrics/route.js';
 import { metrics } from './metrics/registry.js';
 import { registerMcpRoute } from './mcp/route.js';
 import { InProcessBackend } from './mcp/in-process-backend.js';
+import { MIN_SYMBOL_TOKEN_LENGTH } from './auth/symbol-token.js';
 
 export type ServerDeps = {
   db: Db;
@@ -29,6 +30,12 @@ export type ServerDeps = {
   ipRateBurst?: number;
   /** Max symbol upload size in bytes (default 50 MB). */
   maxSymbolBytes?: number;
+  /**
+   * Scoped symbol-upload token (CONTRACT T). When set (≥16 chars), requests
+   * bearing `X-Uh-Oh-Symbol-Token` are authorized on the upload-flow endpoints
+   * WITHOUT a JWT. Unset = feature off.
+   */
+  symbolToken?: string | undefined;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -41,6 +48,13 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   }
   if (!deps.password || deps.password.length === 0) {
     throw new Error('buildServer requires a non-empty admin password');
+  }
+  // Defense in depth: the env layer (symbolTokenFromEnv) already rejects a short
+  // token before boot, but enforce the floor here too so any caller fails fast.
+  if (deps.symbolToken !== undefined && deps.symbolToken.length < MIN_SYMBOL_TOKEN_LENGTH) {
+    throw new Error(
+      `buildServer: symbolToken must be at least ${String(MIN_SYMBOL_TOKEN_LENGTH)} characters`,
+    );
   }
 
   const app = Fastify({
@@ -137,12 +151,13 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   app.get('/healthz', () => ({ ok: true }));
 
   registerAuthRoutes(app, deps.db, deps.secret, deps.password, loginLimiter);
-  registerApiRoutes(app, deps.db, deps.secret);
+  registerApiRoutes(app, deps.db, deps.secret, deps.symbolToken);
   registerSymbolizationRoutes(
     app,
     deps.db,
     deps.secret,
     deps.maxSymbolBytes ?? DEFAULT_MAX_SYMBOL_BYTES,
+    deps.symbolToken,
   );
   registerMetricsRoute(app);
   // MCP (Streamable HTTP) over the same tool registry the stdio bin uses,

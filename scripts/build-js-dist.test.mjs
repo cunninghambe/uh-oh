@@ -8,7 +8,7 @@ import { buildFlatPackageJson } from './build-js-dist.mjs';
 
 const ORIG = {
   name: '@uh-oh/js',
-  version: '0.2.0',
+  version: '0.3.0',
   private: true,
   type: 'module',
   main: './dist/uh-oh-client.js',
@@ -31,7 +31,7 @@ void test('strips the private flag', () => {
 void test('preserves name, version, type, entry points, and exports', () => {
   const flat = buildFlatPackageJson(ORIG);
   assert.equal(flat.name, '@uh-oh/js');
-  assert.equal(flat.version, '0.2.0');
+  assert.equal(flat.version, '0.3.0');
   assert.equal(flat.type, 'module');
   assert.equal(flat.main, './dist/uh-oh-client.js');
   assert.equal(flat.types, './dist/uh-oh-client.d.ts');

@@ -260,7 +260,10 @@ const resolveProjectId = async (backend: UhOhBackend, ref: string): Promise<stri
 const READ = { readOnlyHint: true, destructiveHint: false } as const;
 const WRITE = { readOnlyHint: false, destructiveHint: false } as const;
 
+// User-settable statuses (set_issue_status). 'regressed' is system-set.
 const STATUS = z.enum(['open', 'resolved', 'ignored']);
+// list_issues filter — additionally accepts the system-set 'regressed'.
+const FILTER_STATUS = z.enum(['open', 'resolved', 'ignored', 'regressed']);
 const SORT = z.enum(['lastSeen', 'eventCount', 'firstSeen']);
 
 /**
@@ -326,10 +329,10 @@ export const registerUhOhTools = (server: McpServer, backend: UhOhBackend): void
     {
       title: 'List issues',
       description:
-        'List issues for a project (by id or slug), optionally filtered by status and sorted. Returns issues plus the total count.',
+        'List issues for a project (by id or slug), optionally filtered by status (open, resolved, ignored, or the system-set regressed) and sorted. Returns issues plus the total count.',
       inputSchema: {
         project: z.string().min(1),
-        status: STATUS.optional(),
+        status: FILTER_STATUS.optional(),
         sort: SORT.optional(),
         limit: z.number().int().min(1).max(100).default(20),
         offset: z.number().int().min(0).default(0),
@@ -429,7 +432,8 @@ export const registerUhOhTools = (server: McpServer, backend: UhOhBackend): void
     'set_issue_status',
     {
       title: 'Set issue status',
-      description: 'Set an issue status to open, resolved or ignored.',
+      description:
+        "Set an issue status to open, resolved or ignored. The 'regressed' status is system-set (a resolved issue that received a new event) and cannot be set here; PATCH a regressed issue to resolved to re-arm regression detection.",
       inputSchema: { issueId: z.string().min(1), status: STATUS },
       annotations: WRITE,
     },

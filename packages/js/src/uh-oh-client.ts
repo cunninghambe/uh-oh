@@ -113,6 +113,14 @@ export interface InitOptions {
   maxBreadcrumbs?: number;
   /** Override auto-detection (window+document => browser, else node). */
   runtime?: 'browser' | 'node';
+  /**
+   * Node runtime only (ignored on browser): directory in which to persist the
+   * pending queue as `<spoolDir>/uh-oh-spool.json`, so events captured while
+   * offline survive a process restart. Writes are atomic (tmp + rename) and
+   * debounced (~1s); any filesystem failure is swallowed (never throws). No
+   * effect when the host has no reachable `node:fs`.
+   */
+  spoolDir?: string;
 }
 
 export interface CaptureOptions {
@@ -167,6 +175,23 @@ interface StorageLike {
   removeItem: (key: string) => void;
 }
 
+/**
+ * Minimal synchronous `node:fs` surface used by the optional Node disk spool.
+ * Self-declared (not the ambient Node types) so the file still compiles with
+ * `types: []`. `existsSync`/`unlinkSync` are optional: the spool tolerates a
+ * fake that omits them.
+ */
+export interface FsLike {
+  mkdirSync: (path: string, opts?: { recursive?: boolean }) => unknown;
+  writeFileSync: (path: string, data: string) => void;
+  renameSync: (from: string, to: string) => void;
+  readFileSync: (path: string, encoding: string) => string;
+  existsSync?: (path: string) => boolean;
+  unlinkSync?: (path: string) => void;
+}
+
+type RequireLike = (id: string) => unknown;
+
 interface NavigatorLike {
   userAgent?: string;
   language?: string;
@@ -217,6 +242,7 @@ interface GlobalScope {
   navigator?: NavigatorLike;
   localStorage?: StorageLike;
   process?: ProcessLike;
+  require?: RequireLike;
   fetch?: FetchLike;
   crypto?: CryptoLike;
   URL?: new (input: string) => UrlLike;
@@ -240,6 +266,8 @@ export interface ClientDeps {
   navigator?: NavigatorLike | null;
   storage?: StorageLike | null;
   cryptoObj?: CryptoLike | null;
+  /** Inject a fake `node:fs` for the Node disk-spool tests. */
+  fs?: FsLike | null;
   now?: () => number;
   setTimeoutFn?: TimerSet;
   clearTimeoutFn?: TimerClear;
@@ -252,8 +280,10 @@ export interface ClientDeps {
 // ---------------------------------------------------------------------------
 
 const SDK_NAME = '@uh-oh/js';
-const SDK_VERSION = '0.2.0';
+const SDK_VERSION = '0.3.0';
 const SPOOL_KEY = 'uh-oh:spool';
+const SPOOL_FILE = 'uh-oh-spool.json';
+const SPOOL_DEBOUNCE_MS = 1_000;
 const MAX_QUEUE = 50;
 const MAX_SPOOL_BYTES = 500_000;
 const WIRE_BREADCRUMB_MAX = 100;
@@ -289,6 +319,33 @@ function genId(cryptoObj: CryptoLike | undefined): string {
     // fall through to the manual id
   }
   return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+}
+
+/**
+ * Resolves a usable `node:fs` via a guarded `require`, reached through the
+ * globalThis view (same discipline as every other runtime global here). Returns
+ * undefined - never throws - when `require` or the module is unavailable
+ * (browsers, or an ESM host with no reachable `require`), which disables the
+ * disk spool silently.
+ */
+function loadFs(): FsLike | undefined {
+  try {
+    const req = G.require;
+    if (typeof req !== 'function') return undefined;
+    const mod = req('node:fs') as Partial<FsLike> | undefined;
+    if (
+      mod &&
+      typeof mod.mkdirSync === 'function' &&
+      typeof mod.writeFileSync === 'function' &&
+      typeof mod.renameSync === 'function' &&
+      typeof mod.readFileSync === 'function'
+    ) {
+      return mod as FsLike;
+    }
+  } catch {
+    // node:fs unavailable; the disk spool stays disabled.
+  }
+  return undefined;
 }
 
 export interface ParsedDsn {
@@ -471,6 +528,15 @@ export class Client {
   private uninstallers: Array<() => void> = [];
   private wasOnlyUncaughtListener = false;
 
+  // Node disk spool (opts.spoolDir; node runtime only). All undefined unless a
+  // spoolDir was given on a node runtime AND a node:fs was resolved.
+  private readonly fs: FsLike | undefined;
+  private readonly spoolDir: string | undefined;
+  private readonly spoolFile: string | undefined;
+  private readonly spoolTmp: string | undefined;
+  private spoolTimer: unknown = null;
+  private spoolDirty = false;
+
   constructor(opts: InitOptions, deps: ClientDeps = {}) {
     this.opts = opts;
     this.fetchFn = pick(deps.fetchFn, G.fetch);
@@ -496,6 +562,23 @@ export class Client {
 
     const detected = this.win !== undefined && this.doc !== undefined ? 'browser' : 'node';
     this.runtime = opts.runtime ?? detected;
+
+    const spoolDir =
+      typeof opts.spoolDir === 'string' && opts.spoolDir.length > 0 ? opts.spoolDir : undefined;
+    if (this.runtime === 'node' && spoolDir !== undefined) {
+      this.spoolDir = spoolDir;
+      // Node accepts forward slashes on every platform, so a POSIX join is safe
+      // here and avoids pulling in node:path.
+      const sep = /[\\/]$/.test(spoolDir) ? '' : '/';
+      this.spoolFile = `${spoolDir}${sep}${SPOOL_FILE}`;
+      this.spoolTmp = `${this.spoolFile}.tmp`;
+      this.fs = deps.fs !== undefined ? (deps.fs === null ? undefined : deps.fs) : loadFs();
+    } else {
+      this.spoolDir = undefined;
+      this.spoolFile = undefined;
+      this.spoolTmp = undefined;
+      this.fs = undefined;
+    }
 
     const max = opts.maxBreadcrumbs;
     this.maxBreadcrumbs =
@@ -633,6 +716,8 @@ export class Client {
     } catch {
       // best-effort flush
     }
+    // Anything that could not be sent gets spooled so the next start drains it.
+    this.flushSpool(true);
     if (this.wasOnlyUncaughtListener && !this.closed) {
       this.writeStderr(err);
       try {
@@ -986,7 +1071,14 @@ export class Client {
   // ---- browser persistence ----------------------------------------------
 
   private persist(): void {
-    if (this.runtime !== 'browser') return;
+    if (this.runtime === 'browser') {
+      this.persistBrowser();
+      return;
+    }
+    this.scheduleSpool();
+  }
+
+  private persistBrowser(): void {
     const storage = this.storage;
     if (!storage) return;
     try {
@@ -1004,7 +1096,14 @@ export class Client {
   }
 
   private restore(): void {
-    if (this.runtime !== 'browser') return;
+    if (this.runtime === 'browser') {
+      this.restoreBrowser();
+      return;
+    }
+    this.restoreNode();
+  }
+
+  private restoreBrowser(): void {
     const storage = this.storage;
     if (!storage) return;
     let raw: string | null = null;
@@ -1030,9 +1129,23 @@ export class Client {
       return;
     }
 
+    // Restored events are older, so they go in front, then cap.
+    this.queue = [...this.coerceEntries(parsed), ...this.queue].slice(-MAX_QUEUE);
+  }
+
+  private safeRemoveSpool(): void {
+    try {
+      this.storage?.removeItem(SPOOL_KEY);
+    } catch {
+      // ignore
+    }
+  }
+
+  /** Validates raw spool entries; drops (with a debug log) any malformed one. */
+  private coerceEntries(parsed: unknown[]): QueueItem[] {
     const valid: QueueItem[] = [];
-    for (const raw2 of parsed) {
-      const it = raw2 as { id?: unknown; env?: unknown };
+    for (const raw of parsed) {
+      const it = raw as { id?: unknown; env?: unknown };
       if (
         it &&
         typeof it === 'object' &&
@@ -1045,15 +1158,113 @@ export class Client {
         this.log('debug', 'discarded malformed spool entry');
       }
     }
-    // Restored events are older, so they go in front, then cap.
-    this.queue = [...valid, ...this.queue].slice(-MAX_QUEUE);
+    return valid;
   }
 
-  private safeRemoveSpool(): void {
+  // ---- node disk spool ---------------------------------------------------
+
+  /** Debounced (~1s) request to write the queue to disk. No-op without spool. */
+  private scheduleSpool(): void {
+    if (this.runtime !== 'node' || !this.fs || !this.spoolFile) return;
+    this.spoolDirty = true;
+    if (this.spoolTimer !== null) return;
+    this.spoolTimer = this.setTimeoutFn(() => {
+      this.spoolTimer = null;
+      this.flushSpool();
+    }, SPOOL_DEBOUNCE_MS);
+    // Do not keep a Node event loop alive purely for a pending spool write.
     try {
-      this.storage?.removeItem(SPOOL_KEY);
+      const t = this.spoolTimer as { unref?: () => void };
+      if (t && typeof t.unref === 'function') t.unref();
     } catch {
-      // ignore
+      // unref unavailable; harmless
+    }
+  }
+
+  /**
+   * Writes the queue to `<spoolDir>/uh-oh-spool.json` atomically: serialize to
+   * a sibling `.tmp` file then rename over the target, so a concurrent reader
+   * never sees a partially written file. Force-flushes bypass the dirty check
+   * (used on close and on the uncaught-exception exit path). Never throws.
+   */
+  private flushSpool(force = false): void {
+    if (this.runtime !== 'node') return;
+    const fs = this.fs;
+    const file = this.spoolFile;
+    const tmp = this.spoolTmp;
+    const dir = this.spoolDir;
+    if (!fs || !file || !tmp || dir === undefined) return;
+    if (!force && !this.spoolDirty) return;
+    this.spoolDirty = false;
+    try {
+      let items = this.queue.slice(-MAX_QUEUE);
+      let serialized = JSON.stringify(items);
+      while (serialized.length > MAX_SPOOL_BYTES && items.length > 1) {
+        items = items.slice(1);
+        serialized = JSON.stringify(items);
+      }
+      if (items.length === 0) {
+        this.safeUnlink(file);
+        return;
+      }
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(tmp, serialized);
+      fs.renameSync(tmp, file);
+    } catch (e) {
+      this.log('debug', 'node spool persist failed', e);
+      // Leave no half-written tmp file behind on failure.
+      this.safeUnlink(tmp);
+    }
+  }
+
+  private restoreNode(): void {
+    const fs = this.fs;
+    const file = this.spoolFile;
+    if (!fs || !file) return;
+    let raw: string;
+    try {
+      if (typeof fs.existsSync === 'function' && !fs.existsSync(file)) return;
+      raw = fs.readFileSync(file, 'utf8');
+    } catch (e) {
+      // Missing or unreadable file: nothing to restore.
+      this.log('debug', 'node spool read failed', e);
+      return;
+    }
+    if (!raw) return;
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      this.log('debug', 'node spool JSON parse failed; discarding corrupt spool');
+      this.safeUnlink(file);
+      return;
+    }
+    if (!Array.isArray(parsed)) {
+      this.log('debug', 'node spool was not an array; discarding corrupt spool');
+      this.safeUnlink(file);
+      return;
+    }
+
+    this.queue = [...this.coerceEntries(parsed), ...this.queue].slice(-MAX_QUEUE);
+  }
+
+  private safeUnlink(path: string): void {
+    try {
+      this.fs?.unlinkSync?.(path);
+    } catch {
+      // best-effort
+    }
+  }
+
+  private clearSpoolTimer(): void {
+    if (this.spoolTimer !== null) {
+      try {
+        this.clearTimeoutFn(this.spoolTimer);
+      } catch {
+        // ignore
+      }
+      this.spoolTimer = null;
     }
   }
 
@@ -1129,6 +1340,9 @@ export class Client {
     }
     this.uninstallers = [];
     this.clearRetryTimer();
+    // Persist any still-pending events before we go, then stop the debounce.
+    this.flushSpool(true);
+    this.clearSpoolTimer();
   }
 
   /** Pending queue length (test/introspection helper). */

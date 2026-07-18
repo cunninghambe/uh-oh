@@ -11,7 +11,16 @@ export type ReleaseInsert = {
   platform: 'ios' | 'android' | 'web' | 'node';
 };
 
-export const upsertRelease = (db: DbOrTx, input: ReleaseInsert): ReleaseRow => {
+/**
+ * Idempotent release upsert. Returns the existing row (against the
+ * project+version+build+platform unique index) when present, otherwise inserts
+ * and returns a new one. `created` distinguishes the two so callers (e.g. the
+ * release-upsert route) can return 201 vs 200.
+ */
+export const upsertReleaseWithStatus = (
+  db: DbOrTx,
+  input: ReleaseInsert,
+): { release: ReleaseRow; created: boolean } => {
   const existing = db
     .select()
     .from(releases)
@@ -25,7 +34,7 @@ export const upsertRelease = (db: DbOrTx, input: ReleaseInsert): ReleaseRow => {
     )
     .get();
 
-  if (existing) return existing;
+  if (existing) return { release: existing, created: false };
 
   const row: ReleaseRow = {
     id: newId(),
@@ -37,8 +46,11 @@ export const upsertRelease = (db: DbOrTx, input: ReleaseInsert): ReleaseRow => {
     sourcemapUploadedAt: null,
   };
   db.insert(releases).values(row).run();
-  return row;
+  return { release: row, created: true };
 };
+
+export const upsertRelease = (db: DbOrTx, input: ReleaseInsert): ReleaseRow =>
+  upsertReleaseWithStatus(db, input).release;
 
 export const getReleaseById = (db: DbOrTx, id: string): ReleaseRow | null =>
   db.select().from(releases).where(eq(releases.id, id)).get() ?? null;

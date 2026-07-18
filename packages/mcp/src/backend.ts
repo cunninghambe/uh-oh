@@ -27,7 +27,9 @@ export interface Issue {
   firstSeen: number;
   lastSeen: number;
   eventCount: number;
-  status: 'open' | 'resolved' | 'ignored';
+  // 'regressed' is system-set (a resolved issue that received a new event; see
+  // §18). It is surfaced here but is not user-settable via set_issue_status.
+  status: 'open' | 'resolved' | 'ignored' | 'regressed';
   lastAlertedAt: number | null;
 }
 
@@ -77,12 +79,17 @@ export interface ResolvedFrame {
   status: string;
 }
 
+// User-settable statuses (the `set_issue_status` input). 'regressed' is
+// system-set and intentionally excluded here.
 export type IssueStatus = 'open' | 'resolved' | 'ignored';
+// Statuses accepted by the `list_issues` filter — adds the system-set
+// 'regressed' so callers can list regressed issues.
+export type IssueFilterStatus = IssueStatus | 'regressed';
 export type IssueSort = 'lastSeen' | 'eventCount' | 'firstSeen';
 
 export interface ListIssuesInput {
   projectId: string;
-  status?: IssueStatus;
+  status?: IssueFilterStatus;
   sort?: IssueSort;
   limit: number;
   offset: number;

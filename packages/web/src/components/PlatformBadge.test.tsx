@@ -11,4 +11,16 @@ describe('PlatformBadge', () => {
       expect(screen.getByText(platform)).toBeInTheDocument();
     },
   );
+
+  // v0.4 CONTRACT P: an issue (list row or detail) with no known platform must render no
+  // badge at all, not an empty/placeholder one.
+  it('renders nothing for a null platform', () => {
+    const { container } = render(<PlatformBadge platform={null} />);
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('renders nothing for an undefined platform', () => {
+    const { container } = render(<PlatformBadge platform={undefined} />);
+    expect(container).toBeEmptyDOMElement();
+  });
 });

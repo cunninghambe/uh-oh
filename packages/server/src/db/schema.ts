@@ -56,6 +56,10 @@ export const issues = sqliteTable(
       .notNull()
       .default('open'),
     lastAlertedAt: integer('last_alerted_at'),
+    // Nullable: reflects the issue's latest event platform (§CONTRACT P). Old
+    // issues predating migration 0004 are backfilled from their most recent
+    // event; an issue with no events stays null.
+    platform: text('platform', { enum: ['ios', 'android', 'web', 'node'] }),
   },
   (t) => [
     uniqueIndex('issues_proj_fp_uniq').on(t.projectId, t.fingerprint),

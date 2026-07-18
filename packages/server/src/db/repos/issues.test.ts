@@ -1,8 +1,10 @@
+import { sql } from 'drizzle-orm';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { Db } from '../index.js';
 import { makeTestDb } from '../test-utils.js';
 import { createProject } from './projects.js';
+import { insertEvent } from './events.js';
 import { getIssue, listIssues, markIssueAlerted, setIssueStatus, upsertIssue } from './issues.js';
 
 let db: Db;
@@ -144,5 +146,83 @@ describe('upsertIssue — regression transition (resolved -> regressed)', () => 
     const again = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 3 });
     expect(again.regressed).toBe(true);
     expect(again.issue.status).toBe('regressed');
+  });
+});
+
+describe('upsertIssue — platform (§CONTRACT P)', () => {
+  it('sets platform on insert', () => {
+    const { issue } = upsertIssue(db, {
+      projectId,
+      fingerprint: 'fp',
+      title: 't',
+      ts: 1,
+      platform: 'web',
+    });
+    expect(issue.platform).toBe('web');
+  });
+
+  it('defaults platform to null when omitted', () => {
+    const { issue } = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 1 });
+    expect(issue.platform).toBeNull();
+  });
+
+  it('overwrites platform with the incoming event platform on conflict (latest wins)', () => {
+    upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 1, platform: 'web' });
+    const second = upsertIssue(db, {
+      projectId,
+      fingerprint: 'fp',
+      title: 't',
+      ts: 2,
+      platform: 'node',
+    });
+    expect(second.issue.platform).toBe('node');
+    // Sanity: it's the same issue, not a new one.
+    expect(second.isNew).toBe(false);
+  });
+});
+
+// Directly exercises the migration 0004 backfill UPDATE (correlated subquery),
+// which sets each issue's platform from its most recent event.
+describe('migration 0004 backfill — platform from most recent event', () => {
+  const backfill = () => {
+    db.run(
+      sql`UPDATE issues SET platform = (SELECT events.platform FROM events WHERE events.issue_id = issues.id ORDER BY events.received_at DESC LIMIT 1)`,
+    );
+  };
+
+  const seedEvent = (issueId: string, platform: 'ios' | 'android' | 'web' | 'node', ts: number) =>
+    insertEvent(db, {
+      projectId,
+      issueId,
+      releaseId: null,
+      fingerprint: 'fp',
+      level: 'error',
+      platform,
+      payload: '{}',
+      receivedAt: ts,
+      deviceInfo: '{}',
+      userInfo: null,
+    });
+
+  it('sets platform to the newest event platform, ignoring older events', () => {
+    const { issue } = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 1 });
+    // Simulate a pre-0004 row (platform null) with several events over time.
+    db.run(sql`UPDATE issues SET platform = NULL WHERE id = ${issue.id}`);
+    seedEvent(issue.id, 'web', 100);
+    seedEvent(issue.id, 'node', 300); // newest
+    seedEvent(issue.id, 'android', 200);
+
+    backfill();
+
+    expect(getIssue(db, issue.id)?.platform).toBe('node');
+  });
+
+  it('leaves platform null for an issue with no events', () => {
+    const { issue } = upsertIssue(db, { projectId, fingerprint: 'fp2', title: 't', ts: 1 });
+    db.run(sql`UPDATE issues SET platform = NULL WHERE id = ${issue.id}`);
+
+    backfill();
+
+    expect(getIssue(db, issue.id)?.platform).toBeNull();
   });
 });

@@ -229,6 +229,8 @@ describe('GET /api/projects/:id/issues', () => {
     const body = res.json<{ issues: IssueRow[]; total: number }>();
     expect(body.total).toBe(1);
     expect(body.issues[0]?.title).toContain('TypeError');
+    // §CONTRACT P: the list payload carries the issue's latest platform.
+    expect(body.issues[0]?.platform).toBe('android');
   });
 
   it('filters by status', async () => {
@@ -275,6 +277,8 @@ describe('GET /api/issues/:id', () => {
       breadcrumbs: BreadcrumbRow[];
     }>();
     expect(body.issue.id).toBe(issueId);
+    // §CONTRACT P: the issue detail payload carries platform (nullable).
+    expect(body.issue.platform).toBe('android');
     expect(body.latestEvent?.platform).toBe('android');
     expect(body.breadcrumbs).toHaveLength(1);
   });

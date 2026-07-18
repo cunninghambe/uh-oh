@@ -6,7 +6,12 @@ import { api, type Breadcrumb, type Issue as IssueT, type ResolvedFrame } from '
 import { PlatformBadge } from '../components/PlatformBadge.js';
 import { RegressedBadge } from '../components/RegressedBadge.js';
 import { Sparkline } from '../components/Sparkline.js';
-import { hasSymbolIssue, statusLabel, statusToggleOptions } from './Issue.utils.js';
+import {
+  hasSymbolIssue,
+  resolvedPlatform,
+  statusLabel,
+  statusToggleOptions,
+} from './Issue.utils.js';
 
 const EVENTS_PAGE_SIZE = 5;
 
@@ -179,7 +184,7 @@ export const Issue = () => {
             <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-xl font-semibold break-words">{issue.title}</h1>
               {issue.status === 'regressed' && <RegressedBadge />}
-              {latestEvent && <PlatformBadge platform={latestEvent.platform} />}
+              <PlatformBadge platform={resolvedPlatform(issue, latestEvent)} />
             </div>
             <div className="font-mono text-xs text-zinc-500 mt-1 break-all">
               {issue.fingerprint}

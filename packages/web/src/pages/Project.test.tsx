@@ -228,3 +228,52 @@ describe('Project issues list regressed badge (v0.3 item 2)', () => {
     expect(await screen.findByText('Regressed')).toBeInTheDocument();
   });
 });
+
+describe('Project issues list platform badge (v0.4 CONTRACT P)', () => {
+  const baseIssue: Issue = {
+    id: 'i1',
+    projectId: 'p1',
+    fingerprint: 'fp1',
+    title: 'Boom',
+    firstSeen: Date.now(),
+    lastSeen: Date.now(),
+    eventCount: 3,
+    status: 'open',
+    lastAlertedAt: null,
+  };
+
+  beforeEach(() => {
+    vi.spyOn(api, 'listProjects').mockResolvedValue({ projects: [sampleProject] });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows a platform badge on a row whose issue has a platform', async () => {
+    vi.spyOn(api, 'listIssues').mockResolvedValue({
+      issues: [{ ...baseIssue, platform: 'android' }],
+      total: 1,
+    });
+    renderProject();
+
+    expect(await screen.findByText('android')).toBeInTheDocument();
+  });
+
+  it('shows no platform badge on a row whose issue has none (null or absent)', async () => {
+    vi.spyOn(api, 'listIssues').mockResolvedValue({
+      issues: [
+        { ...baseIssue, id: 'i1', platform: null },
+        { ...baseIssue, id: 'i2', title: 'Kaboom', fingerprint: 'fp2' },
+      ],
+      total: 2,
+    });
+    renderProject();
+
+    await screen.findByText('Boom');
+    await screen.findByText('Kaboom');
+    for (const p of ['ios', 'android', 'web', 'node']) {
+      expect(screen.queryByText(p)).not.toBeInTheDocument();
+    }
+  });
+});

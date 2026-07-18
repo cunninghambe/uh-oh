@@ -1,7 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import type { Issue, ResolvedFrame } from '../api.js';
-import { hasSymbolIssue, statusLabel, statusToggleOptions } from './Issue.utils.js';
+import type { EventRow, Issue, ResolvedFrame } from '../api.js';
+import {
+  hasSymbolIssue,
+  resolvedPlatform,
+  statusLabel,
+  statusToggleOptions,
+} from './Issue.utils.js';
 
 const frame = (status: ResolvedFrame['status']): ResolvedFrame => ({ status });
 
@@ -78,5 +83,26 @@ describe('statusToggleOptions (v0.3: regression surfacing)', () => {
   it('every status value in the non-regressed toggle is a valid Issue status', () => {
     const statuses: Issue['status'][] = statusToggleOptions('open').map((o) => o.value);
     expect(statuses).toEqual(['open', 'resolved', 'ignored']);
+  });
+});
+
+describe('resolvedPlatform (v0.4 CONTRACT P)', () => {
+  const event = (platform: EventRow['platform']): Pick<EventRow, 'platform'> => ({ platform });
+
+  it("prefers the issue's own platform over the latest event's, even when they differ", () => {
+    expect(resolvedPlatform({ platform: 'web' }, event('android'))).toBe('web');
+  });
+
+  it("falls back to the latest event's platform when the issue has none", () => {
+    expect(resolvedPlatform({ platform: null }, event('ios'))).toBe('ios');
+    // `{}` (property omitted, not set to undefined) is how an older server response — one that
+    // predates CONTRACT P — would deserialize; exactOptionalPropertyTypes forbids the literal
+    // `{ platform: undefined }` here since that's a distinct (disallowed) shape.
+    expect(resolvedPlatform({}, event('node'))).toBe('node');
+  });
+
+  it('is null when neither the issue nor a latest event has a platform', () => {
+    expect(resolvedPlatform({ platform: null }, null)).toBeNull();
+    expect(resolvedPlatform({}, null)).toBeNull();
   });
 });

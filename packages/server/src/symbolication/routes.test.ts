@@ -396,3 +396,78 @@ describe('POST /api/releases/:id/symbols?sourcemap=true', () => {
     expect(db.select().from(symbolications).all()).toHaveLength(0);
   });
 });
+
+describe('POST /api/projects/:id/releases (idempotent release upsert)', () => {
+  it('requires auth', async () => {
+    const project = createProject(db, { name: 'App' });
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/releases`,
+      payload: { version: '1.0.0', build: '1', platform: 'web' },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('404 when the project does not exist', async () => {
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/projects/no-such-project/releases',
+      payload: { version: '1.0.0', build: '1', platform: 'web' },
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(404);
+  });
+
+  it('creates a release (201) then upserts idempotently (200, same row id)', async () => {
+    const project = createProject(db, { name: 'App' });
+    const app = buildTestServer(db);
+    const body = { version: '1.2.3', build: '45', platform: 'web' };
+
+    const first = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/releases`,
+      payload: body,
+      headers: authHeader(),
+    });
+    expect(first.statusCode).toBe(201);
+    const created = first.json<{ release: { id: string; platform: string } }>().release;
+    expect(created.platform).toBe('web');
+
+    const second = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/releases`,
+      payload: body,
+      headers: authHeader(),
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json<{ release: { id: string } }>().release.id).toBe(created.id);
+    // Only one row exists for that key.
+    expect(getReleaseById(db, created.id)?.id).toBe(created.id);
+  });
+
+  it('400 on an invalid platform', async () => {
+    const project = createProject(db, { name: 'App' });
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/releases`,
+      payload: { version: '1.0.0', build: '1', platform: 'windows' },
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('400 on an empty version (length rules match ingest)', async () => {
+    const project = createProject(db, { name: 'App' });
+    const app = buildTestServer(db);
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/releases`,
+      payload: { version: '', build: '1', platform: 'web' },
+      headers: authHeader(),
+    });
+    expect(res.statusCode).toBe(400);
+  });
+});

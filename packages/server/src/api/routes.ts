@@ -13,6 +13,7 @@ import {
 } from '../db/repos/projects.js';
 import type { Db } from '../db/index.js';
 import { buildAuthMiddleware } from '../auth/middleware.js';
+import { buildUploadAuthMiddleware } from '../auth/symbol-token.js';
 import { symbolicateEvent } from '../symbolication/symbolicate.js';
 import { validateWebhookUrl } from '../webhooks/url-guard.js';
 import { clampDays, issueStats, projectStats } from '../db/repos/stats.js';
@@ -33,11 +34,25 @@ const VALID_SORTS = new Set<IssueSort>(['lastSeen', 'eventCount', 'firstSeen']);
 const isSort = (s: unknown): s is IssueSort =>
   typeof s === 'string' && VALID_SORTS.has(s as IssueSort);
 
-export const registerApiRoutes = (app: FastifyInstance, db: Db, secret: Uint8Array): void => {
+export const registerApiRoutes = (
+  app: FastifyInstance,
+  db: Db,
+  secret: Uint8Array,
+  symbolToken?: string,
+): void => {
   const auth = buildAuthMiddleware({ db, secret });
   const preHandler = auth as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
+  // CONTRACT T: GET /api/projects is part of the symbol-upload flow (slug
+  // resolution), so it additionally accepts the scoped upload token. EVERY other
+  // route below keeps the JWT-only `preHandler`, which rejects the token.
+  const uploadPreHandler = buildUploadAuthMiddleware({ db, secret, symbolToken }) as (
+    req: FastifyRequest,
+    reply: FastifyReply,
+  ) => Promise<void>;
 
-  app.get('/api/projects', { preHandler }, () => ({ projects: listProjects(db) }));
+  app.get('/api/projects', { preHandler: uploadPreHandler }, () => ({
+    projects: listProjects(db),
+  }));
 
   app.get<{ Params: { id: string } }>('/api/projects/:id', { preHandler }, (req, reply) => {
     const project = getProjectById(db, req.params.id);

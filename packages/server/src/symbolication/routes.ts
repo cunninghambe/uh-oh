@@ -6,14 +6,16 @@ import { pipeline } from 'node:stream/promises';
 import multipart from '@fastify/multipart';
 import type { MultipartFile } from '@fastify/multipart';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { PlatformSchema, ReleaseInfoSchema } from '@uh-oh/types';
 
 import type { Db } from '../db/index.js';
-import { buildAuthMiddleware } from '../auth/middleware.js';
+import { buildUploadAuthMiddleware } from '../auth/symbol-token.js';
 import {
   getReleaseById,
   listReleasesForProject,
   markMappingUploaded,
   markSourcemapUploaded,
+  upsertReleaseWithStatus,
 } from '../db/repos/releases.js';
 import { getProjectById } from '../db/repos/projects.js';
 import { ensureSymbolsDir, mappingPath, platformSymbolsDir, sourcemapPath } from './storage.js';
@@ -29,6 +31,10 @@ import {
 const DEFAULT_MAX_SYMBOL_BYTES = 50 * 1024 * 1024; // 50 MB
 // Cap the number of per-bundle web/node source maps stored per release.
 const MAX_WEB_MAPS_PER_RELEASE = 500;
+
+// Release-upsert body — same version/build length rules ingest applies
+// (ReleaseInfoSchema: 1..64 chars) plus the platform enum.
+const ReleaseUpsertSchema = ReleaseInfoSchema.extend({ platform: PlatformSchema });
 
 const fieldValue = (data: MultipartFile, name: string): string | undefined => {
   const field = data.fields[name];
@@ -75,10 +81,15 @@ export const registerSymbolizationRoutes = (
   db: Db,
   secret: Uint8Array,
   maxSymbolBytes: number = DEFAULT_MAX_SYMBOL_BYTES,
+  symbolToken?: string,
 ): void => {
   app.register(multipart, { limits: { fileSize: maxSymbolBytes } });
 
-  const auth = buildAuthMiddleware({ db, secret });
+  // CONTRACT T: every route in this module is part of the symbol-upload flow
+  // (release resolution + the symbols list/upload), so all of them accept the
+  // scoped upload token as an alternative to a JWT. When no token is configured,
+  // this behaves exactly like the JWT-only middleware.
+  const auth = buildUploadAuthMiddleware({ db, secret, symbolToken });
   const preHandler = auth as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
 
   app.get<{ Params: { id: string } }>(
@@ -88,6 +99,32 @@ export const registerSymbolizationRoutes = (
       const project = getProjectById(db, req.params.id);
       if (!project) return reply.code(404).send({ error: 'project_not_found' });
       return { releases: listReleasesForProject(db, project.id) };
+    },
+  );
+
+  // Idempotent release upsert. Deploy/source-map pipelines run BEFORE the first
+  // crash event, so a release row may not exist yet; this lets the uploader
+  // create (or resolve) one up front. 201 on create, 200 when it already exists.
+  // Part of the symbol-upload flow → covered by the scoped upload token above.
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    '/api/projects/:id/releases',
+    { preHandler },
+    (req, reply) => {
+      const project = getProjectById(db, req.params.id);
+      if (!project) return reply.code(404).send({ error: 'project_not_found' });
+
+      const parsed = ReleaseUpsertSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return reply.code(400).send({ error: 'invalid_release' });
+      }
+
+      const { release, created } = upsertReleaseWithStatus(db, {
+        projectId: project.id,
+        version: parsed.data.version,
+        build: parsed.data.build,
+        platform: parsed.data.platform,
+      });
+      return reply.code(created ? 201 : 200).send({ release });
     },
   );
 

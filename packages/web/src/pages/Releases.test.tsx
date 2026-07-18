@@ -10,6 +10,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { MAX_SYMBOL_UPLOAD_BYTES, api, type Project, type Release } from '../api.js';
+import { EAGER_MAP_COUNT_THRESHOLD } from './Releases.utils.js';
 import { Releases } from './Releases.js';
 
 const buildRouter = () => {
@@ -102,5 +103,67 @@ describe('Releases symbol upload (M9: drag-drop + client size pre-check)', () =>
       expect(screen.getByText(/the server limit is 50\.0MB/i)).toBeInTheDocument();
     });
     expect(uploadSpy).not.toHaveBeenCalled();
+  });
+});
+
+describe('Releases map counts (v0.4 item 2: GET /api/releases/:id/symbols)', () => {
+  beforeEach(() => {
+    vi.spyOn(api, 'getProject').mockResolvedValue({ project: sampleProject });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('a short list (<= threshold) fetches and shows counts eagerly, without interaction', async () => {
+    vi.spyOn(api, 'listReleases').mockResolvedValue({ releases: [sampleRelease] });
+    const symbolsSpy = vi.spyOn(api, 'getReleaseSymbols').mockResolvedValue({
+      maps: [
+        { platform: 'web', bundlePath: 'a.js', size: 10 },
+        { platform: 'web', bundlePath: 'b.js', size: 10 },
+        { platform: 'node', bundlePath: 'c.js', size: 10 },
+      ],
+    });
+    renderReleases();
+
+    expect(await screen.findByText('2 web maps · 1 node map')).toBeInTheDocument();
+    expect(symbolsSpy).toHaveBeenCalledWith('r1');
+  });
+
+  it('shows nothing (no error banner) when the symbols request 404s / errors', async () => {
+    vi.spyOn(api, 'listReleases').mockResolvedValue({ releases: [sampleRelease] });
+    vi.spyOn(api, 'getReleaseSymbols').mockRejectedValue(new Error('not found'));
+    renderReleases();
+
+    // Let the (failed) request settle, then assert no count and no error text appeared.
+    await waitFor(() => {
+      expect(api.getReleaseSymbols).toHaveBeenCalled();
+    });
+    expect(screen.queryByText(/maps?/i, { selector: 'span' })).not.toBeInTheDocument();
+  });
+
+  it('a long list (> threshold) does not fetch on mount, only on hover of a row', async () => {
+    const releases: Release[] = Array.from({ length: EAGER_MAP_COUNT_THRESHOLD + 1 }, (_, i) => ({
+      ...sampleRelease,
+      id: `r${String(i)}`,
+      build: String(i),
+    }));
+    vi.spyOn(api, 'listReleases').mockResolvedValue({ releases });
+    const symbolsSpy = vi
+      .spyOn(api, 'getReleaseSymbols')
+      .mockResolvedValue({ maps: [{ platform: 'web', bundlePath: 'a.js', size: 10 }] });
+    renderReleases();
+
+    const triggers = await screen.findAllByText('Maps…');
+    expect(triggers).toHaveLength(releases.length);
+    expect(symbolsSpy).not.toHaveBeenCalled();
+
+    fireEvent.mouseEnter(triggers[0]!);
+
+    await waitFor(() => {
+      expect(symbolsSpy).toHaveBeenCalledTimes(1);
+    });
+    expect(symbolsSpy).toHaveBeenCalledWith('r0');
+    expect(await screen.findByText('1 web map')).toBeInTheDocument();
   });
 });

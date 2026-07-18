@@ -135,6 +135,35 @@ describe('InProcessBackend over MCP (InMemoryTransport)', () => {
     expect(resolved.data['total']).toBe(1);
   });
 
+  it('surfaces a system-set regressed status end-to-end (§CONTRACT M, no adapter)', async () => {
+    // Resolve the seeded issue, then a new event with the same fingerprint
+    // transitions it resolved -> regressed (system-set by ingest).
+    await call(client, 'set_issue_status', { issueId: seeded.issueId, status: 'resolved' });
+    const rl = createRateLimiter({ capacity: 10, refillPerSec: 1 });
+    const again = ingest({ db, rateLimiter: rl }, project.publicKey, envelope);
+    expect(again.kind).toBe('stored');
+
+    // The regressed filter (now accepted by list_issues) returns the issue.
+    const regressed = await call(client, 'list_issues', { project: 'my-app', status: 'regressed' });
+    expect(regressed.data['total']).toBe(1);
+    expect((regressed.data['issues'] as Record<string, unknown>[])[0]).toMatchObject({
+      id: seeded.issueId,
+      status: 'regressed',
+    });
+
+    // get_issue surfaces the regressed status directly (the widened Issue type).
+    const detail = await call(client, 'get_issue', { issueId: seeded.issueId });
+    expect((detail.data['issue'] as Record<string, unknown>)['status']).toBe('regressed');
+  });
+
+  it('set_issue_status rejects the system-set regressed status', async () => {
+    const { isError } = await call(client, 'set_issue_status', {
+      issueId: seeded.issueId,
+      status: 'regressed',
+    });
+    expect(isError).toBe(true);
+  });
+
   it('list_releases returns the release created at ingest', async () => {
     const { isError, data } = await call(client, 'list_releases', { project: 'my-app' });
     expect(isError).toBe(false);

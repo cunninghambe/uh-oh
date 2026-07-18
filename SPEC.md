@@ -550,7 +550,7 @@ Shipped after the v0.1 robustness pass. Adds first-class `platform: 'web'` and `
 
 **Consumer conventions:** env vars `UH_OH_DSN` (server) / `NEXT_PUBLIC_UH_OH_DSN` (browser); Next.js apps wire via `instrumentation.ts` (`register()` guarded to the nodejs runtime + `onRequestError`), `instrumentation-client.ts`, and `app/global-error.tsx`.
 
-**Known v0.2 gaps:** ~~no symbolication for web/node stacks~~ (shipped in v0.3 — §18); no Node disk spool; RN symbol upload remains Android-only.
+**Known v0.2 gaps:** ~~no symbolication for web/node stacks~~ (shipped in v0.3 — §18); ~~no Node disk spool~~ (shipped in v0.4 — §19); RN symbol upload remains Android-only.
 
 ---
 
@@ -594,4 +594,28 @@ Driven by the first four production consumers (Next.js apps reporting `web` + `n
 
 **CLI.** `uh-oh project list`, `uh-oh project create <name>` (prints slug + DSN), `uh-oh project dsn <slug>` (prints DSN + paste-ready `UH_OH_DSN=`/`NEXT_PUBLIC_UH_OH_DSN=` lines), `uh-oh upload next-sourcemaps --project <slug> --release <v+b> --dir <.next> [--dry-run]` (uploads `static/**` maps as `web` and `server/**` maps as `node`, per-platform release resolution), and `uh-oh upload sourcemap --platform web|node --bundle-path <p>` as the generic escape hatch.
 
-**Known v0.3 gaps:** consumer build pipelines don't yet generate/upload/strip source maps (per-app follow-up once a server is deployed); `@uh-oh/mcp`'s Issue type still models three statuses (the in-process backend surfaces `regressed` at runtime via an adapter — widen the type at next MCP rev); no per-issue platform column on the issues list payload (platform badge is detail-only).
+**Known v0.3 gaps:** consumer build pipelines don't yet generate/upload/strip source maps (per-app follow-up once a server is deployed); ~~`@uh-oh/mcp` Issue type~~ and ~~per-issue platform on the list payload~~ both closed in v0.4 (§19).
+
+---
+
+## 19. v0.4 addendum — CI upload auth, fleet polish, Node spool, e2e
+
+**Scoped symbol-upload token.** Optional env `UH_OH_SYMBOL_TOKEN` (min 16 chars; boot fails if set shorter). Requests carrying `X-Uh-Oh-Symbol-Token` (constant-time compared, never logged) are authorized on exactly five endpoints — `GET /api/projects`, `GET/POST /api/projects/:id/releases`, `GET/POST /api/releases/:id/symbols` — and rejected everywhere else. This lets deploy pipelines upload source maps without the admin JWT.
+
+**Release upsert.** `POST /api/projects/:id/releases` `{ version, build, platform }` → 201 created / 200 existing (idempotent). Closes the pre-first-event upload gap: release rows previously existed only after ingest.
+
+**Issues carry platform.** Migration 0004 adds `issues.platform` (nullable; backfilled from each issue's latest event; latest-wins on new events). List + detail payloads expose it; the dashboard badges list rows.
+
+**SSRF DNS re-check.** Hostname webhook targets are `dns.lookup`-checked at dispatch time (all addresses; private/loopback/link-local/metadata → permanent failure `blocked_dns:<addr>`; 2s timeout, transient DNS errors fall through to the fetch). TOCTOU caveat documented — this raises the bar, it is not pinning.
+
+**@uh-oh/mcp regressed.** MCP Issue status includes `regressed`; the `list_issues` filter accepts it; `set_issue_status` stays 3-value (regressed is system-set).
+
+**@uh-oh/js 0.3.0 — Node disk spool.** `InitOptions.spoolDir` (Node only): pending queue persists to `<spoolDir>/uh-oh-spool.json` (atomic tmp+rename, ~1s debounce, force-flush on close and on the uncaught-exception path, corrupt-tolerant, same 50-event/500KB caps). Browser ignores the option.
+
+**Vendorable source-map uploader.** `node scripts/vendor-sourcemap-uploader.mjs --out <path>` emits a zero-dependency `uh-oh-upload-sourcemaps.mjs` for consumer deploy pipelines: env `UH_OH_SERVER_URL`/`UH_OH_SYMBOL_TOKEN`/`UH_OH_PROJECT` (missing env → clean no-op, `--require` to enforce), uploads `static/**` as web and `server/**` as node, auto-creates missing releases via the upsert, `--delete-browser-maps` (only after full success), `--dry-run`.
+
+**RN SDK.** `@react-native-community/netinfo` declared as an optional peer (`>=9`) — the runtime guarded-require existed since v0.1's hardening pass.
+
+**Playwright e2e.** 6-test chromium smoke (`packages/web/e2e`) boots the real server (temp SQLite, ephemeral config) + built dashboard via `vite preview` proxy: login errors, project create, ingest→issue→detail→resolve flows. CI runs it as a separate job with report artifacts. Fixed also: the server's `isMain` entry check now uses `pathToFileURL` (the old string comparison silently never matched on Windows).
+
+**Dashboard.** Per-release uploaded-map counts (eager ≤10 rows, lazy beyond); platform badges on issue list rows.

@@ -47,6 +47,7 @@ export const ingest = (
       fingerprint,
       title,
       ts: now,
+      platform: envelope.platform,
     });
 
     // Token consumption stays inside the tx and before the insert on purpose:

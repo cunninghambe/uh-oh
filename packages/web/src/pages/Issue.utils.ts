@@ -1,7 +1,7 @@
 // Pure helpers for the symbolication status banner and the status toggle, split out from
 // Issue.tsx for unit testing.
 
-import type { Issue, ResolvedFrame } from '../api.js';
+import type { EventRow, Issue, ResolvedFrame } from '../api.js';
 
 const KNOWN_STATUS_LABELS: Partial<Record<ResolvedFrame['status'], string>> = {
   no_symbols: 'no symbols uploaded',
@@ -39,3 +39,12 @@ export const statusToggleOptions = (current: Issue['status']): StatusToggleOptio
         { value: 'resolved', label: 'resolved' },
         { value: 'ignored', label: 'ignored' },
       ];
+
+// v0.4 CONTRACT P: the issue detail header's platform badge prefers the issue's own `platform`
+// (server-set from its latest event, but stable even while we're viewing an older event) and
+// falls back to the currently-displayed event's platform — which is what the badge showed
+// before CONTRACT P existed, and remains correct if an older server omits the field.
+export const resolvedPlatform = (
+  issue: Pick<Issue, 'platform'>,
+  latestEvent: Pick<EventRow, 'platform'> | null,
+): EventRow['platform'] | null => issue.platform ?? latestEvent?.platform ?? null;

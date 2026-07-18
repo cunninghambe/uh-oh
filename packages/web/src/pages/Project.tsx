@@ -3,6 +3,7 @@ import { Link, useParams } from '@tanstack/react-router';
 import { useState } from 'react';
 
 import { api } from '../api.js';
+import { PlatformBadge } from '../components/PlatformBadge.js';
 import { RegressedBadge } from '../components/RegressedBadge.js';
 import { Sparkline } from '../components/Sparkline.js';
 import {
@@ -194,7 +195,10 @@ export const Project = () => {
                       params={{ issueId: i.id }}
                       className="hover:text-amber-300"
                     >
-                      <div className="font-medium truncate">{i.title}</div>
+                      <div className="flex items-center gap-2">
+                        <div className="font-medium truncate min-w-0">{i.title}</div>
+                        <PlatformBadge platform={i.platform} />
+                      </div>
                       <div className="text-xs text-zinc-500 font-mono truncate">
                         {i.fingerprint}
                       </div>

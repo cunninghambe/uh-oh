@@ -3,7 +3,12 @@ import { Link, useParams } from '@tanstack/react-router';
 import { useRef, useState } from 'react';
 
 import { ApiError, type Release, api } from '../api.js';
-import { oversizeError } from './Releases.utils.js';
+import {
+  EAGER_MAP_COUNT_THRESHOLD,
+  formatMapCounts,
+  oversizeError,
+  summarizeMapCounts,
+} from './Releases.utils.js';
 
 type UploadState = 'idle' | 'uploading' | 'done' | 'error';
 
@@ -87,7 +92,52 @@ const UploadCell = ({
   );
 };
 
-const ReleaseRow = ({ release, onUploadDone }: { release: Release; onUploadDone: () => void }) => {
+// v0.4 item 2: compact "N web maps · M node maps" summary for a release, from GET
+// /api/releases/:id/symbols (v0.3). `eager` rows fetch on mount; the rest fetch lazily on
+// hover/focus (see EAGER_MAP_COUNT_THRESHOLD in Releases.utils.ts for the split rationale). A
+// 404 (unknown/deleted release) or any other error is treated the same as "nothing uploaded
+// yet" — nothing is rendered, no error state.
+const ReleaseMapsCount = ({ releaseId, eager }: { releaseId: string; eager: boolean }) => {
+  const [active, setActive] = useState(eager);
+  const mapsQ = useQuery({
+    queryKey: ['release-symbols', releaseId],
+    queryFn: () => api.getReleaseSymbols(releaseId),
+    enabled: active,
+    retry: false,
+  });
+
+  const label = mapsQ.data ? formatMapCounts(summarizeMapCounts(mapsQ.data.maps)) : '';
+  if (label) return <span className="text-xs text-zinc-500">{label}</span>;
+  if (active) return null; // loading, empty, or errored — nothing to show (yet or ever)
+
+  // Not activated yet (long list, row untouched): a quiet hover/focus target rather than an
+  // eager fetch, so opening a project with hundreds of releases doesn't fan out hundreds of
+  // requests on load.
+  return (
+    <button
+      type="button"
+      onMouseEnter={() => {
+        setActive(true);
+      }}
+      onFocus={() => {
+        setActive(true);
+      }}
+      className="text-xs text-zinc-600 underline decoration-dotted hover:text-zinc-400"
+    >
+      Maps…
+    </button>
+  );
+};
+
+const ReleaseRow = ({
+  release,
+  eagerMaps,
+  onUploadDone,
+}: {
+  release: Release;
+  eagerMaps: boolean;
+  onUploadDone: () => void;
+}) => {
   const [status, setStatus] = useState<RowUploadStatus>({
     mapping: 'idle',
     sourcemap: 'idle',
@@ -137,6 +187,9 @@ const ReleaseRow = ({ release, onUploadDone }: { release: Release; onUploadDone:
       <td className="px-4 py-3 text-xs text-zinc-400">{release.platform}</td>
       <td className="px-4 py-3 text-xs text-zinc-400">{formatTs(release.mappingUploadedAt)}</td>
       <td className="px-4 py-3 text-xs text-zinc-400">{formatTs(release.sourcemapUploadedAt)}</td>
+      <td className="px-4 py-3">
+        <ReleaseMapsCount releaseId={release.id} eager={eagerMaps} />
+      </td>
       <td className="px-4 py-3">
         <UploadCell
           label="Mapping"
@@ -213,20 +266,26 @@ export const Releases = () => {
 
       {releasesQ.data && releasesQ.data.releases.length > 0 && (
         <div className="rounded border border-zinc-800 overflow-x-auto">
-          <table className="w-full text-sm min-w-[700px]">
+          <table className="w-full text-sm min-w-[800px]">
             <thead className="bg-zinc-900 text-left text-xs uppercase text-zinc-500">
               <tr>
                 <th className="px-4 py-2">Version</th>
                 <th className="px-4 py-2">Platform</th>
                 <th className="px-4 py-2">Mapping uploaded</th>
                 <th className="px-4 py-2">Source map uploaded</th>
+                <th className="px-4 py-2">Maps</th>
                 <th className="px-4 py-2">Upload mapping</th>
                 <th className="px-4 py-2">Upload source map</th>
               </tr>
             </thead>
             <tbody>
               {releasesQ.data.releases.map((r) => (
-                <ReleaseRow key={r.id} release={r} onUploadDone={invalidateReleases} />
+                <ReleaseRow
+                  key={r.id}
+                  release={r}
+                  eagerMaps={releasesQ.data.releases.length <= EAGER_MAP_COUNT_THRESHOLD}
+                  onUploadDone={invalidateReleases}
+                />
               ))}
             </tbody>
           </table>

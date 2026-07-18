@@ -116,7 +116,9 @@ const SSRF_URL = 'http://169.254.169.254/';
 
 class FakeBackend implements UhOhBackend {
   projects: Project[] = [{ ...PROJECT }];
-  issueStatus: IssueStatus = 'open';
+  // Widened to the surfaced Issue status so tests can exercise 'regressed'
+  // (system-set) flowing through list_issues / get_issue.
+  issueStatus: Issue['status'] = 'open';
   calls: Array<{ method: string; input?: unknown }> = [];
 
   private rec(method: string, input?: unknown): void {
@@ -420,6 +422,50 @@ describe('issues', () => {
     });
     expect(isError).toBe(true);
     expect(text).toContain('not_found');
+  });
+});
+
+describe('regressed status (§CONTRACT M)', () => {
+  it('surfaces a regressed issue status through list_issues', async () => {
+    backend.issueStatus = 'regressed';
+    const { isError, data } = await call(client, 'list_issues', { project: 'p1' });
+    expect(isError).toBe(false);
+    const issues = data['issues'] as Record<string, unknown>[];
+    expect(issues[0]?.['status']).toBe('regressed');
+  });
+
+  it('surfaces a regressed status through get_issue', async () => {
+    backend.issueStatus = 'regressed';
+    const { isError, data } = await call(client, 'get_issue', { issueId: 'i1' });
+    expect(isError).toBe(false);
+    expect((data['issue'] as Record<string, unknown>)['status']).toBe('regressed');
+  });
+
+  it('list_issues accepts and forwards a regressed status filter', async () => {
+    const { isError } = await call(client, 'list_issues', { project: 'p1', status: 'regressed' });
+    expect(isError).toBe(false);
+    expect((backend.last('listIssues') as ListIssuesInput).status).toBe('regressed');
+  });
+
+  it('set_issue_status REJECTS regressed (system-set, not user-settable)', async () => {
+    const { isError } = await call(client, 'set_issue_status', {
+      issueId: 'i1',
+      status: 'regressed',
+    });
+    expect(isError).toBe(true);
+  });
+
+  it('list_issues tool description advertises the regressed filter option', async () => {
+    const { tools } = await client.listTools();
+    const t = tools.find((x) => x.name === 'list_issues');
+    expect(t?.description).toMatch(/regressed/);
+  });
+
+  it('set_issue_status tool description states regressed is system-set', async () => {
+    const { tools } = await client.listTools();
+    const t = tools.find((x) => x.name === 'set_issue_status');
+    expect(t?.description).toMatch(/regressed/i);
+    expect(t?.description).toMatch(/system-set/i);
   });
 });
 

@@ -201,12 +201,61 @@ describe('uploadNextSourcemaps', () => {
     expect(deps.logs[0]).toMatch(/my-app not found/i);
   });
 
-  it('missing release for a platform fails only that platform and continues with the other', async () => {
+  it('creates a missing release via the idempotent upsert (asserting body) and uploads', async () => {
+    const calls: FetchCall[] = [];
+    const logs: string[] = [];
+    const cfg: Config = { server: 'http://localhost:3300', token: 'tok' };
+    const deps: NextSourcemapsDeps & { logs: string[] } = {
+      config: { read: () => Promise.resolve(cfg) },
+      fetchFn: makeCapturingFetch(
+        [
+          { status: 200, body: { projects: [baseProject] } },
+          { status: 200, body: { releases: [nodeRelease] } }, // no web release yet
+          { status: 201, body: { release: webRelease } }, // upsert creates it
+          { status: 200, body: { release: webRelease } },
+          { status: 200, body: { release: webRelease } },
+          { status: 200, body: { release: nodeRelease } },
+        ],
+        calls,
+      ),
+      log: (line) => logs.push(line),
+      readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
+      statFile: () => Promise.resolve({ size: 1024 }),
+      listFiles: makeListFiles(),
+      logs,
+    };
+
+    const code = await uploadNextSourcemaps(deps, {
+      project: 'my-app',
+      release: '1.0.0+42',
+      dir: '/app/.next',
+    });
+
+    expect(code).toBe(0);
+    // Call 2 is the upsert: POST /api/projects/:id/releases with the parsed triple.
+    expect(calls[2]?.url).toBe('http://localhost:3300/api/projects/proj-1/releases');
+    expect(calls[2]?.init.method).toBe('POST');
+    expect(JSON.parse(calls[2]?.init.body as string)).toEqual({
+      version: '1.0.0',
+      build: '42',
+      platform: 'web',
+    });
+    expect((calls[2]?.init.headers as Record<string, string>)['Content-Type']).toBe(
+      'application/json',
+    );
+    expect(deps.logs.some((l) => l === 'Created release 1.0.0+42 for platform web')).toBe(true);
+    // Uploads then proceed for BOTH platforms against the resolved ids.
+    expect(deps.logs.at(-1)).toBe('uploaded 2 web + 1 node maps (0 skipped)');
+    expect(calls.slice(3).every((c) => c.url.endsWith('/symbols'))).toBe(true);
+  });
+
+  it('a failed release upsert fails only that platform and continues with the other', async () => {
     const deps = makeDeps(
       { server: 'http://localhost:3300', token: 'tok' },
       [
         { status: 200, body: { projects: [baseProject] } },
         { status: 200, body: { releases: [nodeRelease] } }, // no web release
+        { status: 500, body: { error: 'upsert_failed' } }, // web upsert fails
         { status: 200, body: { release: nodeRelease } },
       ],
       undefined,
@@ -217,9 +266,9 @@ describe('uploadNextSourcemaps', () => {
       dir: '/app/.next',
     });
     expect(code).toBe(1); // web files failed
-    expect(
-      deps.logs.some((l) => /release not yet seen by the server for platform web/i.test(l)),
-    ).toBe(true);
+    expect(deps.logs.some((l) => /could not create release .* for platform web/i.test(l))).toBe(
+      true,
+    );
     expect(deps.logs.at(-1)).toBe('uploaded 0 web + 1 node maps (0 skipped)');
   });
 

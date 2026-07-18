@@ -6,9 +6,17 @@ import { issues, type IssueRow } from '../schema.js';
 
 export type IssueStatus = 'open' | 'resolved' | 'ignored' | 'regressed';
 
+export type IssuePlatform = 'ios' | 'android' | 'web' | 'node';
+
 export const upsertIssue = (
   db: DbOrTx,
-  input: { projectId: string; fingerprint: string; title: string; ts: number },
+  input: {
+    projectId: string;
+    fingerprint: string;
+    title: string;
+    ts: number;
+    platform?: IssuePlatform;
+  },
 ): { issue: IssueRow; isNew: boolean; regressed: boolean } => {
   // Read the prior status (if any) before the upsert so we can detect the
   // resolved -> regressed transition. better-sqlite3 is synchronous and this
@@ -36,6 +44,7 @@ export const upsertIssue = (
       eventCount: 1,
       status: 'open',
       lastAlertedAt: null,
+      platform: input.platform ?? null,
     })
     .onConflictDoUpdate({
       target: [issues.projectId, issues.fingerprint],
@@ -43,6 +52,9 @@ export const upsertIssue = (
         lastSeen: input.ts,
         eventCount: sql`${issues.eventCount} + 1`,
         status: sql`CASE WHEN ${issues.status} = 'resolved' THEN 'regressed' ELSE ${issues.status} END`,
+        // An issue reflects its LATEST platform: overwrite with the incoming
+        // event's platform on every conflict.
+        platform: input.platform ?? null,
       },
     })
     .returning()

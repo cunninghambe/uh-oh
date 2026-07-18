@@ -1,6 +1,9 @@
+import { pathToFileURL } from 'node:url';
+
 import { applyMigrations, openDb } from './db/index.js';
 import { buildServer } from './server.js';
 import { secretFromEnv } from './auth/jwt.js';
+import { symbolTokenFromEnv } from './auth/symbol-token.js';
 import { cleanupExpiredSessions } from './db/repos/sessions.js';
 import { pruneOldData, resolveRetentionDays } from './db/repos/retention.js';
 import { startDispatcher } from './webhooks/dispatcher.js';
@@ -15,7 +18,9 @@ export * from './ingest/ingest.js';
 export * from './ingest/fingerprint.js';
 export * from './ingest/rate-limit.js';
 
-const isMain = import.meta.url === `file://${process.argv[1] ?? ''}`;
+// pathToFileURL handles Windows argv paths (backslashes, drive letters), which
+// a naive `file://${argv[1]}` comparison never matches on win32.
+const isMain = process.argv[1] != null && import.meta.url === pathToFileURL(process.argv[1]).href;
 
 if (isMain) {
   const password = process.env['UH_OH_ADMIN_PASSWORD'];
@@ -27,6 +32,16 @@ if (isMain) {
   let secret: Uint8Array;
   try {
     secret = secretFromEnv();
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+
+  // Optional scoped symbol-upload token (CONTRACT T). Unset = feature off; set
+  // but too short = fail boot with a clear error.
+  let symbolToken: string | undefined;
+  try {
+    symbolToken = symbolTokenFromEnv();
   } catch (err) {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
@@ -51,7 +66,15 @@ if (isMain) {
     60 * 60 * 1000,
   );
 
-  const app = buildServer({ db, logger: true, secret, password, ipRatePerMinute, ipRateBurst });
+  const app = buildServer({
+    db,
+    logger: true,
+    secret,
+    password,
+    ipRatePerMinute,
+    ipRateBurst,
+    symbolToken,
+  });
   app.log.level = logLevel;
   const dispatcherHandle = startDispatcher({ db, logger: app.log, dashboardUrl });
 

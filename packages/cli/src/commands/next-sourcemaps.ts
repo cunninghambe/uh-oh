@@ -187,27 +187,45 @@ export const uploadNextSourcemaps = async (
     return 2;
   }
 
-  const releaseFor = (platform: MapPlatform): ReleaseRow | undefined =>
-    releasesResult.data.releases.find(
+  // Resolves the per-platform release row, creating it via the idempotent
+  // upsert (POST /api/projects/:id/releases → 201 created / 200 existing) when
+  // the list does not have it yet — source-map uploads normally run in the
+  // deploy pipeline BEFORE the first crash event of the release exists.
+  const resolveRelease = async (platform: MapPlatform): Promise<ReleaseRow | undefined> => {
+    const existing = releasesResult.data.releases.find(
       (r) => r.version === parsed.version && r.build === parsed.build && r.platform === platform,
     );
+    if (existing) return existing;
 
-  const webRelease = webCandidates.length > 0 ? releaseFor('web') : undefined;
-  const nodeRelease = nodeCandidates.length > 0 ? releaseFor('node') : undefined;
+    const createdResult = await apiFetch<{ release: ReleaseRow }>(
+      `${server}/api/projects/${project.id}/releases`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ version: parsed.version, build: parsed.build, platform }),
+        token,
+      },
+      deps.fetchFn,
+    );
+    if (!createdResult.ok) {
+      deps.log(
+        describeAuthError(
+          `Could not create release ${args.release} for platform ${platform}`,
+          createdResult.error,
+        ),
+      );
+      return undefined;
+    }
+    deps.log(`Created release ${args.release} for platform ${platform}`);
+    return createdResult.data.release;
+  };
+
+  const webRelease = webCandidates.length > 0 ? await resolveRelease('web') : undefined;
+  const nodeRelease = nodeCandidates.length > 0 ? await resolveRelease('node') : undefined;
 
   let failed = 0;
-  if (webCandidates.length > 0 && !webRelease) {
-    deps.log(
-      'Release not yet seen by the server for platform web — send at least one event from this release first',
-    );
-    failed += webCandidates.length;
-  }
-  if (nodeCandidates.length > 0 && !nodeRelease) {
-    deps.log(
-      'Release not yet seen by the server for platform node — send at least one event from this release first',
-    );
-    failed += nodeCandidates.length;
-  }
+  if (webCandidates.length > 0 && !webRelease) failed += webCandidates.length;
+  if (nodeCandidates.length > 0 && !nodeRelease) failed += nodeCandidates.length;
 
   const uploadable: Array<MapCandidate & { releaseId: string }> = [
     ...(webRelease ? webCandidates.map((c) => ({ ...c, releaseId: webRelease.id })) : []),

@@ -1,13 +1,23 @@
+import { lookup as dnsLookup } from 'node:dns/promises';
+
 import type { Db } from '../db/index.js';
 import { getIssue } from '../db/repos/issues.js';
 import { getEvent } from '../db/repos/events.js';
 import { getProjectById } from '../db/repos/projects.js';
 import { takeDueDispatches, markDispatchAttempt } from '../db/repos/webhook-dispatches.js';
 import { metrics } from '../metrics/registry.js';
-import { validateWebhookUrl } from './url-guard.js';
+import { isBlockedIp, isIpLiteralHost, validateWebhookUrl } from './url-guard.js';
 
 const BACKOFF_MS = [2000, 8000, 32000] as const;
 const FETCH_TIMEOUT_MS = 5000;
+const DNS_LOOKUP_TIMEOUT_MS = 2000;
+
+/** A `dns.lookup(host, { all: true })`-shaped resolver; injectable for tests. */
+export type DnsLookupAll = (
+  hostname: string,
+) => Promise<Array<{ address: string; family: number }>>;
+
+const defaultLookup: DnsLookupAll = (hostname) => dnsLookup(hostname, { all: true });
 
 export type DispatcherLogger = {
   error: (msg: string, meta?: object) => void;
@@ -20,11 +30,66 @@ export type DispatcherDeps = {
   now?: () => number;
   pollIntervalMs?: number;
   logger?: DispatcherLogger;
+  /** DNS resolver for the dispatch-time re-check; injectable for tests. */
+  lookupFn?: DnsLookupAll;
   /**
    * Base URL of the dashboard. When unset/empty, the `url` field is omitted from
    * the webhook payload (never emit a dead relative link).
    */
   dashboardUrl?: string | undefined;
+};
+
+/** Reject a promise if it does not settle within `ms`. */
+const withTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
+  new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`dns lookup timed out after ${String(ms)}ms`));
+    }, ms);
+    timer.unref?.();
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e: unknown) => {
+        clearTimeout(timer);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      },
+    );
+  });
+
+/**
+ * Dispatch-time DNS re-check for hostname targets — defends against DNS
+ * rebinding, where a hostname that passed the synchronous literal-IP guard
+ * resolves to a private/loopback/link-local/metadata address.
+ *
+ * TOCTOU caveat: DNS resolution can change between this check and the fetch
+ * (fetch resolves the name independently), so this RAISES THE BAR rather than
+ * pinning the address. Combined with `redirect: 'error'` and the synchronous
+ * literal-IP guard, it closes the common rebinding path without a custom
+ * connect/resolver hook.
+ *
+ * A transient lookup error or timeout is NOT treated as a block — we return
+ * `{ blocked: false }` and proceed to fetch (which will fail naturally and be
+ * retried) rather than permanently failing a dispatch on flaky DNS.
+ */
+const resolveHostBlocked = async (
+  hostname: string,
+  lookupFn: DnsLookupAll,
+  logger?: DispatcherLogger,
+): Promise<{ blocked: true; address: string } | { blocked: false }> => {
+  let records: Array<{ address: string; family: number }>;
+  try {
+    records = await withTimeout(lookupFn(hostname), DNS_LOOKUP_TIMEOUT_MS);
+  } catch (err) {
+    logger?.warn?.('webhook dns re-check skipped (lookup failed or timed out)', {
+      host: hostname,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return { blocked: false };
+  }
+  const bad = records.find((r) => isBlockedIp(r.address));
+  return bad ? { blocked: true, address: bad.address } : { blocked: false };
 };
 
 export type DispatcherHandle = {
@@ -82,6 +147,7 @@ const dispatchOne = async (
     type: 'issue.new' | 'issue.regressed';
   },
   fetchFn: typeof fetch,
+  lookupFn: DnsLookupAll,
   now: number,
   dashboardUrl: string | undefined,
   logger?: DispatcherLogger,
@@ -118,6 +184,30 @@ const dispatchOne = async (
         nextAttemptAt: null,
       });
       return;
+    }
+
+    // Dispatch-time DNS re-check for hostname targets. Literal-IP URLs were
+    // already fully vetted by the synchronous guard above, so only hostnames
+    // need re-resolution here. A hostname resolving to a blocked address is a
+    // permanent failure (an SSRF-rebinding target won't become safe on retry).
+    if (!isIpLiteralHost(guard.url.hostname)) {
+      const dns = await resolveHostBlocked(guard.url.hostname, lookupFn, logger);
+      if (dns.blocked) {
+        logger?.error('webhook host resolves to a blocked address (SSRF guard)', {
+          id: dispatch.id,
+          url: dispatch.url,
+          address: dns.address,
+        });
+        metrics.webhookFailures.inc();
+        markDispatchAttempt(db, dispatch.id, {
+          ok: false,
+          statusCode: null,
+          error: `blocked_dns:${dns.address}`,
+          at: now,
+          nextAttemptAt: null,
+        });
+        return;
+      }
     }
 
     const controller = new AbortController();
@@ -195,6 +285,7 @@ const dispatchOne = async (
 export const startDispatcher = (deps: DispatcherDeps): DispatcherHandle => {
   const pollIntervalMs = deps.pollIntervalMs ?? 1000;
   const fetchFn = deps.fetchFn ?? fetch;
+  const lookupFn = deps.lookupFn ?? defaultLookup;
   const nowFn = deps.now ?? (() => Date.now());
   const dashboardUrl =
     deps.dashboardUrl && deps.dashboardUrl.length > 0 ? deps.dashboardUrl : undefined;
@@ -213,7 +304,15 @@ export const startDispatcher = (deps: DispatcherDeps): DispatcherHandle => {
       const now = nowFn();
       const due = takeDueDispatches(deps.db, now, 10);
       const work = due.map((d) => {
-        const p = dispatchOne(deps.db, d, fetchFn, now, dashboardUrl, deps.logger).finally(() => {
+        const p = dispatchOne(
+          deps.db,
+          d,
+          fetchFn,
+          lookupFn,
+          now,
+          dashboardUrl,
+          deps.logger,
+        ).finally(() => {
           inFlight.delete(p);
         });
         inFlight.add(p);

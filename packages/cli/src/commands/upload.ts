@@ -84,10 +84,44 @@ export const upload = async (
   const effectivePlatform: string =
     kind === 'sourcemap' && args.platform ? args.platform : 'android';
 
-  const rel = releasesResult.data.releases.find(
+  let rel = releasesResult.data.releases.find(
     (r) =>
       r.version === parsed.version && r.build === parsed.build && r.platform === effectivePlatform,
   );
+
+  // Web/node CONTRACT flow only (`upload sourcemap --platform`): source-map
+  // uploads run in deploy pipelines BEFORE the first crash event of a release,
+  // so a missing row is normal — create it via the idempotent upsert
+  // (POST /api/projects/:id/releases → 201 created / 200 existing). The legacy
+  // android flows keep requiring a device-seen release, unchanged.
+  if (!rel && kind === 'sourcemap' && args.platform) {
+    const createdResult = await apiFetch<{ release: ReleaseRow }>(
+      `${cfg.server}/api/projects/${project.id}/releases`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          version: parsed.version,
+          build: parsed.build,
+          platform: effectivePlatform,
+        }),
+        token: cfg.token,
+      },
+      deps.fetchFn,
+    );
+    if (!createdResult.ok) {
+      deps.log(
+        describeAuthError(
+          `Could not create release ${args.release} for platform ${effectivePlatform}`,
+          createdResult.error,
+        ),
+      );
+      return 2;
+    }
+    deps.log(`Created release ${args.release} for platform ${effectivePlatform}`);
+    rel = createdResult.data.release;
+  }
+
   if (!rel) {
     deps.log(
       'Release not yet seen by the server — send at least one event from this release first',
