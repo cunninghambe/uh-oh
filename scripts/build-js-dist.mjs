@@ -1,0 +1,143 @@
+#!/usr/bin/env node
+// Builds @uh-oh/js as a self-contained, npm-installable package and
+// force-pushes it to the `js-dist` branch on origin. Consumers (Next.js apps,
+// Node services) install via `pnpm add github:cunninghambe/uh-oh#js-dist`,
+// or keep using the vendored copy produced by scripts/vendor-js-client.mjs.
+//
+// Much simpler than build-sdk-dist.mjs: the client is a single source file
+// with zero imports, so there is no workspace-dependency inlining to do.
+// The published package ships the compiled ESM output, the .d.ts, and the
+// raw TypeScript source (so consumers can also vendor straight from the
+// dist branch if they prefer).
+//
+// Run from the uh-oh repo root:
+//   node scripts/build-js-dist.mjs
+//
+// Requirements: pnpm, git, write access to origin. Cross-platform
+// (os.tmpdir() + path.join throughout, temp paths quoted for shells).
+
+/* global console, process */
+
+import { execSync } from 'node:child_process';
+import { cpSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import { dirname, join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const REPO = join(__dirname, '..');
+const STAGE = join(os.tmpdir(), 'uh-oh-js-dist-stage');
+const TMP_REPO = join(os.tmpdir(), 'uh-oh-js-dist-repo');
+const BRANCH = 'js-dist';
+
+// Exported so build-js-dist.test.mjs can unit-test the flattening rules
+// (private flag stripped, files list, exports preserved) without running
+// the publish flow.
+/**
+ * @param {Record<string, unknown>} orig - packages/js/package.json contents
+ * @returns {Record<string, unknown>}
+ */
+export function buildFlatPackageJson(orig) {
+  return {
+    name: orig.name,
+    version: orig.version,
+    description: 'Lightweight self-hosted crash reporting client for browser JS and Node.',
+    type: orig.type,
+    main: orig.main,
+    types: orig.types,
+    exports: orig.exports,
+    files: ['dist', 'src', 'README.md'],
+    repository: {
+      type: 'git',
+      url: 'https://github.com/cunninghambe/uh-oh',
+      directory: 'packages/js',
+    },
+    license: 'MIT',
+    private: false,
+  };
+}
+
+/**
+ * @param {string} cmd
+ * @param {{ cwd?: string }} [opts]
+ */
+function run(cmd, opts = {}) {
+  console.log(`\n$ ${cmd}`);
+  execSync(cmd, { stdio: 'inherit', ...opts });
+}
+
+/**
+ * @param {string} cmd
+ * @param {{ cwd?: string }} [opts]
+ * @returns {string}
+ */
+function runQuiet(cmd, opts = {}) {
+  return execSync(cmd, { encoding: 'utf8', ...opts }).trim();
+}
+
+function publish() {
+  // ── 1. Verify clean state and build ──────────────────────────────────────
+  const status = runQuiet('git status --porcelain', { cwd: REPO });
+  if (status) {
+    console.error('ERROR: working tree is dirty. Commit or stash before publishing.');
+    console.error(status);
+    process.exit(1);
+  }
+
+  run('pnpm --filter @uh-oh/js build', { cwd: REPO });
+
+  // ── 2. Stage ─────────────────────────────────────────────────────────────
+  rmSync(STAGE, { recursive: true, force: true });
+  mkdirSync(STAGE, { recursive: true });
+  cpSync(join(REPO, 'packages/js/dist'), join(STAGE, 'dist'), { recursive: true });
+  mkdirSync(join(STAGE, 'src'), { recursive: true });
+  cpSync(join(REPO, 'packages/js/src/uh-oh-client.ts'), join(STAGE, 'src', 'uh-oh-client.ts'));
+
+  // ── 3. Flattened package.json ────────────────────────────────────────────
+  /* eslint-disable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument */
+  const orig = JSON.parse(readFileSync(join(REPO, 'packages/js/package.json'), 'utf8'));
+  const flat = buildFlatPackageJson(orig);
+  /* eslint-enable @typescript-eslint/no-unsafe-assignment, @typescript-eslint/no-unsafe-argument */
+  writeFileSync(join(STAGE, 'package.json'), JSON.stringify(flat, null, 2) + '\n');
+
+  // ── 4. README pointer ────────────────────────────────────────────────────
+  const headSha = runQuiet('git rev-parse HEAD', { cwd: REPO });
+  writeFileSync(
+    join(STAGE, 'README.md'),
+    `# @uh-oh/js
+
+Auto-published from the \`main\` branch of https://github.com/cunninghambe/uh-oh via \`scripts/build-js-dist.mjs\`.
+
+**Do not edit this branch by hand.** Run the script from \`main\` and force-push.
+
+Install: \`pnpm add github:cunninghambe/uh-oh#js-dist\`
+Or vendor the single-file source: \`src/uh-oh-client.ts\`.
+
+Built from \`main@${headSha.slice(0, 7)}\`.
+`,
+  );
+
+  // ── 5. Push to js-dist orphan branch ─────────────────────────────────────
+  rmSync(TMP_REPO, { recursive: true, force: true });
+  const origin = runQuiet('git remote get-url origin', { cwd: REPO });
+  run(`git clone ${origin} "${TMP_REPO}"`);
+  run(`git -C "${TMP_REPO}" checkout --orphan ${BRANCH}`);
+  run(`git -C "${TMP_REPO}" rm -rf .`);
+  for (const name of readdirSync(STAGE)) {
+    cpSync(join(STAGE, name), join(TMP_REPO, name), { recursive: true });
+  }
+  run(`git -C "${TMP_REPO}" add -A`);
+  run(`git -C "${TMP_REPO}" commit -m "build: JS client dist from main@${headSha.slice(0, 7)}"`);
+  run(`git -C "${TMP_REPO}" push --force origin ${BRANCH}`);
+
+  console.log(
+    `\n✅ Published @uh-oh/js to ${BRANCH} branch (source commit ${headSha.slice(0, 7)})`,
+  );
+  console.log(`Consumers install via: pnpm add github:cunninghambe/uh-oh#${BRANCH}`);
+}
+
+const isEntryPoint =
+  process.argv[1] != null && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isEntryPoint) {
+  publish();
+}

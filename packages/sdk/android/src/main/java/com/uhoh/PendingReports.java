@@ -9,6 +9,7 @@ import com.facebook.react.bridge.WritableMap;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.io.DataInputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.nio.charset.StandardCharsets;
@@ -17,17 +18,20 @@ import java.util.List;
 
 /**
  * Scans <cacheDir>/uh-oh/pending/ for JSON crash reports.
- * Each file is read, parsed into a WritableMap, then DELETED.
- * Call once per app launch from UhOhNativeModule.getPendingReports().
+ * Each file is read and returned as {@code { id, payload }} WITHOUT deletion;
+ * the JS layer deletes it via {@link #ack(Context, String)} only after the
+ * report has been durably spooled or sent, so a kill mid-handoff cannot lose a
+ * report. Call once per app launch from UhOhNativeModule.getPendingReports().
  */
 public final class PendingReports {
 
     private PendingReports() {}
 
     /**
-     * Returns all pending reports as a WritableArray of WritableMaps.
-     * Deletes each file after reading. Files that fail to parse are deleted
-     * and skipped (corrupt data is not worth retrying).
+     * Returns all pending reports as a WritableArray of {@code { id, payload }}
+     * maps. Files are NOT deleted here — deletion happens later via
+     * {@link #ack(Context, String)} once JS confirms durable handoff. Files that
+     * fail to parse are deleted immediately (corrupt data is not worth retrying).
      */
     public static WritableArray collect(Context context) {
         WritableArray result = Arguments.createArray();
@@ -41,11 +45,14 @@ public final class PendingReports {
             try {
                 String json = readFile(file);
                 JSONObject obj = new JSONObject(json);
-                WritableMap map = jsonObjectToWritableMap(obj);
-                result.pushMap(map);
+                WritableMap payload = jsonObjectToWritableMap(obj);
+
+                WritableMap entry = Arguments.createMap();
+                entry.putString("id", reportId(file));
+                entry.putMap("payload", payload);
+                result.pushMap(entry);
             } catch (Exception ignored) {
-                // Corrupt or unreadable — fall through to delete.
-            } finally {
+                // Corrupt or unreadable — delete immediately (not worth retrying).
                 //noinspection ResultOfMethodCallIgnored
                 file.delete();
             }
@@ -54,11 +61,39 @@ public final class PendingReports {
         return result;
     }
 
-    private static String readFile(File file) throws Exception {
-        try (FileInputStream in = new FileInputStream(file)) {
-            byte[] bytes = new byte[(int) file.length()];
+    /**
+     * Deletes the pending report file for {@code id}. Called from JS only after
+     * the report has been durably spooled (or successfully sent), so a crash
+     * between {@link #collect(Context)} and this call cannot lose a report.
+     */
+    public static void ack(Context context, String id) {
+        if (id == null || id.isEmpty()) return;
+        // id is a report file's base name (a UUID). Strip path separators
+        // defensively so a malformed id can't escape the pending directory.
+        String safe = id.replace("/", "").replace("\\", "").replace("..", "");
+        if (safe.isEmpty()) return;
+        File file = new File(CrashWriter.getPendingDir(context), safe + ".json");
+        if (file.exists()) {
             //noinspection ResultOfMethodCallIgnored
-            in.read(bytes);
+            file.delete();
+        }
+    }
+
+    /** Derives the ack id (the base file name without the {@code .json} suffix). */
+    private static String reportId(File file) {
+        String name = file.getName();
+        if (name.endsWith(".json")) {
+            return name.substring(0, name.length() - ".json".length());
+        }
+        return name;
+    }
+
+    private static String readFile(File file) throws Exception {
+        try (DataInputStream in = new DataInputStream(new FileInputStream(file))) {
+            byte[] bytes = new byte[(int) file.length()];
+            // readFully loops until the buffer is filled — a single read() is
+            // not guaranteed to return all bytes and can short-read.
+            in.readFully(bytes);
             return new String(bytes, StandardCharsets.UTF_8);
         }
     }

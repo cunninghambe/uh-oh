@@ -161,4 +161,17 @@ describe('getOrLoadCachedConsumer LRU cache', () => {
     expect(second).not.toBe(first);
     invalidateCachedConsumer('lru-test-5');
   });
+
+  it('defers destroy — a consumer stays usable right after invalidation (M1b)', async () => {
+    const raw = buildSourceMap([
+      { genLine: 1, genCol: 0, source: 'g.ts', origLine: 7, origCol: 0, name: 'g' },
+    ]);
+    const consumer = await getOrLoadCachedConsumer('lru-test-6', raw);
+    // An in-flight request already holds `consumer`. Invalidation must not
+    // destroy it synchronously, or resolving would throw on destroyed WASM.
+    invalidateCachedConsumer('lru-test-6');
+    const pos = resolveJsFrame(consumer, { line: 1, column: 0 });
+    expect(pos.source).toBe('g.ts');
+    expect(pos.line).toBe(7);
+  });
 });

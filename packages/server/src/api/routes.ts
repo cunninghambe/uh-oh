@@ -14,6 +14,7 @@ import {
 import type { Db } from '../db/index.js';
 import { buildAuthMiddleware } from '../auth/middleware.js';
 import { symbolicateEvent } from '../symbolication/symbolicate.js';
+import { validateWebhookUrl } from '../webhooks/url-guard.js';
 
 type IssueStatusInput = 'open' | 'resolved' | 'ignored';
 const isStatus = (s: unknown): s is IssueStatusInput =>
@@ -62,10 +63,17 @@ export const registerApiRoutes = (app: FastifyInstance, db: Db, secret: Uint8Arr
       };
       const patch: { webhookUrl?: string | null; alertDedupeMinutes?: number; name?: string } = {};
       if (webhookUrl !== undefined) {
-        if (webhookUrl !== null && (typeof webhookUrl !== 'string' || webhookUrl.length > 1024)) {
+        if (webhookUrl === null) {
+          patch.webhookUrl = null;
+        } else if (typeof webhookUrl !== 'string' || webhookUrl.length > 1024) {
           return reply.code(400).send({ error: 'invalid_webhookUrl' });
+        } else if (!validateWebhookUrl(webhookUrl).ok) {
+          // Reject SSRF-prone targets (loopback/private/link-local/metadata IPs,
+          // non-http(s) schemes) before they are ever stored or dispatched.
+          return reply.code(400).send({ error: 'invalid_webhookUrl' });
+        } else {
+          patch.webhookUrl = webhookUrl;
         }
-        patch.webhookUrl = webhookUrl;
       }
       if (alertDedupeMinutes !== undefined) {
         if (
@@ -150,12 +158,19 @@ export const registerApiRoutes = (app: FastifyInstance, db: Db, secret: Uint8Arr
 
   app.get<{
     Params: { id: string };
-    Querystring: { limit?: string; offset?: string };
+    Querystring: { limit?: string; offset?: string; page?: string };
   }>('/api/issues/:id/events', { preHandler }, (req, reply) => {
     const issue = getIssue(db, req.params.id);
     if (!issue) return reply.code(404).send({ error: 'not_found' });
     const limit = req.query.limit ? Math.max(1, Math.min(200, Number(req.query.limit))) : 50;
-    const offset = req.query.offset ? Math.max(0, Number(req.query.offset)) : 0;
+    // SPEC §9 documents page= (1-indexed); offset= kept for back-compat.
+    const page = req.query.page ? Math.max(1, Number(req.query.page)) : undefined;
+    const offset =
+      page !== undefined
+        ? (page - 1) * limit
+        : req.query.offset
+          ? Math.max(0, Number(req.query.offset))
+          : 0;
     const { rows, total } = listEventsForIssue(db, issue.id, { limit, offset });
     return { events: rows, total };
   });

@@ -43,14 +43,15 @@ const baseRelease = { id: 'rel-1', version: '1.0.0', build: '1', platform: 'andr
 const makeDeps = (
   cfg: Config | null,
   fetchResponses: Array<{ status: number; body: unknown }>,
-  fileContent?: Buffer,
+  opts?: { fileContent?: Buffer; statSize?: number },
 ): UploadDeps & { logs: string[] } => {
   const logs: string[] = [];
   return {
     config: { read: () => Promise.resolve(cfg) },
     fetchFn: makeStubFetch(fetchResponses),
     log: (line) => logs.push(line),
-    readFile: () => Promise.resolve(fileContent ?? Buffer.from('fake content')),
+    readFile: () => Promise.resolve(opts?.fileContent ?? Buffer.from('fake content')),
+    statFile: () => Promise.resolve({ size: opts?.statSize ?? 1024 }),
     logs,
   };
 };
@@ -126,6 +127,59 @@ describe('upload command', () => {
     expect(deps.logs[0]).toMatch(/not yet seen by the server/i);
   });
 
+  it('file too large returns 1 without reading the file into memory', async () => {
+    const logs: string[] = [];
+    let readFileCalled = false;
+    const deps: UploadDeps & { logs: string[] } = {
+      config: { read: () => Promise.resolve({ server: 'http://localhost:3300', token: 'tok' }) },
+      fetchFn: makeStubFetch([
+        { status: 200, body: { projects: [baseProject] } },
+        { status: 200, body: { releases: [baseRelease] } },
+      ]),
+      log: (line) => logs.push(line),
+      readFile: () => {
+        readFileCalled = true;
+        return Promise.resolve(Buffer.from('x'));
+      },
+      statFile: () => Promise.resolve({ size: 51 * 1024 * 1024 }),
+      logs,
+    };
+
+    const code = await upload(deps, 'mapping', {
+      project: 'my-app',
+      release: '1.0.0+1',
+      file: 'mapping.txt',
+    });
+
+    expect(code).toBe(1);
+    expect(logs[0]).toMatch(/too large/i);
+    expect(readFileCalled).toBe(false);
+  });
+
+  it('stat failure (e.g. file does not exist) returns 1', async () => {
+    const logs: string[] = [];
+    const deps: UploadDeps & { logs: string[] } = {
+      config: { read: () => Promise.resolve({ server: 'http://localhost:3300', token: 'tok' }) },
+      fetchFn: makeStubFetch([
+        { status: 200, body: { projects: [baseProject] } },
+        { status: 200, body: { releases: [baseRelease] } },
+      ]),
+      log: (line) => logs.push(line),
+      readFile: () => Promise.resolve(Buffer.from('x')),
+      statFile: () => Promise.reject(new Error('ENOENT')),
+      logs,
+    };
+
+    const code = await upload(deps, 'mapping', {
+      project: 'my-app',
+      release: '1.0.0+1',
+      file: 'does-not-exist.txt',
+    });
+
+    expect(code).toBe(1);
+    expect(logs[0]).toMatch(/cannot read file/i);
+  });
+
   it('happy path mapping: POSTs multipart and returns 0', async () => {
     const calls: FetchCall[] = [];
     const logs: string[] = [];
@@ -142,6 +196,7 @@ describe('upload command', () => {
       ),
       log: (line) => logs.push(line),
       readFile: () => Promise.resolve(Buffer.from('R0 com.example -> a')),
+      statFile: () => Promise.resolve({ size: 1024 }),
       logs,
     };
 
@@ -155,6 +210,38 @@ describe('upload command', () => {
     expect(logs[0]).toBe('Uploaded mapping for 1.0.0+1');
     expect(calls[2]?.url).toBe('http://localhost:3300/api/releases/rel-1/symbols');
     expect(calls[2]?.init.method).toBe('POST');
+  });
+
+  it('uses path.basename for the upload filename (Windows-style path)', async () => {
+    const calls: FetchCall[] = [];
+    const logs: string[] = [];
+    const cfg: Config = { server: 'http://localhost:3300', token: 'tok' };
+    const deps: UploadDeps & { logs: string[] } = {
+      config: { read: () => Promise.resolve(cfg) },
+      fetchFn: makeCapturingFetch(
+        [
+          { status: 200, body: { projects: [baseProject] } },
+          { status: 200, body: { releases: [baseRelease] } },
+          { status: 200, body: { release: baseRelease } },
+        ],
+        calls,
+      ),
+      log: (line) => logs.push(line),
+      readFile: () => Promise.resolve(Buffer.from('R0 com.example -> a')),
+      statFile: () => Promise.resolve({ size: 1024 }),
+      logs,
+    };
+
+    const code = await upload(deps, 'mapping', {
+      project: 'my-app',
+      release: '1.0.0+1',
+      file: 'C:\\Users\\dev\\build\\mapping.txt',
+    });
+
+    expect(code).toBe(0);
+    const form = calls[2]?.init.body as FormData;
+    const uploaded = form.get('file') as File;
+    expect(uploaded.name).toBe('mapping.txt');
   });
 
   it('happy path sourcemap: includes sourcemap=true in form', async () => {
@@ -173,6 +260,7 @@ describe('upload command', () => {
       ),
       log: (line) => logs.push(line),
       readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
+      statFile: () => Promise.resolve({ size: 1024 }),
       logs,
     };
 
@@ -199,5 +287,34 @@ describe('upload command', () => {
     });
     expect(code).toBe(2);
     expect(deps.logs[0]).toMatch(/upload failed/i);
+  });
+
+  it('401 on the projects call appends a login-refresh hint', async () => {
+    const deps = makeDeps({ server: 'http://localhost:3300', token: 'expired' }, [
+      { status: 401, body: { error: 'invalid_or_expired_token' } },
+    ]);
+    const code = await upload(deps, 'mapping', {
+      project: 'my-app',
+      release: '1.0.0+1',
+      file: 'mapping.txt',
+    });
+    expect(code).toBe(2);
+    expect(deps.logs[0]).toMatch(/uh-oh login/);
+  });
+
+  it('401 on the final upload call appends a login-refresh hint', async () => {
+    const deps = makeDeps({ server: 'http://localhost:3300', token: 'expired' }, [
+      { status: 200, body: { projects: [baseProject] } },
+      { status: 200, body: { releases: [baseRelease] } },
+      { status: 401, body: { error: 'invalid_or_expired_token' } },
+    ]);
+    const code = await upload(deps, 'mapping', {
+      project: 'my-app',
+      release: '1.0.0+1',
+      file: 'mapping.txt',
+    });
+    expect(code).toBe(2);
+    expect(deps.logs[0]).toMatch(/upload failed/i);
+    expect(deps.logs[0]).toMatch(/uh-oh login/);
   });
 });

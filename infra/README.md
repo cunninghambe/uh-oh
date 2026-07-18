@@ -9,9 +9,10 @@ nginx + TLS is covered by subtask 15b.
 
 - Ubuntu/Debian-based host (tested on Ubuntu 22.04+)
 - Node 22+ installed (e.g. via [nvm](https://github.com/nvm-sh/nvm) or NodeSource)
-- `sqlite3` CLI installed: `apt-get install -y sqlite3`
 - `ufw` installed: `apt-get install -y ufw`
 - Repo cloned/deployed to `/opt/uh-oh`
+
+`sqlite3` is installed automatically by `setup-server.sh` if missing (it's required by `backup.sh`) — no manual step needed.
 
 ---
 
@@ -41,11 +42,12 @@ chmod 600 /etc/uh-oh/server.env
 
 ### Optional environment variables
 
-| Variable                | Default | Description                                                         |
-| ----------------------- | ------- | ------------------------------------------------------------------- |
-| `UH_OH_LOG_LEVEL`       | `info`  | Pino log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal`. |
-| `UH_OH_IP_RATE_PER_MIN` | `120`   | Per-IP global rate limit — requests allowed per minute window.      |
-| `UH_OH_IP_RATE_BURST`   | `20`    | Per-IP burst allowance on top of the per-minute rate.               |
+| Variable                | Default | Description                                                                                                |
+| ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------- |
+| `UH_OH_LOG_LEVEL`       | `info`  | Pino log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal`.                                        |
+| `UH_OH_IP_RATE_PER_MIN` | `120`   | Per-IP global rate limit — requests allowed per minute window.                                             |
+| `UH_OH_IP_RATE_BURST`   | `20`    | Per-IP burst allowance on top of the per-minute rate.                                                      |
+| `UH_OH_RETENTION_DAYS`  | `90`    | How long event/issue data is retained before pruning. See the commented example in `uh-oh-server.service`. |
 
 Static env vars set directly in `uh-oh-server.service` (not in `server.env`):
 
@@ -66,10 +68,10 @@ This script is idempotent — safe to re-run on updates. It:
 
 1. Creates the `uh-oh` system user if not present.
 2. Creates `/var/lib/uh-oh/`, `/var/backups/uh-oh/`, `/etc/uh-oh/`.
-3. Verifies Node 22+ is available.
-4. Installs pnpm dependencies and builds the server + web packages.
+3. Verifies Node 22+ is available, and installs `sqlite3` if missing.
+4. Installs pnpm dependencies and builds the server + web packages (as root — see comment in the script; `uh-oh` has no writable home directory and isn't given write access to `/opt/uh-oh`).
 5. Verifies `/etc/uh-oh/server.env` exists (exits with instructions if missing).
-6. Installs and enables `uh-oh-server.service` and `uh-oh-backup.timer`.
+6. Installs `uh-oh-server.service`, `uh-oh-backup.service`, `uh-oh-backup.timer`, and `uh-oh-alert.service`; enables and (re)starts the server unconditionally, so re-running this script after a code update actually serves the new build.
 7. Applies UFW firewall rules.
 
 ---
@@ -109,6 +111,23 @@ Logs are structured JSON (pino). Pipe through `jq` for readability:
 journalctl -u uh-oh-server -f | jq .
 ```
 
+### Bounding journald disk usage
+
+By default journald's disk usage is capped as a fraction of the filesystem it lives on, which on a small VPS can still be large enough to matter, especially if request logging is verbose (`UH_OH_LOG_LEVEL=debug`) or the box is under sustained crash-storm traffic. Set an explicit cap in `/etc/systemd/journald.conf`:
+
+```ini
+[Journal]
+SystemMaxUse=1G
+```
+
+Then apply it:
+
+```bash
+systemctl restart systemd-journald
+```
+
+This is a one-time manual step (not automated by `setup-server.sh`) — journald is a system-wide service shared by every unit on the box, not something specific to uh-oh, so it's out of scope for a per-app setup script to reconfigure unilaterally.
+
 ### Health check
 
 ```bash
@@ -126,7 +145,20 @@ From outside the box, port 3300 must be unreachable (UFW blocks it). Use the ngi
 
 `uh-oh-backup.timer` fires daily and runs `uh-oh-backup.service`, which calls `infra/backup.sh`.
 
-`backup.sh` uses `sqlite3 .backup` (SQLite's online backup API — safe while the server is running) to write `/var/backups/uh-oh/uh-oh-YYYYMMDD.db`. Files older than 30 days are deleted automatically.
+`backup.sh` uses `sqlite3 .backup` (SQLite's online backup API — safe while the server is running) to write `/var/backups/uh-oh/uh-oh-YYYYMMDD.db`, then runs `PRAGMA integrity_check` against that copy and fails the unit (triggering the alert below) if it doesn't come back `ok` — a bad backup fails loudly instead of sitting unnoticed until the day you actually need it.
+
+The `symbols/` directory (ProGuard mappings, Hermes source maps) is archived alongside the DB into `/var/backups/uh-oh/uh-oh-symbols-YYYYMMDD.tar.gz`. Restoring the DB without also restoring this archive leaves `releases.mapping_uploaded_at` / `sourcemap_uploaded_at` pointing at symbol files that no longer exist — symbolication breaks with no hint in the UI.
+
+Both the `.db` and `.tar.gz` files older than 30 days are deleted automatically.
+
+### Backup failure alerts
+
+If `backup.sh` exits non-zero (missing `sqlite3`, failed integrity check, etc.), `uh-oh-backup.service`'s `OnFailure=` fires `uh-oh-alert.service`, which logs an `err`-level line to the journal (tag `uh-oh-alert`) and `wall`s all logged-in terminals. The same alert unit is wired to `uh-oh-server.service`. Check recent failures with:
+
+```bash
+journalctl -t uh-oh-alert -n 20
+systemctl --failed
+```
 
 ### Check backup status
 
@@ -153,13 +185,18 @@ systemctl start uh-oh-backup.service
 # 1. Stop the server
 systemctl stop uh-oh-server
 
-# 2. Restore using sqlite3 .restore (replace YYYYMMDD with the target date)
+# 2. Restore the DB using sqlite3 .restore (replace YYYYMMDD with the target date)
 sqlite3 /var/lib/uh-oh/uh-oh.db ".restore '/var/backups/uh-oh/uh-oh-YYYYMMDD.db'"
 
-# 3. Verify the restored DB is readable
+# 3. Restore the symbols directory (mapping.txt / sourcemap.map files)
+rm -rf /var/lib/uh-oh/symbols
+tar -xzf "/var/backups/uh-oh/uh-oh-symbols-YYYYMMDD.tar.gz" -C /var/lib/uh-oh
+chown -R uh-oh:uh-oh /var/lib/uh-oh/symbols
+
+# 4. Verify the restored DB is readable
 sqlite3 /var/lib/uh-oh/uh-oh.db "SELECT count(*) FROM projects;"
 
-# 4. Restart the server
+# 5. Restart the server
 systemctl start uh-oh-server
 ```
 
@@ -186,7 +223,7 @@ systemctl restart uh-oh-server
 
 `ufw.sh` configures UFW with:
 
-- Port 22/tcp open (SSH)
+- Port 22/tcp rate-limited (SSH) — UFW blocks an IP that makes 6+ connection attempts within 30 seconds, throttling brute-force login attempts
 - Port 80/tcp open (HTTP — used by certbot for TLS certificate issuance)
 - Port 443/tcp open (HTTPS)
 - Port 3300 NOT exposed — nginx proxies to 127.0.0.1:3300
@@ -207,6 +244,8 @@ bash /opt/uh-oh/infra/ufw.sh
 bash /opt/uh-oh/infra/setup-server.sh
 ```
 
+`setup-server.sh` always runs `systemctl enable uh-oh-server.service` followed by `systemctl restart uh-oh-server.service` (not `enable --now`), so the freshly built `dist/` is actually picked up on every re-run — `enable --now` alone is a no-op on a unit that's already running and would silently leave the old code serving traffic.
+
 ---
 
 ## systemd-analyze verify
@@ -217,6 +256,7 @@ To verify the unit files are syntactically correct on a box with systemd-analyze
 systemd-analyze verify /opt/uh-oh/infra/uh-oh-server.service
 systemd-analyze verify /opt/uh-oh/infra/uh-oh-backup.service
 systemd-analyze verify /opt/uh-oh/infra/uh-oh-backup.timer
+systemd-analyze verify /opt/uh-oh/infra/uh-oh-alert.service
 ```
 
 On systems where `systemd-analyze verify` is unavailable (e.g. older distros), review the unit files manually and compare against the templates in this directory.
@@ -278,7 +318,17 @@ systemctl list-timers | grep certbot
 certbot renew --dry-run
 ```
 
-Nginx reloads automatically on renewal via the certbot systemd hook installed by `python3-certbot-nginx`.
+Nginx reloads automatically on renewal via a deploy hook, **not** because of the `python3-certbot-nginx` package — that package's automatic nginx integration only applies to the `--nginx` authenticator, and `setup-tls.sh` uses `certbot certonly --webroot` instead. `setup-tls.sh` installs the reload behavior itself, in two redundant places:
+
+- `--deploy-hook 'systemctl reload nginx'` passed to the initial `certbot certonly` call, which certbot persists into `/etc/letsencrypt/renewal/<domain>.conf`.
+- A copy of the same hook at `/etc/letsencrypt/renewal-hooks/deploy/uh-oh-reload-nginx.sh`, which certbot always runs on every renewal for every cert regardless of renewal conf — this is the one that protects you if the cert is ever manually re-issued in a way that doesn't carry the `--deploy-hook` flag forward.
+
+Verify either hook is in place after running `setup-tls.sh`:
+
+```bash
+cat /etc/letsencrypt/renewal/<domain>.conf | grep -A1 deploy_hook
+ls /etc/letsencrypt/renewal-hooks/deploy/
+```
 
 ### vhost details
 
@@ -288,9 +338,13 @@ Nginx reloads automatically on renewal via the certbot systemd hook installed by
 - TLS 1.3 + 1.2 only (`ssl_protocols TLSv1.3 TLSv1.2`).
 - Security headers: HSTS (2 years), X-Frame-Options DENY, X-Content-Type-Options nosniff, Referrer-Policy strict-origin-when-cross-origin, Content-Security-Policy.
 - Dashboard SPA served from `/opt/uh-oh/packages/web/dist/` with SPA fallback (`try_files $uri $uri/ /index.html`).
+- `index.html` explicitly `Cache-Control: no-cache` so a deploy never strands a stale shell pointing at deleted, content-hashed asset files.
 - `/assets/` long-cache (1 year, `Cache-Control: public, immutable`).
-- `/api/` and `/ingest/` reverse-proxied to `127.0.0.1:3300`.
+- `X-Forwarded-For` is set to `$remote_addr` (overwrite, not append) on every proxied location. The server only trusts loopback proxies for this header — nginx is that trusted proxy, and it must send its own view of the client IP rather than forwarding along whatever a client claims.
+- `/api/auth/login` rate-limited to 10 req/min per IP (burst 5) — a tight backstop on top of the server's own login rate limiting, since this is the highest-value brute-force target.
+- `/ingest/` rate-limited to 50 req/sec per IP (burst 100, `nodelay`) — deliberately generous; a crash storm (many devices hitting the same bug at once) is legitimate traffic, this is just a ceiling.
+- `/ingest/` body cap `client_max_body_size 1m` (crash envelopes are small JSON, not file uploads); `/api/` keeps the server-wide `client_max_body_size 50m` for symbol uploads.
+- `/api/` and `/ingest/` (and `/api/auth/login`) reverse-proxied to `127.0.0.1:3300`.
 - `/healthz` proxied, access log suppressed.
-- `/metrics` restricted to `127.0.0.1` (deny all external access).
-- `client_max_body_size 50m` for symbol file uploads.
+- `/metrics` restricted to `127.0.0.1` (deny all external access) — scrape it locally on the box, or via an SSH tunnel (`ssh -L 9090:127.0.0.1:443 <host>` then hit `https://127.0.0.1:9090/metrics` with the `Host` header set, or simpler: `ssh <host> curl -s https://127.0.0.1/metrics -k -H 'Host: <domain>'`).
 - gzip for `text/plain`, `text/css`, `text/javascript`, `application/javascript`, `application/json`, `image/svg+xml`.

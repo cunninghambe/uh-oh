@@ -47,6 +47,28 @@ nginx -t
 systemctl reload nginx
 
 # ---------------------------------------------------------------------------
+# 3b. Deploy hook: reload nginx after every renewal.
+#     `certonly --webroot` has no built-in nginx integration (that's only
+#     wired up by the `--nginx` authenticator, which we don't use here), so
+#     without this, cert renewal succeeds silently but nginx keeps serving
+#     the expiring cert until something else reloads it — a guaranteed
+#     outage around day 90. Belt and braces:
+#       (a) --deploy-hook below writes the hook path into this cert's
+#           renewal conf (/etc/letsencrypt/renewal/<domain>.conf), so it
+#           persists across `certbot renew`.
+#       (b) a copy is also dropped into renewal-hooks/deploy/, which
+#           certbot always runs for every cert regardless of renewal conf —
+#           this survives a manual `certbot certonly` re-issuance that
+#           might not carry the --deploy-hook flag forward.
+# ---------------------------------------------------------------------------
+mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+cat > /etc/letsencrypt/renewal-hooks/deploy/uh-oh-reload-nginx.sh <<'HOOK_EOF'
+#!/bin/sh
+systemctl reload nginx
+HOOK_EOF
+chmod +x /etc/letsencrypt/renewal-hooks/deploy/uh-oh-reload-nginx.sh
+
+# ---------------------------------------------------------------------------
 # 4. Issue the certificate via webroot challenge
 # ---------------------------------------------------------------------------
 certbot certonly \
@@ -55,7 +77,8 @@ certbot certonly \
   -d "$DOMAIN" \
   --email "$EMAIL" \
   --agree-tos \
-  --non-interactive
+  --non-interactive \
+  --deploy-hook 'systemctl reload nginx'
 
 # ---------------------------------------------------------------------------
 # 5. Install the real vhost (with TLS) and reload nginx

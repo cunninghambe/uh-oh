@@ -44,7 +44,9 @@ public final class CrashWriter {
         try {
             JSONObject report = buildJavaReport(thread, throwable);
             return writeReport(context, report);
-        } catch (Exception ignored) {
+        } catch (Throwable ignored) {
+            // Catch Throwable, not Exception: OOM/StackOverflow can be raised
+            // while building the report on the crash path and must not escape.
             return null;
         }
     }
@@ -86,7 +88,8 @@ public final class CrashWriter {
             report.put("device", buildDeviceInfo());
 
             return writeReport(context, report);
-        } catch (Exception ignored) {
+        } catch (Throwable ignored) {
+            // Crash-path report building: never let OOM/StackOverflow escape.
             return null;
         }
     }
@@ -170,12 +173,25 @@ public final class CrashWriter {
         if (!dir.exists() && !dir.mkdirs()) {
             throw new IOException("Cannot create pending dir: " + dir);
         }
-        File file = new File(dir, UUID.randomUUID().toString() + ".json");
+        String base = UUID.randomUUID().toString();
+        File tmp = new File(dir, base + ".tmp");
+        File dest = new File(dir, base + ".json");
         byte[] bytes = report.toString().getBytes(StandardCharsets.UTF_8);
-        try (FileOutputStream out = new FileOutputStream(file)) {
+
+        // Write to a temp file and fsync before renaming into place. The process
+        // typically dies immediately after this returns on the crash path, so a
+        // non-atomic write could leave a torn report. PendingReports' ".json"
+        // filter naturally skips leftover ".tmp" partials.
+        try (FileOutputStream out = new FileOutputStream(tmp)) {
             out.write(bytes);
             out.flush();
+            out.getFD().sync();
         }
-        return file;
+        if (!tmp.renameTo(dest)) {
+            //noinspection ResultOfMethodCallIgnored
+            tmp.delete();
+            throw new IOException("Cannot publish crash report: " + dest);
+        }
+        return dest;
     }
 }

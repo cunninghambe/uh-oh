@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # pnpm must be set up before actions/setup-node when using its
+      # built-in pnpm store cache (cache: 'pnpm' below) — setup-node needs
+      # `pnpm` on PATH to resolve the cache config.
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          # Root package.json intentionally has no "packageManager" field
+          # (out of infra's lane to add), so pin the version here instead.
+          # Matches the pnpm actually used on the dev machine (11.x).
+          version: 11
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'pnpm'
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Lint
+        run: pnpm lint
+
+      - name: Format check
+        run: pnpm format:check
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build web (verifies production build succeeds)
+        run: pnpm --filter @uh-oh/web build
+
+      - name: Unit test scripts/ (node:test — no vitest dep at the repo root)
+        run: node --test scripts/build-sdk-dist.test.mjs scripts/vendor-js-client.test.mjs scripts/build-js-dist.test.mjs
+
+      # shellcheck ships preinstalled on the ubuntu-latest runner image, but
+      # install explicitly anyway so this step doesn't silently start
+      # skipping real checks if a future runner image drops it.
+      - name: shellcheck infra/*.sh
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+          bash infra/test.sh

@@ -4,6 +4,9 @@ Description=Run uh-oh backup daily
 [Timer]
 OnCalendar=daily
 Persistent=true
+# Spread the actual run over a 5-minute window so backup doesn't compete
+# with other daily cron/systemd-timer jobs all firing at exactly midnight.
+RandomizedDelaySec=300
 
 [Install]
 WantedBy=timers.target

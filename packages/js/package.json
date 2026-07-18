@@ -1,0 +1,23 @@
+{
+  "name": "@uh-oh/js",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/uh-oh-client.js",
+  "types": "./dist/uh-oh-client.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/uh-oh-client.d.ts",
+      "import": "./dist/uh-oh-client.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@uh-oh/types": "workspace:*",
+    "vitest": "4.1.6"
+  }
+}

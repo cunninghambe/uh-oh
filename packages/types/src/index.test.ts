@@ -4,6 +4,7 @@ import {
   DeviceInfoSchema,
   EventEnvelopeSchema,
   JsonValueSchema,
+  PlatformSchema,
   StackFrameSchema,
   UserSchema,
 } from './index.js';
@@ -67,6 +68,18 @@ describe('StackFrameSchema', () => {
   it('rejects negative lineno (boundary)', () => {
     const r = StackFrameSchema.safeParse({ ...validFrame, lineno: -1 });
     expect(r.success).toBe(false);
+  });
+});
+
+describe('PlatformSchema', () => {
+  it('accepts all four v0.2 runtimes', () => {
+    for (const p of ['ios', 'android', 'web', 'node'] as const) {
+      expect(PlatformSchema.parse(p)).toBe(p);
+    }
+  });
+
+  it('rejects an unknown platform', () => {
+    expect(PlatformSchema.safeParse('windows').success).toBe(false);
   });
 });
 
@@ -179,6 +192,18 @@ describe('EventEnvelopeSchema', () => {
   it('rejects invalid platform', () => {
     const r = EventEnvelopeSchema.safeParse({ ...validEnvelope, platform: 'windows' });
     expect(r.success).toBe(false);
+  });
+
+  it('accepts platform web (v0.2 browser runtime)', () => {
+    const r = EventEnvelopeSchema.safeParse({ ...validEnvelope, platform: 'web' });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.platform).toBe('web');
+  });
+
+  it('accepts platform node (v0.2 Node runtime)', () => {
+    const r = EventEnvelopeSchema.safeParse({ ...validEnvelope, platform: 'node' });
+    expect(r.success).toBe(true);
+    if (r.success) expect(r.data.platform).toBe('node');
   });
 
   it('rejects invalid mechanism', () => {

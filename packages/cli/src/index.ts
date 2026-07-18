@@ -37,6 +37,7 @@ uploadCmd
       {
         config: { read: readConfig },
         readFile: (p) => fs.readFile(p),
+        statFile: (p) => fs.stat(p),
         log: (line) => process.stdout.write(line + '\n'),
       },
       'mapping',
@@ -56,6 +57,7 @@ uploadCmd
       {
         config: { read: readConfig },
         readFile: (p) => fs.readFile(p),
+        statFile: (p) => fs.stat(p),
         log: (line) => process.stdout.write(line + '\n'),
       },
       'sourcemap',

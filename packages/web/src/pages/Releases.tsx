@@ -3,12 +3,15 @@ import { Link, useParams } from '@tanstack/react-router';
 import { useRef, useState } from 'react';
 
 import { ApiError, type Release, api } from '../api.js';
+import { oversizeError } from './Releases.utils.js';
 
 type UploadState = 'idle' | 'uploading' | 'done' | 'error';
 
 type RowUploadStatus = {
   mapping: UploadState;
   sourcemap: UploadState;
+  mappingProgress: number;
+  sourcemapProgress: number;
   mappingError: string | null;
   sourcemapError: string | null;
 };
@@ -18,41 +21,78 @@ const formatTs = (ms: number | null): string => (ms === null ? '—' : new Date(
 const UploadCell = ({
   label,
   state,
+  progress,
   errorMsg,
   inputRef,
   onChange,
 }: {
   label: string;
   state: UploadState;
+  progress: number;
   errorMsg: string | null;
   inputRef: React.RefObject<HTMLInputElement | null>;
   onChange: (file: File) => void;
-}) => (
-  <div className="space-y-1">
-    <label className="block text-xs text-zinc-500">{label}</label>
-    <input
-      ref={inputRef}
-      type="file"
-      accept={label === 'Mapping' ? '.txt,text/plain' : '.map,application/json'}
-      onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
-        const file = e.target.files?.[0];
+}) => {
+  const [isDragOver, setIsDragOver] = useState(false);
+  const busy = state === 'uploading';
+
+  return (
+    <div
+      className={`space-y-1 rounded border border-dashed px-2 py-1.5 transition-colors ${
+        isDragOver ? 'border-amber-500 bg-amber-950/20' : 'border-zinc-700'
+      }`}
+      onDragOver={(e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        if (!busy) setIsDragOver(true);
+      }}
+      onDragLeave={() => {
+        setIsDragOver(false);
+      }}
+      onDrop={(e: React.DragEvent<HTMLDivElement>) => {
+        e.preventDefault();
+        setIsDragOver(false);
+        if (busy) return;
+        const file = e.dataTransfer.files[0];
         if (file) onChange(file);
       }}
-      disabled={state === 'uploading'}
-      className="block text-xs text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-xs file:text-zinc-200 hover:file:bg-zinc-600 disabled:opacity-50"
-    />
-    {state === 'uploading' && <span className="text-xs text-zinc-500">Uploading…</span>}
-    {state === 'done' && <span className="text-xs text-emerald-400">Uploaded</span>}
-    {state === 'error' && (
-      <span className="text-xs text-red-400">{errorMsg ?? 'Upload failed'}</span>
-    )}
-  </div>
-);
+    >
+      <label className="block text-xs text-zinc-500">{label} — drag & drop or choose file</label>
+      <input
+        ref={inputRef}
+        type="file"
+        accept={label === 'Mapping' ? '.txt,text/plain' : '.map,application/json'}
+        onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+          const file = e.target.files?.[0];
+          if (file) onChange(file);
+        }}
+        disabled={busy}
+        className="block text-xs text-zinc-400 file:mr-2 file:rounded file:border-0 file:bg-zinc-700 file:px-2 file:py-1 file:text-xs file:text-zinc-200 hover:file:bg-zinc-600 disabled:opacity-50"
+      />
+      {busy && (
+        <div className="space-y-1">
+          <div className="h-1.5 w-full overflow-hidden rounded bg-zinc-800">
+            <div
+              className="h-full bg-amber-500 transition-all"
+              style={{ width: `${String(progress)}%` }}
+            />
+          </div>
+          <span className="text-xs text-zinc-500">Uploading… {progress}%</span>
+        </div>
+      )}
+      {state === 'done' && <span className="text-xs text-emerald-400">Uploaded</span>}
+      {state === 'error' && (
+        <span className="text-xs text-red-400">{errorMsg ?? 'Upload failed'}</span>
+      )}
+    </div>
+  );
+};
 
 const ReleaseRow = ({ release, onUploadDone }: { release: Release; onUploadDone: () => void }) => {
   const [status, setStatus] = useState<RowUploadStatus>({
     mapping: 'idle',
     sourcemap: 'idle',
+    mappingProgress: 0,
+    sourcemapProgress: 0,
     mappingError: null,
     sourcemapError: null,
   });
@@ -62,11 +102,25 @@ const ReleaseRow = ({ release, onUploadDone }: { release: Release; onUploadDone:
   const upload = (file: File, isSourcemap: boolean): void => {
     const key = isSourcemap ? 'sourcemap' : 'mapping';
     const errKey = isSourcemap ? 'sourcemapError' : 'mappingError';
-    setStatus((s) => ({ ...s, [key]: 'uploading', [errKey]: null }));
+    const progressKey = isSourcemap ? 'sourcemapProgress' : 'mappingProgress';
+
+    // Client-side size pre-check against the server's cap — fail fast, no network call.
+    const sizeError = oversizeError(file.size);
+    if (sizeError) {
+      setStatus((s) => ({ ...s, [key]: 'error', [errKey]: sizeError }));
+      return;
+    }
+
+    setStatus((s) => ({ ...s, [key]: 'uploading', [errKey]: null, [progressKey]: 0 }));
     api
-      .uploadSymbols(release.id, file, { sourcemap: isSourcemap })
+      .uploadSymbols(release.id, file, {
+        sourcemap: isSourcemap,
+        onProgress: (percent) => {
+          setStatus((s) => ({ ...s, [progressKey]: percent }));
+        },
+      })
       .then(() => {
-        setStatus((s) => ({ ...s, [key]: 'done' }));
+        setStatus((s) => ({ ...s, [key]: 'done', [progressKey]: 100 }));
         onUploadDone();
       })
       .catch((err: unknown) => {
@@ -87,6 +141,7 @@ const ReleaseRow = ({ release, onUploadDone }: { release: Release; onUploadDone:
         <UploadCell
           label="Mapping"
           state={status.mapping}
+          progress={status.mappingProgress}
           errorMsg={status.mappingError}
           inputRef={mappingRef}
           onChange={(file) => {
@@ -98,6 +153,7 @@ const ReleaseRow = ({ release, onUploadDone }: { release: Release; onUploadDone:
         <UploadCell
           label="Source map"
           state={status.sourcemap}
+          progress={status.sourcemapProgress}
           errorMsg={status.sourcemapError}
           inputRef={sourcemapRef}
           onChange={(file) => {

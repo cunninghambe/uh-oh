@@ -1,5 +1,7 @@
+import path from 'node:path';
 import type { readConfig } from '../config.js';
 import { apiFetch } from '../client.js';
+import type { ApiError } from '../client.js';
 
 type UploadKind = 'mapping' | 'sourcemap';
 
@@ -8,16 +10,27 @@ export type UploadDeps = {
   fetchFn?: typeof fetch;
   log: (line: string) => void;
   readFile: (path: string) => Promise<Buffer>;
+  statFile: (path: string) => Promise<{ size: number }>;
 };
 
 type ProjectRow = { id: string; slug: string };
 type ReleaseRow = { id: string; version: string; build: string; platform: string };
+
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB — server accepts multipart; see report re: streaming.
 
 const parseRelease = (release: string): { version: string; build: string } | null => {
   const plus = release.lastIndexOf('+');
   if (plus <= 0 || plus === release.length - 1) return null;
   return { version: release.slice(0, plus), build: release.slice(plus + 1) };
 };
+
+// A 401/403 on any command almost always means the stored token expired or
+// was revoked (logout, JWT secret rotation) — point the user at the fix
+// instead of just surfacing the raw server error.
+const describeError = (prefix: string, error: ApiError): string =>
+  error.kind === 'auth'
+    ? `${prefix}: ${error.message} — run \`uh-oh login\` to refresh your token`
+    : `${prefix}: ${error.message}`;
 
 export const upload = async (
   deps: UploadDeps,
@@ -43,7 +56,7 @@ export const upload = async (
   );
 
   if (!projectsResult.ok) {
-    deps.log(`Error fetching projects: ${projectsResult.error.message}`);
+    deps.log(describeError('Error fetching projects', projectsResult.error));
     return 2;
   }
 
@@ -60,7 +73,7 @@ export const upload = async (
   );
 
   if (!releasesResult.ok) {
-    deps.log(`Error fetching releases: ${releasesResult.error.message}`);
+    deps.log(describeError('Error fetching releases', releasesResult.error));
     return 2;
   }
 
@@ -74,6 +87,23 @@ export const upload = async (
     return 1;
   }
 
+  let stat: { size: number };
+  try {
+    stat = await deps.statFile(args.file);
+  } catch {
+    deps.log(`Cannot read file: ${args.file}`);
+    return 1;
+  }
+  if (stat.size > MAX_UPLOAD_BYTES) {
+    const mb = (stat.size / (1024 * 1024)).toFixed(1);
+    deps.log(`File too large: ${args.file} is ${mb} MB — max is 50 MB`);
+    return 1;
+  }
+
+  // Whole-file read (not streamed) is fine for v0.1: ProGuard mapping files
+  // and Hermes source maps are well under the 50 MB cap checked above, and
+  // the server accepts multipart, not a streaming upload protocol — a
+  // streaming FormData body would be overkill for this size range.
   let fileBuffer: Buffer;
   try {
     fileBuffer = await deps.readFile(args.file);
@@ -83,7 +113,10 @@ export const upload = async (
   }
 
   const form = new FormData();
-  form.append('file', new Blob([fileBuffer]), args.file.split('/').pop() ?? 'file');
+  // path.basename, not split('/').pop(): the latter passes a Windows path
+  // like "C:\Users\dev\mapping.txt" through unmangled since it has no "/",
+  // so the server would receive the whole path as the filename.
+  form.append('file', new Blob([fileBuffer]), path.basename(args.file) || 'file');
   form.append('platform', 'android');
   if (kind === 'sourcemap') {
     form.append('sourcemap', 'true');
@@ -96,7 +129,7 @@ export const upload = async (
   );
 
   if (!uploadResult.ok) {
-    deps.log(`Upload failed: ${uploadResult.error.message}`);
+    deps.log(describeError('Upload failed', uploadResult.error));
     return 2;
   }
 

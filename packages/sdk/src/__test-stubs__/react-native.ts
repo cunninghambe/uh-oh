@@ -20,11 +20,13 @@ export const ErrorUtils = {
 
 export const Platform = {
   OS: 'android' as 'android' | 'ios',
+  Version: 34 as string | number,
 };
 
 type UhOhNativeStub = {
   install: (config: { debug: boolean }) => Promise<boolean>;
   getPendingReports: () => Promise<unknown[]>;
+  ackReport?: (id: string) => Promise<void>;
 };
 
 const uhOhNativeStub: UhOhNativeStub = {

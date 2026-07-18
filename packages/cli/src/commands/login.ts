@@ -46,10 +46,14 @@ export const makePrompt = (q: string, opts?: { hidden?: boolean }): Promise<stri
   });
 
 export const login = async (deps: LoginDeps, args: { server: string }): Promise<number> => {
+  // Strip trailing slash(es) so a server URL of "https://x.example.com/"
+  // doesn't get persisted and later concatenated into
+  // "https://x.example.com//api/projects" by every other command.
+  const server = args.server.replace(/\/+$/, '');
   const password = await deps.prompt('Password: ', { hidden: true });
 
   const result = await apiFetch<{ token: string }>(
-    `${args.server}/api/auth/login`,
+    `${server}/api/auth/login`,
     {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -67,7 +71,7 @@ export const login = async (deps: LoginDeps, args: { server: string }): Promise<
     return 2;
   }
 
-  await deps.config.write({ server: args.server, token: result.data.token });
-  deps.log(`Logged in to ${args.server}`);
+  await deps.config.write({ server, token: result.data.token });
+  deps.log(`Logged in to ${server}`);
   return 0;
 };

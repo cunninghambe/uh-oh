@@ -41,7 +41,7 @@ export const ingest = (
   const fingerprint = computeFingerprint(envelope);
   const title = computeTitle(envelope);
 
-  return deps.db.transaction((tx): IngestResult => {
+  const result = deps.db.transaction((tx): IngestResult => {
     const { issue, isNew } = upsertIssue(tx, {
       projectId: project.id,
       fingerprint,
@@ -49,9 +49,11 @@ export const ingest = (
       ts: now,
     });
 
+    // Token consumption stays inside the tx and before the insert on purpose:
+    // a rolled-back insert must NOT refund the attacker's bucket (rate limiting
+    // is about attempts, not successful persists).
     const allowed = deps.rateLimiter.consume(`${project.publicKey}::${fingerprint}`, now);
     if (!allowed) {
-      metrics.eventsIngested.inc({ outcome: 'rate-limited' });
       return { kind: 'rate-limited', issueId: issue.id, isNewIssue: isNew };
     }
 
@@ -100,11 +102,19 @@ export const ingest = (
       }
     }
 
-    metrics.eventsIngested.inc({ outcome: 'stored' });
-    if (isNew) metrics.issuesNew.inc();
-
     return { kind: 'stored', eventId: event.id, issueId: issue.id, isNewIssue: isNew };
   });
+
+  // Increment metrics only after the transaction commits — a rollback (or a
+  // throw from the tx body) must not leave counters reflecting unpersisted work.
+  if (result.kind === 'rate-limited') {
+    metrics.eventsIngested.inc({ outcome: 'rate-limited' });
+  } else if (result.kind === 'stored') {
+    metrics.eventsIngested.inc({ outcome: 'stored' });
+    if (result.isNewIssue) metrics.issuesNew.inc();
+  }
+
+  return result;
 };
 
 export type IngestEntry = (publicKey: string, envelope: EventEnvelope) => IngestResult;

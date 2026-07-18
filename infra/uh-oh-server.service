@@ -2,6 +2,7 @@
 Description=uh-oh crash reporting server
 After=network-online.target
 Wants=network-online.target
+OnFailure=uh-oh-alert.service
 
 [Service]
 Type=simple
@@ -12,6 +13,11 @@ Environment=UH_OH_DB=/var/lib/uh-oh/uh-oh.db
 Environment=UH_OH_SYMBOLS_DIR=/var/lib/uh-oh/symbols
 Environment=UH_OH_PORT=3300
 Environment=UH_OH_HOST=127.0.0.1
+# Optional: how many days of event/issue data to retain before pruning.
+# Defaults to 90 if unset. Uncomment to override, or set it in
+# /etc/uh-oh/server.env instead — either works, this is just here for
+# discoverability.
+#Environment=UH_OH_RETENTION_DAYS=90
 EnvironmentFile=/etc/uh-oh/server.env
 ExecStart=/usr/bin/node /opt/uh-oh/packages/server/dist/index.js
 Restart=on-failure
@@ -29,6 +35,12 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 LockPersonality=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+SystemCallFilter=@system-service
+RestrictNamespaces=yes
+ProtectClock=yes
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target

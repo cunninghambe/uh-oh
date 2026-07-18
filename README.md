@@ -1,18 +1,19 @@
 # uh-oh
 
-**Lightweight self-hosted crash reporting for React Native — Android only in v0.1.**
+**Lightweight self-hosted crash reporting for React Native Android, browser JS, and Node.**
 
-A single Node process + SQLite + a small React dashboard. Designed for anyone who wants to self-host their React Native crash data on a small VPS instead of using a hosted service. **Android-only in v0.1** — iOS is reserved in the wire format but no iOS code ships yet.
+A single Node process + SQLite + a small React dashboard. Designed for anyone who wants to self-host their crash data on a small VPS instead of using a hosted service. RN support is **Android-only** — iOS is reserved in the wire format but no iOS code ships yet. Browser + Node support landed in v0.2 via `@uh-oh/js` (see `SPEC.md` §16).
 
 ## What it does
 
 - Captures JS exceptions and unhandled promise rejections via a React Native SDK
 - Captures Java uncaught exceptions, native NDK signals, and ANRs via an Android bridge (xCrash + UEH)
+- Captures browser (`window` error/unhandledrejection) and Node (`uncaughtException`/`unhandledRejection`) errors via `@uh-oh/js` — a single dependency-free vendorable client (`node scripts/vendor-js-client.mjs --out <path>`)
 - Groups events into issues by fingerprint
-- Symbolicates Hermes JS and Android ProGuard stacks server-side, on demand
+- Symbolicates Hermes JS and Android ProGuard stacks server-side, on demand (web/node frames render raw for now)
 - Single-user JWT-gated dashboard with project + issue + release + symbol-upload UIs
 - Fires a generic outbound webhook per project on new issues (wire it to Slack, Discord, email, whatever)
-- AsyncStorage-backed event spool on the SDK side — events survive offline-at-crash-time and crash-before-network
+- AsyncStorage-backed event spool on the RN SDK side — events survive offline-at-crash-time and crash-before-network
 
 ## What it does NOT do (intentionally)
 
@@ -49,13 +50,13 @@ SQLite at /var/lib/uh-oh/uh-oh.db (WAL mode, nightly backup)
 
 This is a pnpm workspace. Each package is independently testable.
 
-| Package | What it is |
-|---|---|
-| `@uh-oh/types` | Zod schemas + inferred TS types for the wire format. Imported by both server and SDK. |
-| `@uh-oh/server` | Fastify + SQLite + Drizzle. Ingest, API, workers. |
-| `@uh-oh/web` | Vite + React 19 + TanStack Router/Query + Tailwind v4 dashboard. |
-| `@uh-oh/react-native` | The SDK. JS core + Android native module. |
-| `@uh-oh/cli` | TS CLI for uploading ProGuard mappings + Hermes source maps. |
+| Package               | What it is                                                                            |
+| --------------------- | ------------------------------------------------------------------------------------- |
+| `@uh-oh/types`        | Zod schemas + inferred TS types for the wire format. Imported by both server and SDK. |
+| `@uh-oh/server`       | Fastify + SQLite + Drizzle. Ingest, API, workers.                                     |
+| `@uh-oh/web`          | Vite + React 19 + TanStack Router/Query + Tailwind v4 dashboard.                      |
+| `@uh-oh/react-native` | The SDK. JS core + Android native module.                                             |
+| `@uh-oh/cli`          | TS CLI for uploading ProGuard mappings + Hermes source maps.                          |
 
 ## Spec
 
@@ -76,9 +77,9 @@ Then in your app:
 import { init, captureException } from '@uh-oh/react-native';
 
 init({
-  dsn: process.env.EXPO_PUBLIC_UH_OH_DSN!,  // http://<publicKey>@<host>[:port]
+  dsn: process.env.EXPO_PUBLIC_UH_OH_DSN!, // http://<publicKey>@<host>[:port]
   release: '1.0.0+1',
-  beforeSend: (event) => event,             // your scrubbing goes here
+  beforeSend: (event) => event, // your scrubbing goes here
 });
 ```
 

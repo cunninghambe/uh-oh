@@ -1,7 +1,21 @@
 [Unit]
 Description=Daily uh-oh SQLite backup
+OnFailure=uh-oh-alert.service
 
 [Service]
 Type=oneshot
 User=uh-oh
+Group=uh-oh
 ExecStart=/opt/uh-oh/infra/backup.sh
+
+# hardening — mirrors uh-oh-server.service's approach; only the two dirs
+# backup.sh actually touches are writable. /var/lib/uh-oh must stay in
+# ReadWritePaths (not read-only) because sqlite3 opens the source DB
+# read-write by default even for `.backup`, and may need to create/touch
+# its WAL/SHM sidecar files — ProtectSystem=strict remounts everything else
+# read-only regardless of the uh-oh:uh-oh file ownership underneath.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/uh-oh /var/backups/uh-oh
+ProtectHome=true

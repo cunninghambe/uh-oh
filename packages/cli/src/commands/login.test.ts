@@ -63,6 +63,14 @@ describe('login command', () => {
     expect(deps.config.stored).toBeNull();
   });
 
+  it('strips trailing slashes from --server before persisting and logging', async () => {
+    const deps = makeLoginDeps(200, { token: 'tok_abc' });
+    const code = await login(deps, { server: 'http://localhost:3300///' });
+    expect(code).toBe(0);
+    expect(deps.config.stored).toEqual({ server: 'http://localhost:3300', token: 'tok_abc' });
+    expect(deps.logs[0]).toBe('Logged in to http://localhost:3300');
+  });
+
   it('network failure returns 2', async () => {
     const logs: string[] = [];
     const config = makeConfig();

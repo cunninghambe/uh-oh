@@ -8,7 +8,7 @@ export type ReleaseInsert = {
   projectId: string;
   version: string;
   build: string;
-  platform: 'ios' | 'android';
+  platform: 'ios' | 'android' | 'web' | 'node';
 };
 
 export const upsertRelease = (db: DbOrTx, input: ReleaseInsert): ReleaseRow => {

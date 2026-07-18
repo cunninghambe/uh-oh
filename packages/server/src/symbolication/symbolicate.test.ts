@@ -3,6 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs/promises';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { SourceMapGenerator } from 'source-map';
+import { eq } from 'drizzle-orm';
 
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
@@ -332,5 +333,126 @@ com.example.MainActivity -> a.b:
     invalidateSymbolications(db, release.id);
     const countAfter = db.select().from(symbolications).all().length;
     expect(countAfter).toBe(0);
+  });
+});
+
+describe('symbolicateEvent — corrupt symbols (M6)', () => {
+  it('marks JS frames corrupt_sourcemap when the sourcemap is unparseable', async () => {
+    const project = createProject(db, { name: 'CorruptSM' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const dir = path.join(tmpDir, release.id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'sourcemap.map'), 'not valid json {{{');
+    markSourcemapUploaded(db, release.id, Date.now());
+
+    const event = seedEventForRelease(db, release.id, [
+      { filename: 'index.android.bundle', lineno: 1, colno: 0, inApp: true },
+    ]);
+    const frames = await symbolicateEvent(db, event.id);
+    // Must NOT be 'ok' — a corrupt sourcemap previously passed frames through as ok.
+    expect(frames[0]?.status).toBe('corrupt_sourcemap');
+  });
+
+  it('marks Android frames corrupt_mapping when a non-empty mapping yields no classes', async () => {
+    const project = createProject(db, { name: 'CorruptMap' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const dir = path.join(tmpDir, release.id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(
+      path.join(dir, 'mapping.txt'),
+      'garbage line without an arrow\nmore junk here\n',
+    );
+    markMappingUploaded(db, release.id, Date.now());
+
+    const event = seedEventForRelease(db, release.id, [
+      { module: 'a.b', function: 'c', inApp: true },
+    ]);
+    const frames = await symbolicateEvent(db, event.id);
+    expect(frames[0]?.status).toBe('corrupt_mapping');
+  });
+});
+
+describe('invalidateSymbolications — scale (M2)', () => {
+  it('clears symbolications for a release with more than 1000 events', () => {
+    const project = createProject(db, { name: 'ScaleApp' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const { issue } = upsertIssue(db, {
+      projectId: project.id,
+      fingerprint: 'fp-scale',
+      title: 't',
+      ts: Date.now(),
+    });
+    const N = 1200; // exceeds SQLite's IN(...) bound-variable friendliness
+    for (let i = 0; i < N; i++) {
+      const ev = insertEvent(db, {
+        projectId: project.id,
+        issueId: issue.id,
+        releaseId: release.id,
+        fingerprint: 'fp-scale',
+        level: 'error',
+        platform: 'android',
+        payload: '{}',
+        receivedAt: Date.now(),
+        deviceInfo: '{}',
+        userInfo: null,
+      });
+      db.insert(symbolications)
+        .values({ eventId: ev.id, frameIdx: 0, resolved: JSON.stringify({ status: 'ok' }) })
+        .run();
+    }
+    expect(db.select().from(symbolications).all()).toHaveLength(N);
+
+    // Single-statement subquery delete — must not throw on "too many SQL variables".
+    invalidateSymbolications(db, release.id);
+    expect(db.select().from(symbolications).all()).toHaveLength(0);
+  });
+});
+
+describe('symbolicateEvent — cache race (M1a)', () => {
+  it('does not persist frames when a symbol upload lands mid-symbolication', async () => {
+    const project = createProject(db, { name: 'RaceApp' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const dir = path.join(tmpDir, release.id);
+    await fs.mkdir(dir, { recursive: true });
+    await fs.writeFile(path.join(dir, 'mapping.txt'), MAPPING_TXT);
+    markMappingUploaded(db, release.id, 1000);
+
+    const event = seedEventForRelease(db, release.id, [
+      { module: 'a.b', function: 'c', inApp: true },
+    ]);
+
+    // Start symbolication: it snapshots mappingUploadedAt=1000, then awaits the
+    // file read (yielding control back to us).
+    const p = symbolicateEvent(db, event.id);
+    // A concurrent upload bumps the timestamp before frames are persisted.
+    markMappingUploaded(db, release.id, 2000);
+    const frames = await p;
+
+    // Frames are still resolved from the mapping we read...
+    expect(frames[0]?.status).toBe('ok');
+    // ...but nothing is cached, since the mapping changed under us.
+    expect(
+      db.select().from(symbolications).where(eq(symbolications.eventId, event.id)).all(),
+    ).toHaveLength(0);
   });
 });

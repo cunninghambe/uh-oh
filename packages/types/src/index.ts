@@ -19,7 +19,7 @@ export const JsonValueSchema: z.ZodType<JsonValue> = z.lazy(() =>
   ]),
 );
 
-export const PlatformSchema = z.enum(['ios', 'android']);
+export const PlatformSchema = z.enum(['ios', 'android', 'web', 'node']);
 export type Platform = z.infer<typeof PlatformSchema>;
 
 export const LevelSchema = z.enum(['fatal', 'error', 'warning', 'info']);

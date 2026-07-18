@@ -67,9 +67,10 @@ public final class UhOhNativeModule extends ReactContextBaseJavaModule {
 
     /**
      * Collect all pending crash reports from the cache directory.
-     * Each file is read, returned as a map, and then deleted.
+     * Each file is read and returned as a {@code { id, payload }} map WITHOUT
+     * being deleted; JS deletes it via {@link #ackReport} after durable handoff.
      *
-     * @param promise resolved with a WritableArray of report maps
+     * @param promise resolved with a WritableArray of {@code { id, payload }} maps
      */
     @ReactMethod
     public void getPendingReports(Promise promise) {
@@ -79,6 +80,25 @@ public final class UhOhNativeModule extends ReactContextBaseJavaModule {
             promise.resolve(reports);
         } catch (Exception e) {
             promise.reject("READ_FAILED", e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Delete a pending crash report file, called from JS only after the report
+     * has been durably spooled (or successfully sent). This is the second half
+     * of the crash-safe handoff started by {@link #getPendingReports}.
+     *
+     * @param id      the report id returned by getPendingReports
+     * @param promise resolved once the file has been deleted
+     */
+    @ReactMethod
+    public void ackReport(String id, Promise promise) {
+        try {
+            Context appContext = getReactApplicationContext().getApplicationContext();
+            PendingReports.ack(appContext, id);
+            promise.resolve(null);
+        } catch (Exception e) {
+            promise.reject("ACK_FAILED", e.getMessage(), e);
         }
     }
 

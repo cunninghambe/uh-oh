@@ -1,14 +1,20 @@
 import { NativeModules, Platform } from 'react-native';
 import type { EventEnvelope } from '@uh-oh/types';
 
+/** A pending native crash report plus the id used to ack (delete) it. */
+export type PendingReport = { id: string; payload: Partial<EventEnvelope> };
+
 export type NativeBridge = {
   install(config: { debug: boolean }): Promise<boolean>;
-  getPendingReports(): Promise<Partial<EventEnvelope>[]>;
+  getPendingReports(): Promise<PendingReport[]>;
+  /** Deletes the on-disk report file once JS has durably taken ownership. */
+  ackReport(id: string): Promise<void>;
 };
 
 type UhOhNativeModule = {
   install(config: { debug: boolean }): Promise<boolean>;
   getPendingReports(): Promise<unknown[]>;
+  ackReport?(id: string): Promise<void>;
 };
 
 /**
@@ -28,10 +34,28 @@ export function nativeBridge(): NativeBridge | null {
     install: (config) => mod.install(config),
     getPendingReports: async () => {
       const raw = await mod.getPendingReports();
-      // Each element is a partial EventEnvelope written by CrashWriter.
-      // We trust the shape coming from our own native code; unknown fields
-      // are stripped when buildEnvelopeFromPartial constructs the full envelope.
-      return raw as Partial<EventEnvelope>[];
+      // New native shape: each element is { id, payload }. We do NOT delete
+      // files here — the JS layer acks each report only after it is durably
+      // spooled, so a kill mid-handoff can't lose a report (M1).
+      return raw.map((item): PendingReport => {
+        if (item !== null && typeof item === 'object' && 'payload' in item) {
+          const it = item as { id?: unknown; payload?: unknown };
+          return {
+            id: typeof it.id === 'string' ? it.id : '',
+            payload: (it.payload ?? {}) as Partial<EventEnvelope>,
+          };
+        }
+        // Backward-compat: an older native module returned bare partial
+        // envelopes with no id (and deleted files itself). Treat the whole
+        // item as the payload; without an id there is nothing to ack.
+        return { id: '', payload: item as Partial<EventEnvelope> };
+      });
+    },
+    ackReport: async (id: string) => {
+      if (!id) return;
+      if (typeof mod.ackReport === 'function') {
+        await mod.ackReport(id);
+      }
     },
   };
 }

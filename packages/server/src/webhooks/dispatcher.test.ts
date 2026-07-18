@@ -173,15 +173,15 @@ describe('startDispatcher', () => {
     expect(due).toHaveLength(0);
   });
 
-  it('honors 5s timeout via AbortController', async () => {
+  it('passes an AbortSignal to fetch (for the 5s timeout)', async () => {
     enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);
 
     let capturedSignal: AbortSignal | undefined;
+    // Resolve immediately after capturing the signal — a never-resolving mock
+    // would now hang stop(), which drains in-flight dispatches (M4).
     const fetchFn = vi.fn().mockImplementation((_url: string, opts: { signal?: AbortSignal }) => {
       capturedSignal = opts.signal;
-      return new Promise<Response>(() => {
-        // never resolves
-      });
+      return Promise.resolve({ ok: true, status: 200 });
     });
 
     const handle = startDispatcher({
@@ -194,10 +194,7 @@ describe('startDispatcher', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 50));
     await handle.stop();
 
-    expect(capturedSignal).toBeDefined();
-    // After 5s timeout the signal would be aborted — we can't easily wait 5s in tests,
-    // but we verify the signal is passed through
-    expect(capturedSignal?.aborted === false || capturedSignal?.aborted === true).toBe(true);
+    expect(capturedSignal).toBeInstanceOf(AbortSignal);
   });
 
   it('stop() resolves promptly and stops the loop', async () => {
@@ -217,5 +214,150 @@ describe('startDispatcher', () => {
     expect(elapsed).toBeLessThan(200);
     // No fetches since no pending rows
     expect(fetchFn).not.toHaveBeenCalled();
+  });
+});
+
+// Wrap a Db so the first `.select()` call throws once, then behaves normally.
+// Functions are bound to the real target to avoid breaking private-field access.
+const throwOnceOnSelect = (realDb: Db): Db => {
+  let armed = true;
+  return new Proxy(realDb, {
+    get(target, prop, receiver): unknown {
+      if (prop === 'select' && armed) {
+        armed = false;
+        return () => {
+          throw new Error('transient SQLITE error');
+        };
+      }
+      const value: unknown = Reflect.get(target, prop, receiver);
+      if (typeof value === 'function') {
+        return (value as (...args: unknown[]) => unknown).bind(target);
+      }
+      return value;
+    },
+  });
+};
+
+describe('startDispatcher — resilience (H1)', () => {
+  it('survives a thrown repo error, logs it, and keeps polling', async () => {
+    enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);
+    const logger = { error: vi.fn(), warn: vi.fn() };
+    const fetchFn = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+
+    const handle = startDispatcher({
+      db: throwOnceOnSelect(db),
+      fetchFn,
+      now: () => NOW,
+      pollIntervalMs: 10,
+      logger,
+      dashboardUrl: 'https://dash.example',
+    });
+
+    // First poll's takeDueDispatches throws → logged. A later poll succeeds.
+    await new Promise<void>((resolve) => setTimeout(resolve, 100));
+    await handle.stop();
+
+    expect(logger.error).toHaveBeenCalled();
+    expect(fetchFn).toHaveBeenCalled();
+    // The dispatch eventually succeeded (no pending rows remain).
+    expect(takeDueDispatches(db, NOW + 999999, 10)).toHaveLength(0);
+  });
+});
+
+describe('startDispatcher — payload (L2, L5)', () => {
+  const captureFetch = () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchFn = vi.fn().mockImplementation((_url: string, opts: { body: string }) => {
+      bodies.push(JSON.parse(opts.body) as Record<string, unknown>);
+      return Promise.resolve({ ok: true, status: 200 });
+    });
+    return { fetchFn, bodies };
+  };
+
+  it('includes dispatchId and a url built from dashboardUrl', async () => {
+    const row = enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);
+    const { fetchFn, bodies } = captureFetch();
+    const handle = startDispatcher({
+      db,
+      fetchFn,
+      now: () => NOW,
+      pollIntervalMs: 10,
+      dashboardUrl: 'https://dash.example',
+    });
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    await handle.stop();
+
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]?.['dispatchId']).toBe(row.id);
+    expect(bodies[0]?.['url']).toBe(`https://dash.example/issues/${issueId}`);
+  });
+
+  it('omits url and warns once when dashboardUrl is unset', async () => {
+    enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);
+    const { fetchFn, bodies } = captureFetch();
+    const logger = { error: vi.fn(), warn: vi.fn() };
+    const handle = startDispatcher({ db, fetchFn, now: () => NOW, pollIntervalMs: 10, logger });
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    await handle.stop();
+
+    expect(logger.warn).toHaveBeenCalledTimes(1);
+    expect(bodies[0]).not.toHaveProperty('url');
+    expect(bodies[0]?.['dispatchId']).toBeDefined();
+  });
+});
+
+describe('startDispatcher — SSRF guard at dispatch time (H3)', () => {
+  it('marks a dispatch to a blocked IP as failed without fetching', async () => {
+    enqueueDispatch(db, { issueId, eventId, url: 'http://169.254.169.254/hook' }, NOW);
+    const fetchFn = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const logger = { error: vi.fn(), warn: vi.fn() };
+
+    const handle = startDispatcher({ db, fetchFn, now: () => NOW, pollIntervalMs: 10, logger });
+    await new Promise<void>((resolve) => setTimeout(resolve, 60));
+    await handle.stop();
+
+    expect(fetchFn).not.toHaveBeenCalled();
+    // Permanently failed → no pending rows.
+    expect(takeDueDispatches(db, NOW + 999999, 10)).toHaveLength(0);
+    expect(logger.error).toHaveBeenCalled();
+  });
+});
+
+describe('startDispatcher — graceful drain (M4)', () => {
+  it('stop() awaits an in-flight dispatch before resolving', async () => {
+    enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);
+
+    let releaseFetch: (() => void) | undefined;
+    const fetchFn = vi.fn().mockImplementation(
+      () =>
+        new Promise<{ ok: boolean; status: number }>((resolve) => {
+          releaseFetch = () => {
+            resolve({ ok: true, status: 200 });
+          };
+        }),
+    );
+
+    const handle = startDispatcher({ db, fetchFn, now: () => NOW, pollIntervalMs: 10 });
+
+    // Wait until the fetch is in flight.
+    for (let i = 0; i < 50 && fetchFn.mock.calls.length === 0; i++) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+    expect(fetchFn).toHaveBeenCalledOnce();
+
+    let stopResolved = false;
+    const stopP = handle.stop().then(() => {
+      stopResolved = true;
+    });
+
+    // stop() must not resolve while the dispatch is still running.
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+    expect(stopResolved).toBe(false);
+
+    releaseFetch?.();
+    await stopP;
+    expect(stopResolved).toBe(true);
+    // The drained dispatch was marked succeeded.
+    expect(takeDueDispatches(db, NOW + 999999, 10)).toHaveLength(0);
   });
 });

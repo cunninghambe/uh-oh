@@ -36,7 +36,8 @@ afterEach(async () => {
   await fs.rm(tmpDir, { recursive: true, force: true });
 });
 
-const buildTestServer = (testDb: Db) => buildServer({ db: testDb, secret: TEST_SECRET });
+const buildTestServer = (testDb: Db) =>
+  buildServer({ db: testDb, secret: TEST_SECRET, password: 'test-password' });
 const authHeader = () => ({ authorization: `Bearer ${token}` });
 
 const makeMultipartBody = (
@@ -149,6 +150,33 @@ describe('POST /api/releases/:id/symbols', () => {
     const filePath = path.join(tmpDir, release.id, 'mapping.txt');
     const content = await fs.readFile(filePath, 'utf8');
     expect(content).toContain('com.example.Foo');
+  });
+
+  it('returns 413 (not 500) when the upload exceeds the size limit', async () => {
+    const project = createProject(db, { name: 'App' });
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '1.0.0',
+      build: '1',
+      platform: 'android',
+    });
+    const app = buildServer({
+      db,
+      secret: TEST_SECRET,
+      password: 'test-password',
+      maxSymbolBytes: 1024,
+    });
+    const body = makeMultipartBody('mapping.txt', 'x'.repeat(5000), { platform: 'android' });
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/releases/${release.id}/symbols`,
+      payload: body,
+      headers: {
+        'content-type': 'multipart/form-data; boundary=----TestBoundary1234',
+        ...authHeader(),
+      },
+    });
+    expect(res.statusCode).toBe(413);
   });
 
   it('upload invalidates existing symbolication cache', async () => {

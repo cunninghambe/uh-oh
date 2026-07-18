@@ -39,14 +39,3 @@ export const createIpRateLimiter = (opts: { perMinute: number; burst: number }):
 
   return { consume, cleanup };
 };
-
-export const extractIp = (
-  xForwardedFor: string | string[] | undefined,
-  fallback: string,
-): string => {
-  if (!xForwardedFor) return fallback;
-  const raw = Array.isArray(xForwardedFor) ? xForwardedFor[0] : xForwardedFor;
-  if (!raw) return fallback;
-  const first = raw.split(',')[0];
-  return first ? first.trim() : fallback;
-};

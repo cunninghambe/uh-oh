@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { createIpRateLimiter, extractIp } from './ip-rate-limit.js';
+import { createIpRateLimiter } from './ip-rate-limit.js';
 
 describe('createIpRateLimiter', () => {
   describe('consume — token bucket math', () => {
@@ -93,27 +93,5 @@ describe('createIpRateLimiter', () => {
       // Bucket removed — starts fresh
       expect(limiter.consume('1.2.3.4', 11_000)).toBe(true);
     });
-  });
-});
-
-describe('extractIp', () => {
-  it('returns fallback when header is undefined', () => {
-    expect(extractIp(undefined, '1.2.3.4')).toBe('1.2.3.4');
-  });
-
-  it('returns first value of X-Forwarded-For string', () => {
-    expect(extractIp('10.0.0.1, 10.0.0.2', '0.0.0.0')).toBe('10.0.0.1');
-  });
-
-  it('trims whitespace from first value', () => {
-    expect(extractIp('  192.168.1.1 , 10.0.0.1', '0.0.0.0')).toBe('192.168.1.1');
-  });
-
-  it('handles array header (multi-value)', () => {
-    expect(extractIp(['172.16.0.5, 10.0.0.1'], '0.0.0.0')).toBe('172.16.0.5');
-  });
-
-  it('falls back when first segment is empty string', () => {
-    expect(extractIp('', '9.9.9.9')).toBe('9.9.9.9');
   });
 });

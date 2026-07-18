@@ -10,38 +10,36 @@ export const upsertIssue = (
   db: DbOrTx,
   input: { projectId: string; fingerprint: string; title: string; ts: number },
 ): { issue: IssueRow; isNew: boolean } => {
-  const existing = db
-    .select()
-    .from(issues)
-    .where(and(eq(issues.projectId, input.projectId), eq(issues.fingerprint, input.fingerprint)))
-    .get();
-
-  if (existing) {
-    db.update(issues)
-      .set({
+  // Atomic upsert: a single INSERT ... ON CONFLICT DO UPDATE avoids the
+  // SELECT-then-write race where two concurrent events could both insert.
+  // On conflict we bump lastSeen + eventCount but preserve title, status,
+  // firstSeen and lastAlertedAt (a resolved issue receiving a new event stays
+  // resolved — matching the prior behavior).
+  const issue = db
+    .insert(issues)
+    .values({
+      id: newId(),
+      projectId: input.projectId,
+      fingerprint: input.fingerprint,
+      title: input.title,
+      firstSeen: input.ts,
+      lastSeen: input.ts,
+      eventCount: 1,
+      status: 'open',
+      lastAlertedAt: null,
+    })
+    .onConflictDoUpdate({
+      target: [issues.projectId, issues.fingerprint],
+      set: {
         lastSeen: input.ts,
         eventCount: sql`${issues.eventCount} + 1`,
-      })
-      .where(eq(issues.id, existing.id))
-      .run();
-    const refreshed = db.select().from(issues).where(eq(issues.id, existing.id)).get();
-    if (!refreshed) throw new Error('issue disappeared after update');
-    return { issue: refreshed, isNew: false };
-  }
+      },
+    })
+    .returning()
+    .get();
 
-  const row: IssueRow = {
-    id: newId(),
-    projectId: input.projectId,
-    fingerprint: input.fingerprint,
-    title: input.title,
-    firstSeen: input.ts,
-    lastSeen: input.ts,
-    eventCount: 1,
-    status: 'open',
-    lastAlertedAt: null,
-  };
-  db.insert(issues).values(row).run();
-  return { issue: row, isNew: true };
+  // A freshly inserted issue has eventCount 1; a conflict update makes it >= 2.
+  return { issue, isNew: issue.eventCount === 1 };
 };
 
 export type IssueSort = 'lastSeen' | 'eventCount' | 'firstSeen';
