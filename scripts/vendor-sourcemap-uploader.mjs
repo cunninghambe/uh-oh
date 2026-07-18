@@ -183,9 +183,12 @@ async function upsertRelease(serverBase, token, projectId, version, build, platf
 async function uploadOne(serverBase, token, releaseId, item) {
   const form = new FormData();
   const buf = readFileSync(item.absPath);
-  form.append('file', new Blob([buf]), basename(item.absPath));
+  // Fields BEFORE the file part: the server only sees multipart fields that
+  // arrive ahead of the file in the stream, so a large map appended first
+  // starves platform/bundlePath and gets a 400.
   form.append('platform', item.platform);
   form.append('bundlePath', item.bundlePath);
+  form.append('file', new Blob([buf]), basename(item.absPath));
   const headers = {};
   headers[TOKEN_HEADER] = token;
   const res = await fetch(serverBase + '/api/releases/' + releaseId + '/symbols', {

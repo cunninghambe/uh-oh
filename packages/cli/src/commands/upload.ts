@@ -160,7 +160,8 @@ export const upload = async (
   // reduces to its filename even when the CLI runs on POSIX (plain
   // path.basename on Linux passes the whole string through, and
   // split('/').pop() has the same failure).
-  form.append('file', new Blob([fileBuffer]), path.win32.basename(args.file) || 'file');
+  // Fields BEFORE the file part: the server only sees fields that arrive
+  // ahead of the file in the multipart stream (large files otherwise 400).
   form.append('platform', effectivePlatform);
   if (kind === 'sourcemap' && !args.platform) {
     // Legacy hermes flow (no --platform given): keep sending the sourcemap
@@ -171,6 +172,7 @@ export const upload = async (
   if (args.bundlePath) {
     form.append('bundlePath', args.bundlePath);
   }
+  form.append('file', new Blob([fileBuffer]), path.win32.basename(args.file) || 'file');
 
   const uploadResult = await apiFetch<{ release: ReleaseRow }>(
     `${cfg.server}/api/releases/${rel.id}/symbols`,

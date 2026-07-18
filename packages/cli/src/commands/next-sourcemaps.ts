@@ -87,9 +87,11 @@ const uploadOne = async (
   }
 
   const form = new FormData();
-  form.append('file', new Blob([fileBuffer]), path.basename(item.absPath));
+  // Fields BEFORE the file part: the server only sees fields that arrive ahead
+  // of the file in the multipart stream (large maps otherwise 400).
   form.append('platform', item.platform);
   form.append('bundlePath', item.bundlePath);
+  form.append('file', new Blob([fileBuffer]), path.basename(item.absPath));
 
   const result = await apiFetch<{ release: ReleaseRow }>(
     `${server}/api/releases/${releaseId}/symbols`,
