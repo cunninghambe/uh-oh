@@ -3,15 +3,22 @@ import { Link, useParams } from '@tanstack/react-router';
 import { useState } from 'react';
 
 import { api } from '../api.js';
+import { RegressedBadge } from '../components/RegressedBadge.js';
+import { Sparkline } from '../components/Sparkline.js';
 import {
+  DEFAULT_ISSUE_SORT,
   DEFAULT_ISSUE_STATUS,
+  ISSUE_SORTS,
+  ISSUE_SORT_LABELS,
   ISSUE_STATUSES,
   ISSUES_PAGE_SIZE,
   hasNextPage,
   hasPrevPage,
+  isIssueSort,
   nextOffset,
   pageRangeLabel,
   prevOffset,
+  type IssueSort,
   type IssueStatusFilter,
 } from './Project.utils.js';
 
@@ -38,6 +45,7 @@ export const Project = () => {
   // default view is 'open'. `status` is always sent explicitly (never omitted) so the API
   // never falls back to its own default, which could silently diverge from ours.
   const [status, setStatus] = useState<IssueStatusFilter>(DEFAULT_ISSUE_STATUS);
+  const [sort, setSort] = useState<IssueSort>(DEFAULT_ISSUE_SORT);
   const [offset, setOffset] = useState(0);
 
   const changeStatus = (next: IssueStatusFilter): void => {
@@ -46,9 +54,24 @@ export const Project = () => {
     setOffset(0); // switching tabs always starts back at page 1
   };
 
+  const changeSort = (next: IssueSort): void => {
+    if (next === sort) return;
+    setSort(next);
+    setOffset(0); // changing sort order always starts back at page 1
+  };
+
   const issuesQ = useQuery({
-    queryKey: ['issues', projectId, status, offset],
-    queryFn: () => api.listIssues(projectId, { status, limit: ISSUES_PAGE_SIZE, offset }),
+    queryKey: ['issues', projectId, status, sort, offset],
+    queryFn: () => api.listIssues(projectId, { status, sort, limit: ISSUES_PAGE_SIZE, offset }),
+  });
+
+  // v0.3 CONTRACT C: server agent work landing concurrently, may 404 until it does.
+  // retry: false so an absent endpoint fails fast instead of retrying a guaranteed-404 —
+  // isError then just means "hide the sparkline" (see render below).
+  const statsQ = useQuery({
+    queryKey: ['project-stats', projectId],
+    queryFn: () => api.getProjectStats(projectId, 14),
+    retry: false,
   });
 
   const project = projectQ.data?.projects.find((p) => p.id === projectId);
@@ -67,6 +90,12 @@ export const Project = () => {
             {project && (
               <div className="text-xs font-mono text-zinc-500 mt-1 break-all">
                 DSN base: /ingest/{project.publicKey}
+              </div>
+            )}
+            {statsQ.data && (
+              <div className="mt-2 flex items-center gap-2">
+                <Sparkline points={statsQ.data.days} srLabel="Events" />
+                <span className="text-xs text-zinc-500">{statsQ.data.totalOpenIssues} open</span>
               </div>
             )}
           </div>
@@ -89,25 +118,45 @@ export const Project = () => {
         </div>
       </div>
 
-      <div className="flex gap-1 border-b border-zinc-800" role="tablist" aria-label="Issue status">
-        {ISSUE_STATUSES.map((s) => (
-          <button
-            key={s}
-            type="button"
-            role="tab"
-            aria-selected={status === s}
-            onClick={() => {
-              changeStatus(s);
+      <div className="flex items-center justify-between gap-4 border-b border-zinc-800">
+        <div className="flex gap-1" role="tablist" aria-label="Issue status">
+          {ISSUE_STATUSES.map((s) => (
+            <button
+              key={s}
+              type="button"
+              role="tab"
+              aria-selected={status === s}
+              onClick={() => {
+                changeStatus(s);
+              }}
+              className={`px-3 py-1.5 text-xs capitalize border-b-2 -mb-px ${
+                status === s
+                  ? 'border-amber-500 text-amber-400'
+                  : 'border-transparent text-zinc-500 hover:text-zinc-300'
+              }`}
+            >
+              {s}
+            </button>
+          ))}
+        </div>
+        <label className="flex items-center gap-1.5 text-xs text-zinc-500 pb-1.5 shrink-0">
+          Sort
+          <select
+            aria-label="Sort issues"
+            value={sort}
+            onChange={(e) => {
+              const next = e.target.value;
+              if (isIssueSort(next)) changeSort(next);
             }}
-            className={`px-3 py-1.5 text-xs capitalize border-b-2 -mb-px ${
-              status === s
-                ? 'border-amber-500 text-amber-400'
-                : 'border-transparent text-zinc-500 hover:text-zinc-300'
-            }`}
+            className="rounded border border-zinc-700 bg-zinc-900 px-2 py-1 text-xs text-zinc-300"
           >
-            {s}
-          </button>
-        ))}
+            {ISSUE_SORTS.map((s) => (
+              <option key={s} value={s}>
+                {ISSUE_SORT_LABELS[s]}
+              </option>
+            ))}
+          </select>
+        </label>
       </div>
 
       {issuesQ.isLoading && <div className="text-zinc-500 text-sm">Loading issues…</div>}
@@ -154,17 +203,21 @@ export const Project = () => {
                   <td className="px-4 py-3 text-right tabular-nums">{i.eventCount}</td>
                   <td className="px-4 py-3 text-zinc-400">{relativeTime(i.lastSeen)}</td>
                   <td className="px-4 py-3">
-                    <span
-                      className={
-                        i.status === 'open'
-                          ? 'text-amber-400'
-                          : i.status === 'resolved'
-                            ? 'text-emerald-400'
-                            : 'text-zinc-500'
-                      }
-                    >
-                      {i.status}
-                    </span>
+                    {i.status === 'regressed' ? (
+                      <RegressedBadge />
+                    ) : (
+                      <span
+                        className={
+                          i.status === 'open'
+                            ? 'text-amber-400'
+                            : i.status === 'resolved'
+                              ? 'text-emerald-400'
+                              : 'text-zinc-500'
+                        }
+                      >
+                        {i.status}
+                      </span>
+                    )}
                   </td>
                 </tr>
               ))}

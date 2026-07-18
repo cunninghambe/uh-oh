@@ -14,7 +14,7 @@ import type { RateLimiter } from './rate-limit.js';
 import { metrics } from '../metrics/registry.js';
 
 export type IngestResult =
-  | { kind: 'stored'; eventId: string; issueId: string; isNewIssue: boolean }
+  | { kind: 'stored'; eventId: string; issueId: string; isNewIssue: boolean; regressed: boolean }
   | { kind: 'rate-limited'; issueId: string; isNewIssue: boolean }
   | { kind: 'unknown-key' };
 
@@ -42,7 +42,7 @@ export const ingest = (
   const title = computeTitle(envelope);
 
   const result = deps.db.transaction((tx): IngestResult => {
-    const { issue, isNew } = upsertIssue(tx, {
+    const { issue, isNew, regressed } = upsertIssue(tx, {
       projectId: project.id,
       fingerprint,
       title,
@@ -92,17 +92,44 @@ export const ingest = (
     }
 
     if (project.webhookUrl) {
-      const shouldFire =
-        isNew ||
-        issue.lastAlertedAt === null ||
-        now - issue.lastAlertedAt > project.alertDedupeMinutes * 60_000;
-      if (shouldFire) {
-        enqueueDispatch(tx, { issueId: issue.id, eventId: event.id, url: project.webhookUrl }, now);
+      if (regressed) {
+        // The resolved -> regressed transition dispatches immediately, bypassing
+        // the dedupe window for this one dispatch. last_alerted_at is updated so
+        // subsequent events on the now-regressed issue respect the normal window.
+        enqueueDispatch(
+          tx,
+          {
+            issueId: issue.id,
+            eventId: event.id,
+            url: project.webhookUrl,
+            type: 'issue.regressed',
+          },
+          now,
+        );
         markIssueAlerted(tx, issue.id, now);
+      } else {
+        const shouldFire =
+          isNew ||
+          issue.lastAlertedAt === null ||
+          now - issue.lastAlertedAt > project.alertDedupeMinutes * 60_000;
+        if (shouldFire) {
+          enqueueDispatch(
+            tx,
+            { issueId: issue.id, eventId: event.id, url: project.webhookUrl, type: 'issue.new' },
+            now,
+          );
+          markIssueAlerted(tx, issue.id, now);
+        }
       }
     }
 
-    return { kind: 'stored', eventId: event.id, issueId: issue.id, isNewIssue: isNew };
+    return {
+      kind: 'stored',
+      eventId: event.id,
+      issueId: issue.id,
+      isNewIssue: isNew,
+      regressed,
+    };
   });
 
   // Increment metrics only after the transaction commits — a rollback (or a
@@ -112,6 +139,7 @@ export const ingest = (
   } else if (result.kind === 'stored') {
     metrics.eventsIngested.inc({ outcome: 'stored' });
     if (result.isNewIssue) metrics.issuesNew.inc();
+    if (result.regressed) metrics.issuesRegressed.inc();
   }
 
   return result;

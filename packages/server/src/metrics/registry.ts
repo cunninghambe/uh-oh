@@ -16,6 +16,12 @@ export const metrics = {
     registers: [registry],
   }),
 
+  issuesRegressed: new Counter({
+    name: 'uh_oh_issues_regressed_total',
+    help: 'Total issues that transitioned resolved -> regressed',
+    registers: [registry],
+  }),
+
   webhookFailures: new Counter({
     name: 'uh_oh_webhook_failures_total',
     help: 'Total webhook attempts that failed permanently',

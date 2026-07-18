@@ -4,17 +4,26 @@ import type { DbOrTx } from '../index.js';
 import { newId } from '../ids.js';
 import { issues, type IssueRow } from '../schema.js';
 
-export type IssueStatus = 'open' | 'resolved' | 'ignored';
+export type IssueStatus = 'open' | 'resolved' | 'ignored' | 'regressed';
 
 export const upsertIssue = (
   db: DbOrTx,
   input: { projectId: string; fingerprint: string; title: string; ts: number },
-): { issue: IssueRow; isNew: boolean } => {
+): { issue: IssueRow; isNew: boolean; regressed: boolean } => {
+  // Read the prior status (if any) before the upsert so we can detect the
+  // resolved -> regressed transition. better-sqlite3 is synchronous and this
+  // runs inside the ingest transaction, so there is no SELECT-then-write race.
+  const prior = db
+    .select({ status: issues.status })
+    .from(issues)
+    .where(and(eq(issues.projectId, input.projectId), eq(issues.fingerprint, input.fingerprint)))
+    .get();
+
   // Atomic upsert: a single INSERT ... ON CONFLICT DO UPDATE avoids the
   // SELECT-then-write race where two concurrent events could both insert.
-  // On conflict we bump lastSeen + eventCount but preserve title, status,
-  // firstSeen and lastAlertedAt (a resolved issue receiving a new event stays
-  // resolved — matching the prior behavior).
+  // On conflict we bump lastSeen + eventCount and preserve title, firstSeen and
+  // lastAlertedAt. Status is preserved EXCEPT that a 'resolved' issue receiving
+  // a new event transitions to 'regressed' (open/ignored/regressed unchanged).
   const issue = db
     .insert(issues)
     .values({
@@ -33,13 +42,16 @@ export const upsertIssue = (
       set: {
         lastSeen: input.ts,
         eventCount: sql`${issues.eventCount} + 1`,
+        status: sql`CASE WHEN ${issues.status} = 'resolved' THEN 'regressed' ELSE ${issues.status} END`,
       },
     })
     .returning()
     .get();
 
-  // A freshly inserted issue has eventCount 1; a conflict update makes it >= 2.
-  return { issue, isNew: issue.eventCount === 1 };
+  const isNew = prior === undefined;
+  // The transition fires exactly once: the first event after a 'resolved' issue.
+  const regressed = prior?.status === 'resolved';
+  return { issue, isNew, regressed };
 };
 
 export type IssueSort = 'lastSeen' | 'eventCount' | 'firstSeen';

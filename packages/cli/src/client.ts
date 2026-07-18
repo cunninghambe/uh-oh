@@ -14,6 +14,15 @@ const extractMessage = async (res: Response): Promise<string> => {
   }
 };
 
+// A 401/403 on any command almost always means the stored token expired or
+// was revoked (logout, JWT secret rotation) — point the user at the fix
+// instead of just surfacing the raw server error. Shared across commands
+// (upload, project) so the hint text stays identical everywhere.
+export const describeAuthError = (prefix: string, error: ApiError): string =>
+  error.kind === 'auth'
+    ? `${prefix}: ${error.message} — run \`uh-oh login\` to refresh your token`
+    : `${prefix}: ${error.message}`;
+
 export const apiFetch = async <T>(
   url: string,
   init: RequestInit & { token?: string },

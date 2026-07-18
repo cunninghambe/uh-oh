@@ -323,6 +323,26 @@ describe('startDispatcher — SSRF guard at dispatch time (H3)', () => {
   });
 });
 
+describe('startDispatcher — dispatch type (issue.regressed)', () => {
+  it('emits the row type in the payload (issue.new default, issue.regressed when set)', async () => {
+    const bodies: Array<Record<string, unknown>> = [];
+    const fetchFn = vi.fn().mockImplementation((_url: string, opts: { body: string }) => {
+      bodies.push(JSON.parse(opts.body) as Record<string, unknown>);
+      return Promise.resolve({ ok: true, status: 200 });
+    });
+    enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW); // default type
+    enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL, type: 'issue.regressed' }, NOW);
+
+    const handle = startDispatcher({ db, fetchFn, now: () => NOW, pollIntervalMs: 10 });
+    await new Promise<void>((resolve) => setTimeout(resolve, 80));
+    await handle.stop();
+
+    const types = bodies.map((b) => b['type']);
+    expect(types).toContain('issue.new');
+    expect(types).toContain('issue.regressed');
+  });
+});
+
 describe('startDispatcher — graceful drain (M4)', () => {
   it('stop() awaits an in-flight dispatch before resolving', async () => {
     enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);

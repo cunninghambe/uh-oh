@@ -1,6 +1,7 @@
-// Pure helpers for the symbolication status banner, split out from Issue.tsx for unit testing.
+// Pure helpers for the symbolication status banner and the status toggle, split out from
+// Issue.tsx for unit testing.
 
-import type { ResolvedFrame } from '../api.js';
+import type { Issue, ResolvedFrame } from '../api.js';
 
 const KNOWN_STATUS_LABELS: Partial<Record<ResolvedFrame['status'], string>> = {
   no_symbols: 'no symbols uploaded',
@@ -19,3 +20,22 @@ export const hasSymbolIssue = (frames: ResolvedFrame[] | undefined): boolean =>
 /** Human label for a frame status; falls back to the raw status string for anything unknown. */
 export const statusLabel = (status: ResolvedFrame['status']): string =>
   KNOWN_STATUS_LABELS[status] ?? status;
+
+export type StatusToggleOption = { value: Issue['status']; label: string };
+
+// v0.3 CONTRACT B: 'regressed' is system-set (a resolved issue recurring), never a direct PATCH
+// target — so it never appears as a toggle option. A regressed issue instead offers
+// resolve/ignore/reopen (SPEC brief item 2); every other status keeps the pre-existing
+// open/resolved/ignored toggle, targeting itself.
+export const statusToggleOptions = (current: Issue['status']): StatusToggleOption[] =>
+  current === 'regressed'
+    ? [
+        { value: 'resolved', label: 'resolve' },
+        { value: 'ignored', label: 'ignore' },
+        { value: 'open', label: 'reopen' },
+      ]
+    : [
+        { value: 'open', label: 'open' },
+        { value: 'resolved', label: 'resolved' },
+        { value: 'ignored', label: 'ignored' },
+      ];

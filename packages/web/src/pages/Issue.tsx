@@ -3,7 +3,10 @@ import { Link, useParams } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 
 import { api, type Breadcrumb, type Issue as IssueT, type ResolvedFrame } from '../api.js';
-import { hasSymbolIssue, statusLabel } from './Issue.utils.js';
+import { PlatformBadge } from '../components/PlatformBadge.js';
+import { RegressedBadge } from '../components/RegressedBadge.js';
+import { Sparkline } from '../components/Sparkline.js';
+import { hasSymbolIssue, statusLabel, statusToggleOptions } from './Issue.utils.js';
 
 const EVENTS_PAGE_SIZE = 5;
 
@@ -118,6 +121,15 @@ export const Issue = () => {
     queryFn: () => api.listIssueEvents(issueId, { page: eventsPage, limit: EVENTS_PAGE_SIZE }),
   });
 
+  // v0.3 CONTRACT C: server agent work landing concurrently, may 404 until it does.
+  // retry: false so an absent endpoint fails fast instead of retrying a guaranteed-404 —
+  // isError then just means "hide the sparkline" (see render below).
+  const statsQ = useQuery({
+    queryKey: ['issue-stats', issueId],
+    queryFn: () => api.getIssueStats(issueId, 14),
+    retry: false,
+  });
+
   const statusM = useMutation({
     mutationFn: (status: IssueT['status']) => api.setIssueStatus(issueId, status),
     onSuccess: () => {
@@ -164,26 +176,40 @@ export const Issue = () => {
         </Link>
         <div className="flex items-start justify-between gap-4 mt-2">
           <div className="min-w-0">
-            <h1 className="text-xl font-semibold break-words">{issue.title}</h1>
+            <div className="flex items-center gap-2 flex-wrap">
+              <h1 className="text-xl font-semibold break-words">{issue.title}</h1>
+              {issue.status === 'regressed' && <RegressedBadge />}
+              {latestEvent && <PlatformBadge platform={latestEvent.platform} />}
+            </div>
             <div className="font-mono text-xs text-zinc-500 mt-1 break-all">
               {issue.fingerprint}
             </div>
+            {statsQ.data && (
+              <div className="mt-2">
+                <Sparkline
+                  points={statsQ.data.days}
+                  width={80}
+                  height={20}
+                  srLabel="Issue events"
+                />
+              </div>
+            )}
           </div>
           <div className="flex gap-2 shrink-0">
-            {(['open', 'resolved', 'ignored'] as const).map((s) => (
+            {statusToggleOptions(issue.status).map(({ value, label }) => (
               <button
-                key={s}
+                key={value}
                 onClick={() => {
-                  statusM.mutate(s);
+                  statusM.mutate(value);
                 }}
-                disabled={statusM.isPending || issue.status === s}
+                disabled={statusM.isPending || issue.status === value}
                 className={`text-xs px-2 py-1 rounded border ${
-                  issue.status === s
+                  issue.status === value
                     ? 'border-amber-500 text-amber-400'
                     : 'border-zinc-700 text-zinc-400 hover:border-zinc-500'
                 } disabled:opacity-50`}
               >
-                {s}
+                {label}
               </button>
             ))}
           </div>

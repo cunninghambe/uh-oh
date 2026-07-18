@@ -95,3 +95,54 @@ describe('issues repo', () => {
     expect(getIssue(db, issue.id)?.lastAlertedAt).toBe(5_000);
   });
 });
+
+describe('upsertIssue — regression transition (resolved -> regressed)', () => {
+  it('a new event on a resolved issue transitions it to regressed (once)', () => {
+    const { issue } = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 1 });
+    setIssueStatus(db, issue.id, 'resolved');
+
+    const second = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 2 });
+    expect(second.regressed).toBe(true);
+    expect(second.issue.status).toBe('regressed');
+
+    // A further event on the now-regressed issue does NOT re-fire the transition.
+    const third = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 3 });
+    expect(third.regressed).toBe(false);
+    expect(third.issue.status).toBe('regressed');
+    expect(third.issue.eventCount).toBe(3);
+  });
+
+  it('an open issue stays open (no regression)', () => {
+    upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 1 });
+    const second = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 2 });
+    expect(second.regressed).toBe(false);
+    expect(second.issue.status).toBe('open');
+  });
+
+  it('an ignored issue stays ignored (no regression)', () => {
+    const { issue } = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 1 });
+    setIssueStatus(db, issue.id, 'ignored');
+    const second = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 2 });
+    expect(second.regressed).toBe(false);
+    expect(second.issue.status).toBe('ignored');
+  });
+
+  it('a fresh issue is never regressed', () => {
+    const r = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 1 });
+    expect(r.regressed).toBe(false);
+    expect(r.isNew).toBe(true);
+  });
+
+  it('re-resolving a regressed issue re-arms detection', () => {
+    const { issue } = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 1 });
+    setIssueStatus(db, issue.id, 'resolved');
+    const regressed = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 2 });
+    expect(regressed.regressed).toBe(true);
+
+    // User PATCHes it back to resolved → the next event regresses it again.
+    setIssueStatus(db, issue.id, 'resolved');
+    const again = upsertIssue(db, { projectId, fingerprint: 'fp', title: 't', ts: 3 });
+    expect(again.regressed).toBe(true);
+    expect(again.issue.status).toBe('regressed');
+  });
+});

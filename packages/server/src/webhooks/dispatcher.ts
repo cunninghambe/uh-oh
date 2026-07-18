@@ -33,7 +33,7 @@ export type DispatcherHandle = {
 
 const buildPayload = (
   db: Db,
-  dispatch: { id: string; issueId: string; eventId: string },
+  dispatch: { id: string; issueId: string; eventId: string; type: 'issue.new' | 'issue.regressed' },
   dashboardUrl: string | undefined,
 ): object | null => {
   const issue = getIssue(db, dispatch.issueId);
@@ -42,7 +42,9 @@ const buildPayload = (
   const project = getProjectById(db, issue.projectId);
   if (!project) return null;
   return {
-    type: 'issue.new',
+    // 'issue.new' for a new-issue alert, 'issue.regressed' for the
+    // resolved->regressed transition. Recorded on the row at enqueue time.
+    type: dispatch.type,
     // Idempotency hint: receivers can dedupe on dispatchId (at-least-once delivery).
     dispatchId: dispatch.id,
     project: { id: project.id, name: project.name, slug: project.slug },
@@ -71,7 +73,14 @@ const nextAttemptFor = (attempt: number, now: number): number | null =>
  */
 const dispatchOne = async (
   db: Db,
-  dispatch: { id: string; issueId: string; eventId: string; url: string; attempt: number },
+  dispatch: {
+    id: string;
+    issueId: string;
+    eventId: string;
+    url: string;
+    attempt: number;
+    type: 'issue.new' | 'issue.regressed';
+  },
   fetchFn: typeof fetch,
   now: number,
   dashboardUrl: string | undefined,

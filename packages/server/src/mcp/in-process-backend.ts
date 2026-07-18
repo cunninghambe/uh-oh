@@ -26,7 +26,13 @@ import { getIssue, listIssues, setIssueStatus } from '../db/repos/issues.js';
 import { createProject, listProjects, updateProject } from '../db/repos/projects.js';
 import { listReleasesForProject } from '../db/repos/releases.js';
 import type { Db } from '../db/index.js';
-import type { ProjectRow } from '../db/schema.js';
+import type { IssueRow, ProjectRow } from '../db/schema.js';
+
+// The DB issue row gained a v0.3 'regressed' status; the @uh-oh/mcp `Issue`
+// type predates it and models only open|resolved|ignored. A regressed issue is
+// surfaced with its true status string at runtime (mirroring how HttpBackend
+// deserializes the same server responses), so widen the row to the MCP shape.
+const toMcpIssue = (row: IssueRow): Issue => row as Issue;
 import { registry } from '../metrics/registry.js';
 import { symbolicateEvent } from '../symbolication/symbolicate.js';
 import { validateWebhookUrl } from '../webhooks/url-guard.js';
@@ -75,7 +81,7 @@ export class InProcessBackend implements UhOhBackend {
       ...(input.status ? { status: input.status } : {}),
       ...(input.sort ? { sort: input.sort } : {}),
     });
-    return Promise.resolve({ issues: rows, total });
+    return Promise.resolve({ issues: rows.map(toMcpIssue), total });
   }
 
   async getIssue(input: { issueId: string }): Promise<IssueDetail | null> {
@@ -84,7 +90,7 @@ export class InProcessBackend implements UhOhBackend {
     const latestEvent = getLatestEventForIssue(this.db, issue.id);
     const breadcrumbs = latestEvent ? listBreadcrumbs(this.db, latestEvent.id) : [];
     const frames = latestEvent ? await symbolicateEvent(this.db, latestEvent.id) : [];
-    return { issue, latestEvent, frames, breadcrumbs };
+    return { issue: toMcpIssue(issue), latestEvent, frames, breadcrumbs };
   }
 
   listIssueEvents(input: {
@@ -118,7 +124,8 @@ export class InProcessBackend implements UhOhBackend {
   }
 
   setIssueStatus(input: { issueId: string; status: IssueStatus }): Promise<Issue | null> {
-    return Promise.resolve(setIssueStatus(this.db, input.issueId, input.status));
+    const updated = setIssueStatus(this.db, input.issueId, input.status);
+    return Promise.resolve(updated ? toMcpIssue(updated) : null);
   }
 
   listReleases(input: { projectId: string }): Promise<Release[]> {

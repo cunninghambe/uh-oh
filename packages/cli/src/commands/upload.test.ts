@@ -272,6 +272,63 @@ describe('upload command', () => {
 
     expect(code).toBe(0);
     expect(logs[0]).toBe('Uploaded sourcemap for 1.0.0+1');
+    const form = calls[2]?.init.body as FormData;
+    expect(form.get('platform')).toBe('android');
+    expect(form.get('sourcemap')).toBe('true');
+    expect(form.get('bundlePath')).toBeNull();
+  });
+
+  it('sourcemap --platform web resolves against the web release row (not android) and sends platform + bundlePath instead of sourcemap=true', async () => {
+    const calls: FetchCall[] = [];
+    const logs: string[] = [];
+    const cfg: Config = { server: 'http://localhost:3300', token: 'tok' };
+    const webRelease = { id: 'rel-web', version: '1.0.0', build: '1', platform: 'web' };
+    const deps: UploadDeps & { logs: string[] } = {
+      config: { read: () => Promise.resolve(cfg) },
+      fetchFn: makeCapturingFetch(
+        [
+          { status: 200, body: { projects: [baseProject] } },
+          // android release exists too, but must NOT be selected for a web upload
+          { status: 200, body: { releases: [baseRelease, webRelease] } },
+          { status: 200, body: { release: webRelease } },
+        ],
+        calls,
+      ),
+      log: (line) => logs.push(line),
+      readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
+      statFile: () => Promise.resolve({ size: 1024 }),
+      logs,
+    };
+
+    const code = await upload(deps, 'sourcemap', {
+      project: 'my-app',
+      release: '1.0.0+1',
+      file: 'chunks/123.js.map',
+      platform: 'web',
+      bundlePath: 'static/chunks/123.js',
+    });
+
+    expect(code).toBe(0);
+    expect(calls[2]?.url).toBe('http://localhost:3300/api/releases/rel-web/symbols');
+    const form = calls[2]?.init.body as FormData;
+    expect(form.get('platform')).toBe('web');
+    expect(form.get('bundlePath')).toBe('static/chunks/123.js');
+    expect(form.get('sourcemap')).toBeNull();
+  });
+
+  it('sourcemap --platform node with no matching node release returns 1', async () => {
+    const deps = makeDeps({ server: 'http://localhost:3300', token: 'tok' }, [
+      { status: 200, body: { projects: [baseProject] } },
+      { status: 200, body: { releases: [baseRelease] } }, // android only, no node release
+    ]);
+    const code = await upload(deps, 'sourcemap', {
+      project: 'my-app',
+      release: '1.0.0+1',
+      file: 'server/pages/index.js.map',
+      platform: 'node',
+    });
+    expect(code).toBe(1);
+    expect(deps.logs[0]).toMatch(/not yet seen by the server/i);
   });
 
   it('upload server error returns 2', async () => {

@@ -170,7 +170,7 @@ issues
   first_seen INTEGER NOT NULL
   last_seen INTEGER NOT NULL
   event_count INTEGER NOT NULL DEFAULT 1
-  status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','resolved','ignored'))
+  status TEXT NOT NULL DEFAULT 'open'   -- open|resolved|ignored|regressed (TS-enforced, no SQL CHECK shipped; 'regressed' is system-set — see §18)
   last_alerted_at INTEGER
   UNIQUE(project_id, fingerprint)
   INDEX (project_id, last_seen DESC)
@@ -550,7 +550,7 @@ Shipped after the v0.1 robustness pass. Adds first-class `platform: 'web'` and `
 
 **Consumer conventions:** env vars `UH_OH_DSN` (server) / `NEXT_PUBLIC_UH_OH_DSN` (browser); Next.js apps wire via `instrumentation.ts` (`register()` guarded to the nodejs runtime + `onRequestError`), `instrumentation-client.ts`, and `app/global-error.tsx`.
 
-**Known v0.2 gaps:** no symbolication for web/node stacks (frames render raw; Node server stacks are usually readable anyway); no Node disk spool; symbol upload remains Android-only.
+**Known v0.2 gaps:** ~~no symbolication for web/node stacks~~ (shipped in v0.3 — §18); no Node disk spool; RN symbol upload remains Android-only.
 
 ---
 
@@ -577,3 +577,21 @@ claude mcp add --transport http uh-oh-remote https://errors.example.com/mcp \
 ```
 
 **Distribution:** `mcp-dist` orphan branch (mirrors `sdk-dist`/`js-dist`), produced by `scripts/build-mcp-dist.mjs`; install via `pnpm add github:cunninghambe/uh-oh#mcp-dist`.
+
+---
+
+## 18. v0.3 addendum — web/node symbolication, regression detection, fleet dashboard
+
+Driven by the first four production consumers (Next.js apps reporting `web` + `node` events).
+
+**Multi-file source maps (web/node).** `POST /api/releases/:id/symbols` with `platform=web|node` accepts one `.map` per call with a `bundlePath` field (path of the JS file relative to the app build; sanitized: no absolute paths, no `..`, ≤512 chars, containment-checked). Stored at `<symbols>/<release-id>/<platform>/<bundlePath>.map`; cap 500 maps/release (409 beyond; same-path re-upload overwrites). `GET /api/releases/:id/symbols` lists `{ maps: [{ platform, bundlePath, size }] }`. At symbolicate time, frames match stored maps by longest segment-boundary suffix of the filename's path component (handles full URLs, bare `/_next/...` paths, and `file:///` URLs); consumers cached per `(releaseId, platform, bundlePath)` with the existing deferred-destroy semantics. Unmatched → `no_symbols`; corrupt → `corrupt_sourcemap`.
+
+**Regression detection.** A new event on a `resolved` issue flips it to `regressed` (system-set; users PATCH only `open|resolved|ignored`; re-resolving re-arms detection). The transition dispatches an immediate `type: 'issue.regressed'` webhook bypassing the dedupe window (recorded per-dispatch via the new `webhook_dispatches.type` column, migration 0003); subsequent events respect the window. Metric: `uh_oh_issues_regressed_total`. `ignored` issues stay ignored.
+
+**Stats.** `GET /api/projects/:id/stats?days=N` → `{ days: [{ date, events }], totalOpenIssues }`; `GET /api/issues/:id/stats?days=N` → `{ days }`. N clamped 1..90 (default 14), UTC-bucketed, zero-filled, ascending.
+
+**Dashboard.** Sort control (lastSeen/eventCount/firstSeen); status tabs Open/Regressed/Resolved/Ignored with regressed badges; platform badge on issue detail; 14-day SVG sparklines on project and issue pages (hidden gracefully if stats are unavailable).
+
+**CLI.** `uh-oh project list`, `uh-oh project create <name>` (prints slug + DSN), `uh-oh project dsn <slug>` (prints DSN + paste-ready `UH_OH_DSN=`/`NEXT_PUBLIC_UH_OH_DSN=` lines), `uh-oh upload next-sourcemaps --project <slug> --release <v+b> --dir <.next> [--dry-run]` (uploads `static/**` maps as `web` and `server/**` maps as `node`, per-platform release resolution), and `uh-oh upload sourcemap --platform web|node --bundle-path <p>` as the generic escape hatch.
+
+**Known v0.3 gaps:** consumer build pipelines don't yet generate/upload/strip source maps (per-app follow-up once a server is deployed); `@uh-oh/mcp`'s Issue type still models three statuses (the in-process backend surfaces `regressed` at runtime via an adapter — widen the type at next MCP rev); no per-issue platform column on the issues list payload (platform badge is detail-only).

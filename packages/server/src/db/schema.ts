@@ -52,7 +52,7 @@ export const issues = sqliteTable(
     firstSeen: integer('first_seen').notNull(),
     lastSeen: integer('last_seen').notNull(),
     eventCount: integer('event_count').notNull().default(1),
-    status: text('status', { enum: ['open', 'resolved', 'ignored'] })
+    status: text('status', { enum: ['open', 'resolved', 'ignored', 'regressed'] })
       .notNull()
       .default('open'),
     lastAlertedAt: integer('last_alerted_at'),
@@ -132,6 +132,11 @@ export const webhookDispatches = sqliteTable(
       .notNull()
       .references(() => events.id, { onDelete: 'cascade' }),
     url: text('url').notNull(),
+    // Webhook body `type` — 'issue.new' (default, preserves existing rows) or
+    // 'issue.regressed' for the resolved->regressed transition dispatch.
+    type: text('type', { enum: ['issue.new', 'issue.regressed'] })
+      .notNull()
+      .default('issue.new'),
     attempt: integer('attempt').notNull().default(0),
     nextAttemptAt: integer('next_attempt_at').notNull(),
     status: text('status', { enum: ['pending', 'succeeded', 'failed'] })
