@@ -34,6 +34,12 @@ export const metrics = {
     registers: [registry],
   }),
 
+  usageEvents: new Counter({
+    name: 'uh_oh_usage_events_total',
+    help: 'Total usage analytics events stored (pageviews + custom events)',
+    registers: [registry],
+  }),
+
   requestDuration: new Histogram({
     name: 'uh_oh_request_duration_seconds',
     help: 'HTTP request duration',

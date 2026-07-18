@@ -20,6 +20,7 @@ import { symbolicateEvent } from '../symbolication/symbolicate.js';
 import { buildIssueBundle } from './bundle.js';
 import { validateWebhookUrl } from '../webhooks/url-guard.js';
 import { clampDays, issueStats, projectStats } from '../db/repos/stats.js';
+import { clampUsageDays, usageSummary } from '../db/repos/usage-summary.js';
 
 // list_top_issues bounds (mirrored by the MCP tool schema).
 const MAX_TOP_ISSUES = 25;
@@ -179,6 +180,18 @@ export const registerApiRoutes = (
       const project = getProjectById(db, req.params.id);
       if (!project) return reply.code(404).send({ error: 'project_not_found' });
       return projectStats(db, project.id, clampDays(req.query.days));
+    },
+  );
+
+  // CONTRACT U-API — privacy-first usage analytics summary (days clamped 1..90,
+  // default 30).
+  app.get<{ Params: { id: string }; Querystring: { days?: string } }>(
+    '/api/projects/:id/usage/summary',
+    { preHandler },
+    (req, reply) => {
+      const project = getProjectById(db, req.params.id);
+      if (!project) return reply.code(404).send({ error: 'project_not_found' });
+      return usageSummary(db, project.id, clampUsageDays(req.query.days));
     },
   );
 

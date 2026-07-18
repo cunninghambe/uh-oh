@@ -27,6 +27,7 @@ import {
   type TopIssue,
   type UhOhBackend,
   type UpdateProjectInput,
+  type UsageSummary,
 } from './backend.js';
 import { parseMetricsSubset } from './metrics.js';
 
@@ -311,6 +312,14 @@ export class HttpBackend implements UhOhBackend {
       all.push(...body.monitors);
     }
     return all;
+  }
+
+  async getUsageSummary(input: { projectId: string; days: number }): Promise<UsageSummary> {
+    const qs = new URLSearchParams({ days: String(input.days) });
+    return (await this.api(
+      'GET',
+      `/api/projects/${encodeURIComponent(input.projectId)}/usage/summary?${qs.toString()}`,
+    )) as UsageSummary;
   }
 
   async getHealth(): Promise<HealthReport> {

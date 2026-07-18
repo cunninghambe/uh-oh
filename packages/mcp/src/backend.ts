@@ -225,6 +225,21 @@ export interface ListMonitorsInput {
   projectId?: string;
 }
 
+/**
+ * CONTRACT U-API — privacy-first usage analytics summary for a project over a
+ * day window. `visitors` are distinct daily-rotating visitor hashes, so a
+ * visitor returning across days is counted once per day (an intentional privacy
+ * over-count). Raw IP / User-Agent are never part of this — they were never
+ * stored.
+ */
+export interface UsageSummary {
+  days: Array<{ date: string; pageviews: number; visitors: number; events: number }>;
+  topPages: Array<{ path: string; pageviews: number; visitors: number }>;
+  topReferrers: Array<{ referrer: string; pageviews: number }>;
+  topEvents: Array<{ name: string; count: number }>;
+  totals: { pageviews: number; visitors: number; events: number };
+}
+
 export interface IssueDetail {
   issue: Issue;
   latestEvent: EventRecord | null;
@@ -292,4 +307,6 @@ export interface UhOhBackend {
   listTopIssues(input: ListTopIssuesInput): Promise<TopIssue[]>;
   /** Check-in monitors across projects (or one), with computed `overdue`. */
   listMonitors(input: ListMonitorsInput): Promise<Monitor[]>;
+  /** CONTRACT U-API — usage analytics summary for a project over `days`. */
+  getUsageSummary(input: { projectId: string; days: number }): Promise<UsageSummary>;
 }

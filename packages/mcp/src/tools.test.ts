@@ -21,6 +21,7 @@ import {
   type TopIssue,
   type UhOhBackend,
   type UpdateProjectInput,
+  type UsageSummary,
 } from './backend.js';
 import { createUhOhMcpServer } from './tools.js';
 
@@ -331,6 +332,17 @@ class FakeBackend implements UhOhBackend {
     this.rec('listMonitors', input);
     return Promise.resolve([{ ...MONITOR }]);
   }
+
+  getUsageSummary(input: { projectId: string; days: number }): Promise<UsageSummary> {
+    this.rec('getUsageSummary', input);
+    return Promise.resolve({
+      days: [{ date: '2026-07-18', pageviews: 3, visitors: 2, events: 1 }],
+      topPages: [{ path: '/home', pageviews: 3, visitors: 2 }],
+      topReferrers: [{ referrer: 'google.com', pageviews: 2 }],
+      topEvents: [{ name: 'signup', count: 1 }],
+      totals: { pageviews: 3, visitors: 2, events: 1 },
+    });
+  }
 }
 
 // ── Harness ───────────────────────────────────────────────────────────────────
@@ -374,7 +386,7 @@ beforeEach(async () => {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('tool registry', () => {
-  it('registers all thirteen tools exactly once', async () => {
+  it('registers all fourteen tools exactly once', async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(
@@ -384,6 +396,7 @@ describe('tool registry', () => {
         'get_issue',
         'get_issue_bundle',
         'get_server_health',
+        'get_usage_summary',
         'list_issue_events',
         'list_issues',
         'list_monitors',
@@ -722,6 +735,39 @@ describe('bundle / top-issues / monitors (v0.5)', () => {
     const { isError, text } = await call(client, 'list_monitors', { project: 'nope' });
     expect(isError).toBe(true);
     expect(text).toContain('project_not_found');
+  });
+});
+
+describe('usage summary (v0.6)', () => {
+  it('get_usage_summary resolves a slug to the project id and forwards days', async () => {
+    const { isError, data } = await call(client, 'get_usage_summary', {
+      project: 'my-app',
+      days: 7,
+    });
+    expect(isError).toBe(false);
+    expect(backend.last('getUsageSummary')).toEqual({ projectId: 'p1', days: 7 });
+    expect(data['totals']).toEqual({ pageviews: 3, visitors: 2, events: 1 });
+    expect((data['topReferrers'] as unknown[])[0]).toEqual({
+      referrer: 'google.com',
+      pageviews: 2,
+    });
+  });
+
+  it('get_usage_summary defaults days to 30', async () => {
+    await call(client, 'get_usage_summary', { project: 'p1' });
+    expect((backend.last('getUsageSummary') as { days: number }).days).toBe(30);
+  });
+
+  it('get_usage_summary on an unknown project ref is a tool error', async () => {
+    const { isError, text } = await call(client, 'get_usage_summary', { project: 'nope' });
+    expect(isError).toBe(true);
+    expect(text).toContain('project_not_found');
+  });
+
+  it('get_usage_summary is annotated read-only', async () => {
+    const { tools } = await client.listTools();
+    const t = tools.find((x) => x.name === 'get_usage_summary');
+    expect(t?.annotations?.readOnlyHint).toBe(true);
   });
 });
 

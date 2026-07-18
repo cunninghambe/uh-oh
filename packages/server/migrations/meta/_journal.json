@@ -43,6 +43,13 @@
       "when": 1784344317487,
       "tag": "0005_monitors_and_dispatch_nullable",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1784381382070,
+      "tag": "0006_usage_analytics",
+      "breakpoints": true
     }
   ]
 }

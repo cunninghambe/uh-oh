@@ -6,6 +6,7 @@ import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
 import { createMonitor } from '../db/repos/monitors.js';
+import { insertUsageEvent } from '../db/repos/usage.js';
 import type { ProjectRow } from '../db/schema.js';
 import { ingest } from '../ingest/ingest.js';
 import { createRateLimiter } from '../ingest/rate-limit.js';
@@ -268,5 +269,24 @@ describe('InProcessBackend over MCP (InMemoryTransport)', () => {
     const text = (got.messages[0]?.content as { type: string; text: string }).text;
     expect(text).toContain('get_issue_bundle');
     expect(text).toContain(seeded.issueId);
+  });
+
+  it('get_usage_summary resolves the slug and returns the aggregated summary', async () => {
+    insertUsageEvent(db, {
+      projectId: project.id,
+      type: 'pageview',
+      name: null,
+      path: '/home',
+      referrerDomain: 'google.com',
+      visitor: 'v1',
+      props: null,
+      receivedAt: Date.now(),
+    });
+    const { isError, data } = await call(client, 'get_usage_summary', { project: 'my-app' });
+    expect(isError).toBe(false);
+    expect((data['totals'] as Record<string, number>)['pageviews']).toBe(1);
+    expect((data['days'] as unknown[]).length).toBe(30);
+    const referrers = data['topReferrers'] as Array<{ referrer: string }>;
+    expect(referrers[0]?.referrer).toBe('google.com');
   });
 });

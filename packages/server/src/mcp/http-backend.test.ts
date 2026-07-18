@@ -9,6 +9,7 @@ import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
 import { createMonitor } from '../db/repos/monitors.js';
+import { insertUsageEvent } from '../db/repos/usage.js';
 import { cleanupExpiredSessions } from '../db/repos/sessions.js';
 import { ingest } from '../ingest/ingest.js';
 import { createRateLimiter } from '../ingest/rate-limit.js';
@@ -145,6 +146,24 @@ describe('HttpBackend against a live server', () => {
     expect(all[0]).toMatchObject({ slug: 'nightly', projectSlug: 'my-app', overdue: true });
     const scoped = await backend.listMonitors({ projectId: project.id });
     expect(scoped).toHaveLength(1);
+  });
+
+  it('fetches the usage summary over the API route', async () => {
+    insertUsageEvent(db, {
+      projectId: project.id,
+      type: 'pageview',
+      name: null,
+      path: '/home',
+      referrerDomain: 'google.com',
+      visitor: 'v1',
+      props: null,
+      receivedAt: Date.now(),
+    });
+    const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+    const summary = await backend.getUsageSummary({ projectId: project.id, days: 7 });
+    expect(summary.days).toHaveLength(7);
+    expect(summary.totals).toEqual({ pageviews: 1, visitors: 1, events: 0 });
+    expect(summary.topReferrers[0]).toEqual({ referrer: 'google.com', pageviews: 1 });
   });
 
   it('aborts a slow request via the AbortController timeout', async () => {

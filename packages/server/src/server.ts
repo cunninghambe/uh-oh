@@ -11,6 +11,7 @@ import { registerSymbolizationRoutes } from './symbolication/routes.js';
 import type { IngestEntry } from './ingest/ingest.js';
 import { makeIngest } from './ingest/ingest.js';
 import { registerCheckInRoute } from './ingest/check-in.js';
+import { registerUsageIngestRoute } from './ingest/usage.js';
 import { createRateLimiter } from './ingest/rate-limit.js';
 import { createIpRateLimiter } from './hardening/ip-rate-limit.js';
 import { securityHeadersHook } from './hardening/security-headers.js';
@@ -76,6 +77,10 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   // pings every few minutes, so a big bucket tolerates retries/bursts.
   const checkInLimiter = createRateLimiter({ capacity: 30, refillPerSec: 1 });
 
+  // Usage limiter: keyed per publicKey. Usage analytics is high-volume by design
+  // (every pageview), so the bucket is large with a fast refill.
+  const usageLimiter = createRateLimiter({ capacity: 200, refillPerSec: 20 });
+
   const ipLimiter = createIpRateLimiter({
     perMinute: deps.ipRatePerMinute ?? 600,
     burst: deps.ipRateBurst ?? 100,
@@ -89,6 +94,7 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
       ipLimiter.cleanup(now);
       ingestRateLimiter.cleanup(now);
       checkInLimiter.cleanup(now);
+      usageLimiter.cleanup(now);
       loginLimiter.cleanup(now);
     },
     5 * 60 * 1000,
@@ -158,6 +164,7 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   app.get('/healthz', () => ({ ok: true }));
 
   registerCheckInRoute(app, deps.db, checkInLimiter);
+  registerUsageIngestRoute(app, deps.db, usageLimiter);
 
   registerAuthRoutes(app, deps.db, deps.secret, deps.password, loginLimiter);
   registerApiRoutes(app, deps.db, deps.secret, deps.symbolToken);

@@ -161,31 +161,37 @@ describe('POST /api/releases/:id/symbols — web/node maps', () => {
     expect(res.statusCode).toBe(400);
   });
 
-  it('409 once the per-release cap (500) is exceeded; overwrite of an existing map still 200', async () => {
-    const release = newRelease('web');
-    // Pre-seed 500 maps directly on disk (fast path around the HTTP loop).
-    for (let i = 0; i < 500; i++) {
-      const dest = webSymbolMapPath(release.id, 'web', `static/chunks/c${String(i)}.js`);
-      await fs.mkdir(path.dirname(dest), { recursive: true });
-      await fs.writeFile(dest, '{}');
-    }
-    const app = buildTestServer(db);
+  // 30s timeout: seeding 500 files is ~1s in isolation but can exceed the 5s
+  // default under a fully parallel suite run on a loaded machine.
+  it(
+    '409 once the per-release cap (500) is exceeded; overwrite of an existing map still 200',
+    { timeout: 30_000 },
+    async () => {
+      const release = newRelease('web');
+      // Pre-seed 500 maps directly on disk (fast path around the HTTP loop).
+      for (let i = 0; i < 500; i++) {
+        const dest = webSymbolMapPath(release.id, 'web', `static/chunks/c${String(i)}.js`);
+        await fs.mkdir(path.dirname(dest), { recursive: true });
+        await fs.writeFile(dest, '{}');
+      }
+      const app = buildTestServer(db);
 
-    // A brand-new (501st) bundlePath is rejected.
-    const over = await postMap(app, release.id, {
-      platform: 'web',
-      bundlePath: 'static/chunks/new.js',
-    });
-    expect(over.statusCode).toBe(409);
-    expect(over.json<{ error: string }>().error).toBe('too_many_maps');
+      // A brand-new (501st) bundlePath is rejected.
+      const over = await postMap(app, release.id, {
+        platform: 'web',
+        bundlePath: 'static/chunks/new.js',
+      });
+      expect(over.statusCode).toBe(409);
+      expect(over.json<{ error: string }>().error).toBe('too_many_maps');
 
-    // Overwriting one of the existing 500 is an overwrite, not a new map → 200.
-    const overwrite = await postMap(app, release.id, {
-      platform: 'web',
-      bundlePath: 'static/chunks/c0.js',
-    });
-    expect(overwrite.statusCode).toBe(200);
-  });
+      // Overwriting one of the existing 500 is an overwrite, not a new map → 200.
+      const overwrite = await postMap(app, release.id, {
+        platform: 'web',
+        bundlePath: 'static/chunks/c0.js',
+      });
+      expect(overwrite.statusCode).toBe(200);
+    },
+  );
 
   it('upload invalidates cached symbolication rows for the release', async () => {
     const release = newRelease('web');

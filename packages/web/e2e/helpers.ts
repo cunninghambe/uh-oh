@@ -112,3 +112,28 @@ export const checkIn = async (
   }
   return (await res.json()) as { monitorId: string };
 };
+
+type UsageEventInput = {
+  type: 'pageview' | 'event';
+  ts?: number;
+  path?: string;
+  referrer?: string;
+  name?: string;
+  props?: Record<string, string | number | boolean>;
+};
+
+/**
+ * POSTs a batch of usage events to /ingest/<publicKey>/usage (v0.6 CONTRACT U-IN) — the public,
+ * unauthenticated analytics endpoint the @uh-oh/js browser SDK's beacon hits in production.
+ */
+export const ingestUsage = async (
+  request: APIRequestContext,
+  publicKey: string,
+  events: UsageEventInput[],
+): Promise<{ accepted: number; dropped: number }> => {
+  const res = await request.post(`/ingest/${publicKey}/usage`, { data: { events } });
+  if (!res.ok()) {
+    throw new Error(`usage ingest failed: ${String(res.status())} ${await res.text()}`);
+  }
+  return (await res.json()) as { accepted: number; dropped: number };
+};

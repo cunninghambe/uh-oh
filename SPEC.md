@@ -635,3 +635,19 @@ The "exceptional" release: uh-oh becomes a deterministic fix-dossier substrate f
 **Monitors.** `POST /ingest/:publicKey/check-in/:slug[?intervalMinutes=N]` (public-key auth, slug `[a-z0-9-]{1,64}`, per-(key,slug) token bucket, 202 `{monitorId}`). First ping auto-creates (interval required; grace `max(5, ceil(interval/4))`); later pings bump `lastCheckInAt` and recover `missed→ok` with a `monitor.recovered` webhook. A 60s in-process sweep flips overdue monitors to `missed` and fires `monitor.missed` once per episode (status transition = dedupe) through the normal dispatcher — migration 0005 creates `monitors` and rebuilds `webhook_dispatches` with nullable `issue_id`/`event_id` + `monitor_id`. JWT CRUD under `/api/projects/:id/monitors` + `/api/monitors/:id`; MCP `list_monitors`; metric `uh_oh_monitor_missed_total`. Dashboard: Monitors section on the project page (status pills, overdue chip, pause/edit/delete, empty state showing the project's real check-in URL).
 
 **Client.** `@uh-oh/js` 0.4.0 adds `checkIn(slug, { intervalMinutes? })` — fire-and-forget, single attempt, no spooling, never throws, silent no-op without a DSN. Copy-paste consumer snippets (Next.js worker, Apps Script sender, curl-for-cron) live in `docs/check-ins.md`.
+
+---
+
+## 21. v0.6 addendum — privacy-first usage analytics
+
+Cookie-less, self-hosted product analytics on the same rails as crash reporting. Plausible-style, not GA-style: **no cookies, no client identifiers, no fingerprinting stored**.
+
+**Privacy model.** The client sends only event payloads. Daily uniques come from a server-side hash `sha256(dailySalt | publicKey | clientIp | userAgent)` truncated to 16 hex chars; salts are crypto-random per UTC day (`usage_salts`, pruned after 2 days) so visitors are uncorrelatable across days (repeat visitors over-count across days — the accepted trade). Raw IP and UA feed the hash and are discarded — never stored, never logged; paths are stripped of query/fragment; referrers reduce to domain only (same-origin → null). Tests prove the store contains no IP/UA/salt.
+
+**Ingest.** `POST /ingest/:publicKey/usage` — public-key auth, `application/json` or `text/plain` (sendBeacon), `{ events: [{ type: 'pageview'|'event', ts?, path?, referrer?, name?, props? }] }`, batch ≤50 (413 beyond), per-event validation drops the event not the batch (`202 { accepted, dropped }`), generous per-key token bucket (200 cap / 20 per s). Storage: `usage_events` (migration 0006) with `(project_id, received_at)` index; pruned by the standard retention window. Metric `uh_oh_usage_events_total`.
+
+**Summary.** `GET /api/projects/:id/usage/summary?days=30` (JWT; days 1..90) → zero-filled ascending `days` (pageviews/visitors/events), `topPages` / `topReferrers` (direct excluded) / `topEvents` (≤10 each, deterministic ordering), `totals`. MCP tool `get_usage_summary` in both backends.
+
+**Client (`@uh-oh/js` 0.5.0).** `trackPageview(path?)`, `trackEvent(name, props?)`, and opt-in `init({ analytics: { auto: true } })` — initial pageview (with raw referrer, first pageview only), History pushState/replaceState + popstate hooks with consecutive-path dedupe, restored cleanly on `close()`. Separate lossy batch queue (cap 20, 5s debounce, sendBeacon on pagehide, no retry/spool — analytics is best-effort by design). Validation mirrors the server; nothing here can throw or mint an identifier.
+
+**Dashboard.** Usage section per project: visitors/pageviews/events headline, dual-series 30-day trend (SVG, shared-scale fitting), top pages/referrers/events bars, 7/30/90-day toggle; hidden entirely when the endpoint is absent.

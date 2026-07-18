@@ -23,6 +23,7 @@ import {
   type TopIssue,
   type UhOhBackend,
   type UpdateProjectInput,
+  type UsageSummary,
 } from '@uh-oh/mcp';
 
 import { buildIssueBundle } from '../api/bundle.js';
@@ -33,6 +34,7 @@ import { listMonitorsWithComputed } from '../db/repos/monitors.js';
 import { createProject, listProjects, updateProject } from '../db/repos/projects.js';
 import { listReleasesForProject } from '../db/repos/releases.js';
 import { topIssues } from '../db/repos/top-issues.js';
+import { usageSummary } from '../db/repos/usage-summary.js';
 import type { Db } from '../db/index.js';
 import type { ProjectRow } from '../db/schema.js';
 import { registry } from '../metrics/registry.js';
@@ -162,5 +164,11 @@ export class InProcessBackend implements UhOhBackend {
         ...(input.projectId !== undefined ? { projectId: input.projectId } : {}),
       }),
     );
+  }
+
+  getUsageSummary(input: { projectId: string; days: number }): Promise<UsageSummary> {
+    // Same aggregation the GET /api/projects/:id/usage/summary route runs, so
+    // the in-process and HTTP backends return identical summaries.
+    return Promise.resolve(usageSummary(this.db, input.projectId, input.days));
   }
 }

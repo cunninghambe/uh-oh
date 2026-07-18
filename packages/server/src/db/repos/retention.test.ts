@@ -8,7 +8,8 @@ import { upsertIssue, getIssue } from './issues.js';
 import { insertEvent } from './events.js';
 import { insertBreadcrumbs, listBreadcrumbs } from './breadcrumbs.js';
 import { enqueueDispatch, markDispatchAttempt } from './webhook-dispatches.js';
-import { events, symbolications, webhookDispatches } from '../schema.js';
+import { insertUsageEvent } from './usage.js';
+import { events, symbolications, usageEvents, usageSalts, webhookDispatches } from '../schema.js';
 import { pruneOldData, resolveRetentionDays } from './retention.js';
 
 const DAY = 86_400_000;
@@ -123,6 +124,54 @@ describe('pruneOldData', () => {
     const rows = db.select().from(webhookDispatches).all();
     expect(rows).toHaveLength(2);
     expect(rows.map((r) => r.status).sort()).toEqual(['pending', 'succeeded']);
+  });
+
+  const seedUsage = (path: string, receivedAt: number): void => {
+    insertUsageEvent(db, {
+      projectId,
+      type: 'pageview',
+      name: null,
+      path,
+      referrerDomain: null,
+      visitor: 'v',
+      props: null,
+      receivedAt,
+    });
+  };
+
+  it('prunes usage_events older than the retention window and old daily salts', () => {
+    seedUsage('/old', NOW - 100 * DAY);
+    seedUsage('/young', NOW - 1 * DAY);
+    const oldDate = new Date(NOW - 10 * DAY).toISOString().slice(0, 10);
+    const recentDate = new Date(NOW).toISOString().slice(0, 10);
+    db.insert(usageSalts).values({ date: oldDate, salt: 'old' }).run();
+    db.insert(usageSalts).values({ date: recentDate, salt: 'new' }).run();
+
+    const res = pruneOldData(db, { now: NOW, retentionDays: 90 });
+
+    expect(res.usageEventsDeleted).toBe(1);
+    expect(res.usageSaltsDeleted).toBe(1);
+    expect(
+      db
+        .select()
+        .from(usageEvents)
+        .all()
+        .map((r) => r.path),
+    ).toEqual(['/young']);
+    expect(
+      db
+        .select()
+        .from(usageSalts)
+        .all()
+        .map((r) => r.date),
+    ).toEqual([recentDate]);
+  });
+
+  it('retentionDays = 0 disables usage_events pruning', () => {
+    seedUsage('/ancient', NOW - 1000 * DAY);
+    const res = pruneOldData(db, { now: NOW, retentionDays: 0 });
+    expect(res.usageEventsDeleted).toBe(0);
+    expect(db.select().from(usageEvents).all()).toHaveLength(1);
   });
 });
 

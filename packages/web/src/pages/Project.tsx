@@ -7,6 +7,7 @@ import { MonitorsSection } from '../components/MonitorsSection.js';
 import { PlatformBadge } from '../components/PlatformBadge.js';
 import { RegressedBadge } from '../components/RegressedBadge.js';
 import { Sparkline } from '../components/Sparkline.js';
+import { UsageSection } from '../components/UsageSection.js';
 import { relativeTime } from '../format.js';
 import {
   DEFAULT_ISSUE_SORT,
@@ -251,6 +252,10 @@ export const Project = () => {
       {/* v0.5 CONTRACT M: renders nothing itself if GET .../monitors 404s (endpoint not yet
           available on the server this build is talking to) — see MonitorsSection.tsx. */}
       {project && <MonitorsSection projectId={projectId} publicKey={project.publicKey} />}
+
+      {/* v0.6 CONTRACT U-API: renders nothing itself if GET .../usage/summary 404s (endpoint not
+          yet available on the server this build is talking to) — see UsageSection.tsx. */}
+      <UsageSection projectId={projectId} />
     </div>
   );
 };

@@ -246,3 +246,89 @@ export function fakeNavigator(
     },
   };
 }
+
+export interface FakeLocation {
+  loc: { pathname?: string };
+  setPath: (p: string) => void;
+}
+
+/** A mutable `location`-like fake for auto-analytics tests (defaults to '/'). */
+export function fakeLocation(pathname = '/'): FakeLocation {
+  const loc: { pathname?: string } = { pathname };
+  return {
+    loc,
+    setPath: (p: string): void => {
+      loc.pathname = p;
+    },
+  };
+}
+
+export interface FakeHistory {
+  history: {
+    pushState: (...args: unknown[]) => unknown;
+    replaceState: (...args: unknown[]) => unknown;
+  };
+  pushCalls: unknown[][];
+  replaceCalls: unknown[][];
+}
+
+/** A fake `history` for auto-analytics SPA-navigation tests; can be made to throw. */
+export function fakeHistory(
+  opts: { throwOnPush?: boolean; throwOnReplace?: boolean } = {},
+): FakeHistory {
+  const pushCalls: unknown[][] = [];
+  const replaceCalls: unknown[][] = [];
+  return {
+    pushCalls,
+    replaceCalls,
+    history: {
+      pushState: (...args: unknown[]): unknown => {
+        pushCalls.push(args);
+        if (opts.throwOnPush) throw new Error('pushState boom');
+        return undefined;
+      },
+      replaceState: (...args: unknown[]): unknown => {
+        replaceCalls.push(args);
+        if (opts.throwOnReplace) throw new Error('replaceState boom');
+        return undefined;
+      },
+    },
+  };
+}
+
+export interface FakeTimers {
+  setTimeoutFn: (cb: () => void, ms: number) => unknown;
+  clearTimeoutFn: (handle: unknown) => void;
+  /** Fires every currently-pending timer callback (and clears them). */
+  fireAll: () => void;
+  /** Number of timers currently pending (not yet fired or cleared). */
+  pending: () => number;
+}
+
+/**
+ * A controllable fake for setTimeout/clearTimeout: schedules callbacks
+ * without a real delay, letting a test assert nothing fired yet, then fire
+ * them deterministically via `fireAll()`. Used for the analytics batching
+ * debounce, where a real 5s wait (or firing immediately, which would hide a
+ * debounce bug) would not do.
+ */
+export function fakeTimers(): FakeTimers {
+  const pending = new Map<number, () => void>();
+  let nextId = 1;
+  return {
+    setTimeoutFn: (cb: () => void): unknown => {
+      const id = nextId++;
+      pending.set(id, cb);
+      return id;
+    },
+    clearTimeoutFn: (handle: unknown): void => {
+      pending.delete(handle as number);
+    },
+    fireAll: (): void => {
+      const cbs = [...pending.values()];
+      pending.clear();
+      for (const cb of cbs) cb();
+    },
+    pending: () => pending.size,
+  };
+}

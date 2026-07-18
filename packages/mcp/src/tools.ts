@@ -573,6 +573,25 @@ export const registerUhOhTools = (server: McpServer, backend: UhOhBackend): void
       }),
   );
 
+  server.registerTool(
+    'get_usage_summary',
+    {
+      title: 'Get usage summary',
+      description:
+        'Privacy-first usage analytics for a project (by id or slug) over the last N days (default 30, clamped 1..90): per-day pageviews/visitors/events (ascending, zero-filled), top pages, top referrer domains (direct excluded), top custom events, and window totals. Visitor counts use a daily-rotating hash, so repeat visitors across days are intentionally over-counted (the privacy trade); no raw IP or User-Agent is ever exposed.',
+      inputSchema: {
+        project: z.string().min(1),
+        days: z.number().int().min(1).max(90).default(30),
+      },
+      annotations: READ,
+    },
+    (args) =>
+      run(async () => {
+        const projectId = await resolveProjectId(backend, args.project);
+        return ok(await backend.getUsageSummary({ projectId, days: args.days }));
+      }),
+  );
+
   // Prompt: instruct an agent to pull the bundle and produce a fix. Kept short
   // and imperative — the heavy lifting is the deterministic bundle behind it.
   server.registerPrompt(

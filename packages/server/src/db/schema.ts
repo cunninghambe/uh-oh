@@ -180,6 +180,45 @@ export const webhookDispatches = sqliteTable(
   (t) => [index('webhook_dispatches_status_due_idx').on(t.status, t.nextAttemptAt)],
 );
 
+// ── Usage analytics (v0.6, CONTRACT U-IN / U-API) ─────────────────────────────
+// Privacy is the product: raw IP and raw User-Agent are NEVER persisted here.
+// They feed the visitor hash and are discarded. The daily salt rotates the hash
+// so a visitor is uncorrelatable across UTC days.
+
+// One crypto-random salt per UTC day, created lazily on first usage event that
+// day and pruned (>2 days old) by the retention job. Never appears in any API
+// response or log.
+export const usageSalts = sqliteTable('usage_salts', {
+  // UTC day the salt is valid for, as 'YYYY-MM-DD'.
+  date: text('date').primaryKey(),
+  // 32 random bytes, hex.
+  salt: text('salt').notNull(),
+});
+
+export const usageEvents = sqliteTable(
+  'usage_events',
+  {
+    id: text('id').primaryKey(),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    type: text('type', { enum: ['pageview', 'event'] }).notNull(),
+    // Set for 'event' rows (the event name); null for pageviews.
+    name: text('name'),
+    // Set for 'pageview' rows (query + fragment stripped); null for events.
+    path: text('path'),
+    // Referrer DOMAIN only (never the full URL); null for direct / same-origin /
+    // unparseable referrers.
+    referrerDomain: text('referrer_domain'),
+    // 16-char truncated sha256 daily visitor hash — the ONLY identity artifact.
+    visitor: text('visitor').notNull(),
+    // Small JSON blob (<=10 keys), or null.
+    props: text('props'),
+    receivedAt: integer('received_at').notNull(),
+  },
+  (t) => [index('usage_events_project_received_idx').on(t.projectId, t.receivedAt)],
+);
+
 export type ProjectRow = typeof projects.$inferSelect;
 export type ProjectInsert = typeof projects.$inferInsert;
 export type IssueRow = typeof issues.$inferSelect;
@@ -195,3 +234,6 @@ export type WebhookDispatchRow = typeof webhookDispatches.$inferSelect;
 export type WebhookDispatchInsert = typeof webhookDispatches.$inferInsert;
 export type MonitorRow = typeof monitors.$inferSelect;
 export type MonitorInsert = typeof monitors.$inferInsert;
+export type UsageEventRow = typeof usageEvents.$inferSelect;
+export type UsageEventInsert = typeof usageEvents.$inferInsert;
+export type UsageSaltRow = typeof usageSalts.$inferSelect;

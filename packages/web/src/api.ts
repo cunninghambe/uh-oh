@@ -136,6 +136,23 @@ export type Monitor = {
   overdue: boolean;
 };
 
+// v0.6 CONTRACT U-API: GET /api/projects/:id/usage/summary?days=. `days` ascending, zero-filled
+// (one entry per calendar day, no gaps — same convention as DayStat above), clamped 1..90
+// server-side. `topReferrers` excludes direct/no-referrer traffic (a null referrer_domain means
+// "direct", not a referrer literally named null) — every list capped at 10 server-side.
+// `totals.visitors` intentionally over-counts repeat visitors across the window (the visitor
+// hash rotates daily for privacy — see packages/server), so treat it as an activity measure,
+// not a precise unique-user count.
+export type UsageDayStat = { date: string; pageviews: number; visitors: number; events: number };
+
+export type UsageSummary = {
+  days: UsageDayStat[];
+  topPages: { path: string; pageviews: number; visitors: number }[];
+  topReferrers: { referrer: string; pageviews: number }[];
+  topEvents: { name: string; count: number }[];
+  totals: { pageviews: number; visitors: number; events: number };
+};
+
 export type MonitorPatch = {
   name?: string;
   intervalMinutes?: number;
@@ -381,4 +398,10 @@ export const api = {
     }),
 
   deleteMonitor: (id: string) => request<void>(`/api/monitors/${id}`, { method: 'DELETE' }),
+
+  // v0.6 CONTRACT U-API — server agent work landing concurrently, may 404 until it does. Callers
+  // must treat any failure as "no usage endpoint" and hide the whole section (see
+  // UsageSection.tsx), same degrade-gracefully pattern as listMonitors/getIssueImpact above.
+  getUsageSummary: (projectId: string, days = 30) =>
+    request<UsageSummary>(`/api/projects/${projectId}/usage/summary?days=${String(days)}`),
 };
