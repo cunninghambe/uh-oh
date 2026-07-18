@@ -12,10 +12,11 @@ import {
   setContext,
   setTag,
   setFingerprint,
+  checkIn,
   flush,
   close,
 } from './uh-oh-client.js';
-import { fakeProcess, mockFetch } from './test-support.js';
+import { fakeProcess, mockFetch, mockRawFetch } from './test-support.js';
 
 const DSN = 'https://pubkey123@errors.example.com';
 const INGEST = 'https://errors.example.com/ingest/pubkey123';
@@ -79,7 +80,7 @@ describe('Client - envelope + runtime', () => {
     expect(f.calls[0]?.url).toBe(INGEST);
     const env = EventEnvelopeSchema.parse(firstCallEnv(f.calls));
     expect(env.platform).toBe('node');
-    expect(env.sdk).toEqual({ name: '@uh-oh/js', version: '0.3.0' });
+    expect(env.sdk).toEqual({ name: '@uh-oh/js', version: '0.4.0' });
     expect(env.release).toEqual({ version: '1.4.2', build: '37' });
     expect(env.device.osName).toBe('linux');
     expect(env.device.osVersion).toBe('v20.3.1');
@@ -417,6 +418,158 @@ describe('Client - safety', () => {
   });
 });
 
+describe('Client - checkIn', () => {
+  it('posts to the check-in url for the slug with no query param when interval is omitted', async () => {
+    const f = mockRawFetch();
+    const c = new Client(
+      { dsn: DSN, release: '1.0.0' },
+      { fetchFn: f.fn, proc: fakeProcess().proc },
+    );
+    c.checkIn('nightly-backup');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]?.url).toBe(`${INGEST}/check-in/nightly-backup`);
+    expect(f.calls[0]?.init.method).toBe('POST');
+    c.close();
+  });
+
+  it('appends intervalMinutes as a query param when provided', async () => {
+    const f = mockRawFetch();
+    const c = new Client(
+      { dsn: DSN, release: '1.0.0' },
+      { fetchFn: f.fn, proc: fakeProcess().proc },
+    );
+    c.checkIn('nightly-backup', { intervalMinutes: 5 });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.calls[0]?.url).toBe(`${INGEST}/check-in/nightly-backup?intervalMinutes=5`);
+    c.close();
+  });
+
+  it('floors a fractional intervalMinutes', async () => {
+    const f = mockRawFetch();
+    const c = new Client(
+      { dsn: DSN, release: '1.0.0' },
+      { fetchFn: f.fn, proc: fakeProcess().proc },
+    );
+    c.checkIn('worker', { intervalMinutes: 5.9 });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.calls[0]?.url).toBe(`${INGEST}/check-in/worker?intervalMinutes=5`);
+    c.close();
+  });
+
+  it.each([0, -1, NaN, Infinity])(
+    'omits the query param for a non-positive-finite intervalMinutes (%s)',
+    async (bad) => {
+      const f = mockRawFetch();
+      const c = new Client(
+        { dsn: DSN, release: '1.0.0' },
+        { fetchFn: f.fn, proc: fakeProcess().proc },
+      );
+      c.checkIn('worker', { intervalMinutes: bad });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(f.calls[0]?.url).toBe(`${INGEST}/check-in/worker`);
+      c.close();
+    },
+  );
+
+  it.each(['Nightly-Backup', 'has space', 'has_underscore', '', 'a'.repeat(65), 'émoji-🔥'])(
+    'drops an invalid slug without sending (%s)',
+    async (slug) => {
+      const f = mockRawFetch();
+      const c = new Client(
+        { dsn: DSN, release: '1.0.0' },
+        { fetchFn: f.fn, proc: fakeProcess().proc },
+      );
+      expect(() => {
+        c.checkIn(slug);
+      }).not.toThrow();
+      await new Promise((r) => setTimeout(r, 0));
+      expect(f.calls).toHaveLength(0);
+      c.close();
+    },
+  );
+
+  it('accepts a max-length (64 char) slug of lowercase letters, digits, and hyphens', async () => {
+    const f = mockRawFetch();
+    const c = new Client(
+      { dsn: DSN, release: '1.0.0' },
+      { fetchFn: f.fn, proc: fakeProcess().proc },
+    );
+    const slug = ('a1-'.repeat(22) + 'ab').slice(0, 64);
+    c.checkIn(slug);
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]?.url).toBe(`${INGEST}/check-in/${slug}`);
+    c.close();
+  });
+
+  it('is a silent no-op with no dsn', async () => {
+    const f = mockRawFetch();
+    const c = new Client({ release: '1.0.0' }, { fetchFn: f.fn, proc: fakeProcess().proc });
+    expect(() => {
+      c.checkIn('worker');
+    }).not.toThrow();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.calls).toHaveLength(0);
+    c.close();
+  });
+
+  it('is a no-op after close()', async () => {
+    const f = mockRawFetch();
+    const c = new Client(
+      { dsn: DSN, release: '1.0.0' },
+      { fetchFn: f.fn, proc: fakeProcess().proc },
+    );
+    c.close();
+    expect(() => {
+      c.checkIn('worker');
+    }).not.toThrow();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.calls).toHaveLength(0);
+  });
+
+  it('never throws when fetch rejects (network error)', async () => {
+    const f = mockRawFetch([{ reject: true }]);
+    const c = new Client(
+      { dsn: DSN, release: '1.0.0' },
+      { fetchFn: f.fn, proc: fakeProcess().proc },
+    );
+    expect(() => {
+      c.checkIn('worker');
+    }).not.toThrow();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.calls).toHaveLength(1);
+    c.close();
+  });
+
+  it('never throws when fetch throws synchronously', async () => {
+    const throwingFetch = (): Promise<{ ok: boolean; status: number }> => {
+      throw new Error('boom, synchronously');
+    };
+    const c = new Client(
+      { dsn: DSN, release: '1.0.0' },
+      { fetchFn: throwingFetch, proc: fakeProcess().proc },
+    );
+    expect(() => {
+      c.checkIn('worker');
+    }).not.toThrow();
+    await new Promise((r) => setTimeout(r, 0));
+    c.close();
+  });
+
+  it('does not queue or persist check-ins (size() stays 0)', async () => {
+    const f = mockRawFetch([{ reject: true }]);
+    const c = new Client(
+      { dsn: DSN, release: '1.0.0' },
+      { fetchFn: f.fn, proc: fakeProcess().proc },
+    );
+    c.checkIn('worker');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(c.size()).toBe(0);
+    c.close();
+  });
+});
+
 describe('functional API', () => {
   afterEach(() => {
     close();
@@ -431,12 +584,31 @@ describe('functional API', () => {
     setContext('k', null);
     setTag('k', null);
     setFingerprint(null);
+    expect(() => {
+      checkIn('worker');
+    }).not.toThrow();
     await flush();
 
     // No-op init (no dsn) then double init - neither throws.
     init({ release: '1.0.0' });
     init({ release: '1.0.0' });
     expect(captureException(new Error('x'))).toBe('');
+  });
+
+  it('init -> checkIn end to end (fire-and-forget, no reply awaited)', async () => {
+    const f = mockRawFetch();
+    const holder = globalThis as unknown as { fetch?: unknown };
+    const realFetch = holder.fetch;
+    holder.fetch = f.fn;
+    try {
+      init({ dsn: DSN, release: '1.0.0', runtime: 'browser' });
+      checkIn('nightly-backup', { intervalMinutes: 10 });
+      await new Promise((r) => setTimeout(r, 0));
+      expect(f.calls).toHaveLength(1);
+      expect(f.calls[0]?.url).toBe(`${INGEST}/check-in/nightly-backup?intervalMinutes=10`);
+    } finally {
+      holder.fetch = realFetch;
+    }
   });
 
   it('init -> capture -> flush end to end (browser override avoids real node handlers)', async () => {

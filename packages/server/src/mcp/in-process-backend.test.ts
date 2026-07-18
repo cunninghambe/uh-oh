@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
+import { createMonitor } from '../db/repos/monitors.js';
 import type { ProjectRow } from '../db/schema.js';
 import { ingest } from '../ingest/ingest.js';
 import { createRateLimiter } from '../ingest/rate-limit.js';
@@ -206,5 +207,66 @@ describe('InProcessBackend over MCP (InMemoryTransport)', () => {
     const { isError, text } = await call(client, 'list_issue_events', { issueId: 'ghost' });
     expect(isError).toBe(true);
     expect(text).toContain('not_found');
+  });
+
+  it('get_issue_bundle returns the fix-dossier bundle', async () => {
+    const { isError, data } = await call(client, 'get_issue_bundle', { issueId: seeded.issueId });
+    expect(isError).toBe(false);
+    expect((data['issue'] as Record<string, unknown>)['id']).toBe(seeded.issueId);
+    expect((data['project'] as Record<string, unknown>)['slug']).toBe('my-app');
+    expect((data['latestEvent'] as Record<string, unknown>)['id']).toBe(seeded.eventId);
+    expect(data).toHaveProperty('impact');
+    expect(data['truncated']).toEqual({ context: false, breadcrumbs: false });
+  });
+
+  it('get_issue_bundle reports not_found for a missing issue', async () => {
+    const { isError, text } = await call(client, 'get_issue_bundle', { issueId: 'ghost' });
+    expect(isError).toBe(true);
+    expect(text).toContain('not_found');
+  });
+
+  it('list_top_issues ranks the seeded open issue', async () => {
+    const { isError, data } = await call(client, 'list_top_issues', { limit: 10, days: 14 });
+    expect(isError).toBe(false);
+    const issues = data['issues'] as Record<string, unknown>[];
+    expect(issues[0]).toMatchObject({
+      issueId: seeded.issueId,
+      projectSlug: 'my-app',
+      platform: 'android',
+    });
+  });
+
+  it('list_monitors returns computed monitors, scoped by project slug', async () => {
+    createMonitor(db, {
+      projectId: project.id,
+      slug: 'nightly',
+      intervalMinutes: 10,
+      graceMinutes: 5,
+      now: Date.now() - 60 * 60_000, // long ago -> overdue
+    });
+    const all = await call(client, 'list_monitors');
+    expect(all.isError).toBe(false);
+    const monitors = all.data['monitors'] as Record<string, unknown>[];
+    expect(monitors).toHaveLength(1);
+    expect(monitors[0]).toMatchObject({ slug: 'nightly', projectSlug: 'my-app', overdue: true });
+
+    const scoped = await call(client, 'list_monitors', { project: 'my-app' });
+    expect((scoped.data['monitors'] as unknown[]).length).toBe(1);
+
+    const missing = await call(client, 'list_monitors', { project: 'no-such-project' });
+    expect(missing.isError).toBe(true);
+    expect(missing.text).toContain('project_not_found');
+  });
+
+  it('exposes the fix_crash prompt pointing at get_issue_bundle', async () => {
+    const { prompts } = await client.listPrompts();
+    expect(prompts.map((p) => p.name)).toContain('fix_crash');
+    const got = await client.getPrompt({
+      name: 'fix_crash',
+      arguments: { issueId: seeded.issueId },
+    });
+    const text = (got.messages[0]?.content as { type: string; text: string }).text;
+    expect(text).toContain('get_issue_bundle');
+    expect(text).toContain(seeded.issueId);
   });
 });

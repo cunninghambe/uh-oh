@@ -102,6 +102,129 @@ export interface UpdateProjectInput {
   alertDedupeMinutes?: number;
 }
 
+// ── v0.5 impact / bundle / top-issues / monitors DTOs ─────────────────────────
+// Plain data mirroring the server's /api/* JSON (this package never imports from
+// @uh-oh/server). Timestamps are epoch-ms, matching the REST payloads and the
+// server-side size-bounding of the bundle.
+
+/** CONTRACT I — issue impact roll-up. */
+export interface IssueImpact {
+  /** Distinct user ids across the issue's events; null when none carry a user. */
+  distinctUsers: number | null;
+  topDevices: Array<{ model: string; events: number }>;
+  topOs: Array<{ os: string; events: number }>;
+  releases: Array<{ release: string; events: number }>;
+  platforms: Array<{ platform: string; events: number }>;
+}
+
+/** A resolved frame in a bundle — a {@link ResolvedFrame} plus optional context. */
+export interface BundleFrame extends ResolvedFrame {
+  context?: { pre: string[]; line: string; post: string[] };
+}
+
+export interface BundleBreadcrumb {
+  ts: number;
+  category: string;
+  level: string;
+  message: string;
+  data?: unknown;
+}
+
+export interface BundleLatestEvent {
+  id: string;
+  receivedAt: number;
+  level: string;
+  platform: string;
+  /** "version+build", or null. */
+  release: string | null;
+  exception: { type?: string; value?: string; mechanism?: string } | null;
+  frames: BundleFrame[];
+  breadcrumbs: BundleBreadcrumb[];
+}
+
+export interface BundleRecentEvent {
+  id: string;
+  receivedAt: number;
+  level: string;
+  platform: string;
+  release: string | null;
+}
+
+/** Symbol availability for the latest event's release. */
+export interface BundleSymbols {
+  releaseId: string | null;
+  platform: string | null;
+  mappingUploaded: boolean;
+  sourcemapUploaded: boolean;
+  maps: { web: number; node: number };
+}
+
+/**
+ * CONTRACT B — everything an agent needs to fix a crash in one call. Serialized
+ * form is hard-capped ~64KB by the server; `truncated` flags what was dropped
+ * (context lines first, then breadcrumbs) to fit.
+ */
+export interface IssueBundle {
+  project: { id: string; name: string; slug: string };
+  issue: {
+    id: string;
+    title: string;
+    fingerprint: string;
+    platform: string | null;
+    status: string;
+    firstSeen: number;
+    lastSeen: number;
+    eventCount: number;
+  };
+  impact: IssueImpact;
+  latestEvent: BundleLatestEvent | null;
+  recentEvents: BundleRecentEvent[];
+  symbols: BundleSymbols | null;
+  truncated: { context: boolean; breadcrumbs: boolean };
+}
+
+/** A ranked open/regressed issue across all projects (list_top_issues). */
+export interface TopIssue {
+  issueId: string;
+  title: string;
+  status: string;
+  platform: string | null;
+  projectId: string;
+  projectSlug: string;
+  projectName: string;
+  /** Event count within the requested window. */
+  windowEvents: number;
+  /** All-time event count. */
+  eventCount: number;
+  firstSeen: number;
+  lastSeen: number;
+}
+
+export interface ListTopIssuesInput {
+  limit: number;
+  days: number;
+}
+
+/** A check-in monitor with a computed `overdue` flag (list_monitors). */
+export interface Monitor {
+  id: string;
+  projectId: string;
+  projectSlug: string;
+  slug: string;
+  name: string | null;
+  intervalMinutes: number;
+  graceMinutes: number;
+  status: string;
+  lastCheckInAt: number | null;
+  createdAt: number;
+  overdue: boolean;
+}
+
+export interface ListMonitorsInput {
+  /** Concrete project id (resolved in the tool layer); omit for all projects. */
+  projectId?: string;
+}
+
 export interface IssueDetail {
   issue: Issue;
   latestEvent: EventRecord | null;
@@ -163,4 +286,10 @@ export interface UhOhBackend {
   setIssueStatus(input: { issueId: string; status: IssueStatus }): Promise<Issue | null>;
   listReleases(input: { projectId: string }): Promise<Release[]>;
   getHealth(): Promise<HealthReport>;
+  /** CONTRACT B — the full fix-dossier bundle for an issue (null if unknown). */
+  getIssueBundle(input: { issueId: string }): Promise<IssueBundle | null>;
+  /** Open/regressed issues across all projects, ranked by windowed volume. */
+  listTopIssues(input: ListTopIssuesInput): Promise<TopIssue[]>;
+  /** Check-in monitors across projects (or one), with computed `overdue`. */
+  listMonitors(input: ListMonitorsInput): Promise<Monitor[]>;
 }

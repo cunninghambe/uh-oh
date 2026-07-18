@@ -3,10 +3,26 @@ import { lookup as dnsLookup } from 'node:dns/promises';
 import type { Db } from '../db/index.js';
 import { getIssue } from '../db/repos/issues.js';
 import { getEvent } from '../db/repos/events.js';
+import { getMonitor } from '../db/repos/monitors.js';
 import { getProjectById } from '../db/repos/projects.js';
-import { takeDueDispatches, markDispatchAttempt } from '../db/repos/webhook-dispatches.js';
+import {
+  takeDueDispatches,
+  markDispatchAttempt,
+  type DispatchType,
+} from '../db/repos/webhook-dispatches.js';
 import { metrics } from '../metrics/registry.js';
 import { isBlockedIp, isIpLiteralHost, validateWebhookUrl } from './url-guard.js';
+
+/** Fields of a webhook_dispatches row the dispatcher reads. */
+type DispatchRecord = {
+  id: string;
+  issueId: string | null;
+  eventId: string | null;
+  monitorId: string | null;
+  url: string;
+  attempt: number;
+  type: DispatchType;
+};
 
 const BACKOFF_MS = [2000, 8000, 32000] as const;
 const FETCH_TIMEOUT_MS = 5000;
@@ -96,11 +112,44 @@ export type DispatcherHandle = {
   stop: () => Promise<void>;
 };
 
-const buildPayload = (
+const buildMonitorPayload = (
   db: Db,
-  dispatch: { id: string; issueId: string; eventId: string; type: 'issue.new' | 'issue.regressed' },
+  dispatch: DispatchRecord,
   dashboardUrl: string | undefined,
 ): object | null => {
+  if (!dispatch.monitorId) return null;
+  const monitor = getMonitor(db, dispatch.monitorId);
+  if (!monitor) return null;
+  const project = getProjectById(db, monitor.projectId);
+  if (!project) return null;
+  return {
+    // 'monitor.missed' when the sweep flips it overdue, 'monitor.recovered' when
+    // a check-in clears a missed monitor. Recorded on the row at enqueue time.
+    type: dispatch.type,
+    dispatchId: dispatch.id,
+    project: { id: project.id, name: project.name, slug: project.slug },
+    monitor: {
+      id: monitor.id,
+      slug: monitor.slug,
+      name: monitor.name,
+      intervalMinutes: monitor.intervalMinutes,
+      graceMinutes: monitor.graceMinutes,
+      lastCheckInAt: monitor.lastCheckInAt,
+    },
+    ...(dashboardUrl ? { url: `${dashboardUrl}/monitors/${monitor.id}` } : {}),
+  };
+};
+
+const buildPayload = (
+  db: Db,
+  dispatch: DispatchRecord,
+  dashboardUrl: string | undefined,
+): object | null => {
+  if (dispatch.type === 'monitor.missed' || dispatch.type === 'monitor.recovered') {
+    return buildMonitorPayload(db, dispatch, dashboardUrl);
+  }
+
+  if (!dispatch.issueId || !dispatch.eventId) return null;
   const issue = getIssue(db, dispatch.issueId);
   const event = getEvent(db, dispatch.eventId);
   if (!issue || !event) return null;
@@ -138,14 +187,7 @@ const nextAttemptFor = (attempt: number, now: number): number | null =>
  */
 const dispatchOne = async (
   db: Db,
-  dispatch: {
-    id: string;
-    issueId: string;
-    eventId: string;
-    url: string;
-    attempt: number;
-    type: 'issue.new' | 'issue.regressed';
-  },
+  dispatch: DispatchRecord,
   fetchFn: typeof fetch,
   lookupFn: DnsLookupAll,
   now: number,

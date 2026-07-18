@@ -3,9 +3,11 @@ import { Link, useParams } from '@tanstack/react-router';
 import { useState } from 'react';
 
 import { api } from '../api.js';
+import { MonitorsSection } from '../components/MonitorsSection.js';
 import { PlatformBadge } from '../components/PlatformBadge.js';
 import { RegressedBadge } from '../components/RegressedBadge.js';
 import { Sparkline } from '../components/Sparkline.js';
+import { relativeTime } from '../format.js';
 import {
   DEFAULT_ISSUE_SORT,
   DEFAULT_ISSUE_STATUS,
@@ -22,18 +24,6 @@ import {
   type IssueSort,
   type IssueStatusFilter,
 } from './Project.utils.js';
-
-const relativeTime = (ms: number): string => {
-  const diff = Date.now() - ms;
-  const s = Math.floor(diff / 1000);
-  if (s < 60) return `${String(s)}s ago`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${String(m)}m ago`;
-  const h = Math.floor(m / 60);
-  if (h < 24) return `${String(h)}h ago`;
-  const d = Math.floor(h / 24);
-  return `${String(d)}d ago`;
-};
 
 export const Project = () => {
   const { projectId } = useParams({ from: '/projects/$projectId' });
@@ -257,6 +247,10 @@ export const Project = () => {
           </div>
         </div>
       )}
+
+      {/* v0.5 CONTRACT M: renders nothing itself if GET .../monitors 404s (endpoint not yet
+          available on the server this build is talking to) — see MonitorsSection.tsx. */}
+      {project && <MonitorsSection projectId={projectId} publicKey={project.publicKey} />}
     </div>
   );
 };

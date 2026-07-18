@@ -62,12 +62,23 @@ export type Breadcrumb = {
   data: string | null;
 };
 
+// v0.5 CONTRACT S: source context around a resolved frame's crash line, up to 5 lines each side.
+// Optional/absent whenever the server couldn't extract it (no in-app map, no sourceContentFor,
+// frame beyond the first-8-in-app cap, older server build, etc.) — callers must render the frame
+// exactly as before when `context` is missing, never show an error/placeholder in its place.
+export type FrameContext = {
+  pre: string[];
+  line: string;
+  post: string[];
+};
+
 export type ResolvedFrame = {
   function?: string;
   module?: string;
   filename?: string;
   lineno?: number;
   status: 'ok' | 'no_symbols' | 'unsymbolicated' | 'corrupt_mapping';
+  context?: FrameContext;
 };
 
 // v0.3 CONTRACT C: GET /api/projects/:id/stats?days= and /api/issues/:id/stats?days=.
@@ -95,6 +106,42 @@ export type ReleaseSymbolMap = {
   platform: 'web' | 'node';
   bundlePath: string;
   size: number;
+};
+
+// v0.5 CONTRACT I: GET /api/issues/:id/impact. `distinctUsers` is null (not 0) when no event on
+// the issue carries a user id — callers must hide that stat rather than show "null" or "0" for
+// it (see ImpactPanel.tsx). Every list is capped at 5 entries server-side.
+export type ImpactSummary = {
+  distinctUsers: number | null;
+  topDevices: { model: string; events: number }[];
+  topOs: { os: string; events: number }[];
+  releases: { release: string; events: number }[];
+  platforms: { platform: string; events: number }[];
+};
+
+// v0.5 CONTRACT M: monitors are a dead-man's-switch, not something the UI creates — a row only
+// exists once the owner's fleet has POSTed one check-in for it (see MonitorsSection.tsx).
+export type Monitor = {
+  id: string;
+  projectId: string;
+  slug: string;
+  name: string | null;
+  intervalMinutes: number;
+  graceMinutes: number;
+  status: 'ok' | 'missed' | 'paused';
+  lastCheckInAt: number | null;
+  createdAt: number;
+  // Server-computed: true when `now` is already past the miss threshold even if the 60s sweep
+  // hasn't flipped `status` to 'missed' yet — see MonitorsSection.tsx's early-warning chip.
+  overdue: boolean;
+};
+
+export type MonitorPatch = {
+  name?: string;
+  intervalMinutes?: number;
+  graceMinutes?: number;
+  // Only these two are valid PATCH targets — 'missed' is set by the server-side sweep only.
+  status?: 'ok' | 'paused';
 };
 
 export class ApiError extends Error {
@@ -315,4 +362,23 @@ export const api = {
   // anything else) as "no maps to show" — see Releases.tsx's ReleaseMapsCount.
   getReleaseSymbols: (releaseId: string) =>
     request<{ maps: ReleaseSymbolMap[] }>(`/api/releases/${releaseId}/symbols`),
+
+  // v0.5 CONTRACT I — server agent work landing concurrently, may 404 until it does. Callers
+  // must treat any failure as "no impact data" and hide the panel (see Issue.tsx), same
+  // degrade-gracefully rule as getIssueStats/getProjectStats above.
+  getIssueImpact: (issueId: string) => request<ImpactSummary>(`/api/issues/${issueId}/impact`),
+
+  // v0.5 CONTRACT M — server agent work landing concurrently, may 404 until it does. Callers
+  // must treat a failed list fetch as "no monitors endpoint" and hide the whole section (see
+  // MonitorsSection.tsx), not confuse it with the legitimate "zero monitors yet" empty state.
+  listMonitors: (projectId: string) =>
+    request<{ monitors: Monitor[] }>(`/api/projects/${projectId}/monitors`),
+
+  updateMonitor: (id: string, patch: MonitorPatch) =>
+    request<{ monitor: Monitor }>(`/api/monitors/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+
+  deleteMonitor: (id: string) => request<void>(`/api/monitors/${id}`, { method: 'DELETE' }),
 };

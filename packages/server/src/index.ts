@@ -7,6 +7,7 @@ import { symbolTokenFromEnv } from './auth/symbol-token.js';
 import { cleanupExpiredSessions } from './db/repos/sessions.js';
 import { pruneOldData, resolveRetentionDays } from './db/repos/retention.js';
 import { startDispatcher } from './webhooks/dispatcher.js';
+import { startMonitorSweep } from './monitors/sweep.js';
 
 export { applyMigrations, openDb } from './db/index.js';
 export { buildServer } from './server.js';
@@ -77,6 +78,8 @@ if (isMain) {
   });
   app.log.level = logLevel;
   const dispatcherHandle = startDispatcher({ db, logger: app.log, dashboardUrl });
+  // Dead-man's-switch sweep: flip overdue monitors to 'missed' every 60s.
+  const monitorSweepHandle = startMonitorSweep({ db, logger: app.log });
 
   const runRetention = () => {
     try {
@@ -102,6 +105,7 @@ if (isMain) {
     try {
       clearInterval(cleanupInterval);
       clearInterval(retentionInterval);
+      monitorSweepHandle.stop(); // stop the dead-man's-switch sweep
       await app.close(); // stop accepting new requests
       await dispatcherHandle.stop(); // drain in-flight webhook dispatches
       closeDb(); // close the SQLite handle

@@ -20,6 +20,14 @@ const utcDayStart = (ms: number): number => {
   return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate());
 };
 
+/**
+ * Lower bound (epoch ms, inclusive) of the N-UTC-day window ending on the day of
+ * `now` — the same window the day-bucket stats use. Shared so top-issues ranks
+ * over exactly the stats window.
+ */
+export const statsWindowLowerMs = (days: number, now: number): number =>
+  utcDayStart(now) - (days - 1) * DAY_MS;
+
 /** `YYYY-MM-DD` in UTC for an epoch-ms timestamp. */
 const utcDateString = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 

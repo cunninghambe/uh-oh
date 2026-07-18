@@ -11,20 +11,28 @@ import {
   type EventRecord,
   type HealthReport,
   type Issue,
+  type IssueBundle,
   type IssueDetail,
   type IssueStatus,
   type ListIssuesInput,
+  type ListMonitorsInput,
+  type ListTopIssuesInput,
+  type Monitor,
   type Project,
   type Release,
+  type TopIssue,
   type UhOhBackend,
   type UpdateProjectInput,
 } from '@uh-oh/mcp';
 
+import { buildIssueBundle } from '../api/bundle.js';
 import { listBreadcrumbs } from '../db/repos/breadcrumbs.js';
 import { getEvent, getLatestEventForIssue, listEventsForIssue } from '../db/repos/events.js';
 import { getIssue, listIssues, setIssueStatus } from '../db/repos/issues.js';
+import { listMonitorsWithComputed } from '../db/repos/monitors.js';
 import { createProject, listProjects, updateProject } from '../db/repos/projects.js';
 import { listReleasesForProject } from '../db/repos/releases.js';
+import { topIssues } from '../db/repos/top-issues.js';
 import type { Db } from '../db/index.js';
 import type { ProjectRow } from '../db/schema.js';
 import { registry } from '../metrics/registry.js';
@@ -136,5 +144,23 @@ export class InProcessBackend implements UhOhBackend {
     const text = await registry.metrics();
     const subset = parseMetricsSubset(text);
     return { ok: true, metricsAvailable: true, ...subset };
+  }
+
+  getIssueBundle(input: { issueId: string }): Promise<IssueBundle | null> {
+    // Same builder the GET /api/issues/:id/bundle route uses, so the in-process
+    // and HTTP backends return byte-identical (already size-bounded) bundles.
+    return buildIssueBundle(this.db, input.issueId);
+  }
+
+  listTopIssues(input: ListTopIssuesInput): Promise<TopIssue[]> {
+    return Promise.resolve(topIssues(this.db, { limit: input.limit, days: input.days }));
+  }
+
+  listMonitors(input: ListMonitorsInput): Promise<Monitor[]> {
+    return Promise.resolve(
+      listMonitorsWithComputed(this.db, {
+        ...(input.projectId !== undefined ? { projectId: input.projectId } : {}),
+      }),
+    );
   }
 }

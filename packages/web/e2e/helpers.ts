@@ -93,3 +93,22 @@ export const ingestEvent = async (
     throw new Error(`ingest failed: ${String(res.status())} ${await res.text()}`);
   }
 };
+
+/**
+ * POSTs a dead-man's-switch check-in to /ingest/<publicKey>/check-in/<slug> (v0.5 CONTRACT M) —
+ * `intervalMinutes` is only required on a monitor's first-ever check-in (auto-create); omit it
+ * on later pings against an already-created slug.
+ */
+export const checkIn = async (
+  request: APIRequestContext,
+  publicKey: string,
+  slug: string,
+  intervalMinutes?: number,
+): Promise<{ monitorId: string }> => {
+  const qs = intervalMinutes !== undefined ? `?intervalMinutes=${String(intervalMinutes)}` : '';
+  const res = await request.post(`/ingest/${publicKey}/check-in/${slug}${qs}`);
+  if (!res.ok()) {
+    throw new Error(`check-in failed: ${String(res.status())} ${await res.text()}`);
+  }
+  return (await res.json()) as { monitorId: string };
+};

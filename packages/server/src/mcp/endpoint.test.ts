@@ -103,12 +103,30 @@ describe('POST /mcp with a valid token (real MCP client)', () => {
     return client;
   };
 
-  it('lists all ten tools', async () => {
+  it('lists all thirteen tools', async () => {
     const client = await connect();
     try {
       const { tools } = await client.listTools();
-      expect(tools).toHaveLength(10);
-      expect(tools.map((t) => t.name)).toContain('get_server_health');
+      expect(tools).toHaveLength(13);
+      const names = tools.map((t) => t.name);
+      expect(names).toContain('get_server_health');
+      expect(names).toContain('get_issue_bundle');
+      expect(names).toContain('list_top_issues');
+      expect(names).toContain('list_monitors');
+    } finally {
+      await client.close();
+    }
+  });
+
+  it('exposes the fix_crash prompt', async () => {
+    const client = await connect();
+    try {
+      const { prompts } = await client.listPrompts();
+      expect(prompts.map((p) => p.name)).toContain('fix_crash');
+      const got = await client.getPrompt({ name: 'fix_crash', arguments: { issueId: 'iX' } });
+      const text = (got.messages[0]?.content as { type: string; text: string }).text;
+      expect(text).toContain('get_issue_bundle');
+      expect(text).toContain('iX');
     } finally {
       await client.close();
     }

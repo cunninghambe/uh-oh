@@ -3,12 +3,14 @@ import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import type { z } from 'zod';
 
 import { registerApiRoutes } from './api/routes.js';
+import { registerMonitorRoutes } from './api/monitors-routes.js';
 import { registerAuthRoutes } from './auth/routes.js';
 import { createLoginLimiter } from './auth/login-limiter.js';
 import type { Db } from './db/index.js';
 import { registerSymbolizationRoutes } from './symbolication/routes.js';
 import type { IngestEntry } from './ingest/ingest.js';
 import { makeIngest } from './ingest/ingest.js';
+import { registerCheckInRoute } from './ingest/check-in.js';
 import { createRateLimiter } from './ingest/rate-limit.js';
 import { createIpRateLimiter } from './hardening/ip-rate-limit.js';
 import { securityHeadersHook } from './hardening/security-headers.js';
@@ -70,6 +72,10 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   const ingestRateLimiter = createRateLimiter({ capacity: 10, refillPerSec: 1 });
   const ingest = deps.ingest ?? makeIngest({ db: deps.db, rateLimiter: ingestRateLimiter });
 
+  // Check-in limiter: generous, keyed per (publicKey, slug). A healthy monitor
+  // pings every few minutes, so a big bucket tolerates retries/bursts.
+  const checkInLimiter = createRateLimiter({ capacity: 30, refillPerSec: 1 });
+
   const ipLimiter = createIpRateLimiter({
     perMinute: deps.ipRatePerMinute ?? 600,
     burst: deps.ipRateBurst ?? 100,
@@ -82,6 +88,7 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
       const now = Date.now();
       ipLimiter.cleanup(now);
       ingestRateLimiter.cleanup(now);
+      checkInLimiter.cleanup(now);
       loginLimiter.cleanup(now);
     },
     5 * 60 * 1000,
@@ -150,8 +157,11 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
 
   app.get('/healthz', () => ({ ok: true }));
 
+  registerCheckInRoute(app, deps.db, checkInLimiter);
+
   registerAuthRoutes(app, deps.db, deps.secret, deps.password, loginLimiter);
   registerApiRoutes(app, deps.db, deps.secret, deps.symbolToken);
+  registerMonitorRoutes(app, deps.db, deps.secret);
   registerSymbolizationRoutes(
     app,
     deps.db,

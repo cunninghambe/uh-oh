@@ -619,3 +619,19 @@ Driven by the first four production consumers (Next.js apps reporting `web` + `n
 **Playwright e2e.** 6-test chromium smoke (`packages/web/e2e`) boots the real server (temp SQLite, ephemeral config) + built dashboard via `vite preview` proxy: login errors, project create, ingest→issue→detail→resolve flows. CI runs it as a separate job with report artifacts. Fixed also: the server's `isMain` entry check now uses `pathToFileURL` (the old string comparison silently never matched on Windows).
 
 **Dashboard.** Per-release uploaded-map counts (eager ≤10 rows, lazy beyond); platform badges on issue list rows.
+
+---
+
+## 20. v0.5 addendum — fix dossier + silence detection
+
+The "exceptional" release: uh-oh becomes a deterministic fix-dossier substrate for agents (no LLM calls in the server) plus a dead-man's-switch for the fleet.
+
+**Source context.** At symbolication time, in-app frames that resolve `ok` against a map exposing `sourcesContent` gain `context: { pre, line, post }` (≤5 lines each side, right-trimmed, 300-char cap, tabs preserved; first 8 in-app frames per event). Stored inside `symbolications.resolved` (no migration), cached/invalidated with existing semantics, rendered as collapsible highlighted code frames in the dashboard.
+
+**Impact.** `GET /api/issues/:id/impact` → `{ distinctUsers (null when unknowable), topDevices, topOs, releases, platforms }` (top-5s, deterministic ordering) — indexed JSON1 aggregates, no new tables. Dashboard shows an Impact panel on issue detail.
+
+**Issue bundle.** `GET /api/issues/:id/bundle` — project + issue + impact + symbolicated latest event (with source context) + last-20 breadcrumbs + ≤3 recent-event summaries + symbol availability, deterministically truncated to 64KB (context lines first, then breadcrumbs; always-present `truncated` flags). MCP tools `get_issue_bundle` and `list_top_issues` (volume-ranked open+regressed across all projects, backed by `GET /api/top-issues`) in both backends, plus the `fix_crash` MCP prompt. One tool call = everything an agent needs to fix a crash.
+
+**Monitors.** `POST /ingest/:publicKey/check-in/:slug[?intervalMinutes=N]` (public-key auth, slug `[a-z0-9-]{1,64}`, per-(key,slug) token bucket, 202 `{monitorId}`). First ping auto-creates (interval required; grace `max(5, ceil(interval/4))`); later pings bump `lastCheckInAt` and recover `missed→ok` with a `monitor.recovered` webhook. A 60s in-process sweep flips overdue monitors to `missed` and fires `monitor.missed` once per episode (status transition = dedupe) through the normal dispatcher — migration 0005 creates `monitors` and rebuilds `webhook_dispatches` with nullable `issue_id`/`event_id` + `monitor_id`. JWT CRUD under `/api/projects/:id/monitors` + `/api/monitors/:id`; MCP `list_monitors`; metric `uh_oh_monitor_missed_total`. Dashboard: Monitors section on the project page (status pills, overdue chip, pause/edit/delete, empty state showing the project's real check-in URL).
+
+**Client.** `@uh-oh/js` 0.4.0 adds `checkIn(slug, { intervalMinutes? })` — fire-and-forget, single attempt, no spooling, never throws, silent no-op without a DSN. Copy-paste consumer snippets (Next.js worker, Apps Script sender, curl-for-cron) live in `docs/check-ins.md`.

@@ -8,12 +8,17 @@ import {
   type EventRecord,
   type HealthReport,
   type Issue,
+  type IssueBundle,
   type IssueDetail,
   type IssueStatus,
   type ListIssuesInput,
+  type ListMonitorsInput,
+  type ListTopIssuesInput,
+  type Monitor,
   type Project,
   type Release,
   type ResolvedFrame,
+  type TopIssue,
   type UhOhBackend,
   type UpdateProjectInput,
 } from './backend.js';
@@ -109,6 +114,90 @@ const BREADCRUMBS: BreadcrumbRecord[] = Array.from({ length: 25 }, (_, i) => ({
   message: `step ${i}`,
   data: i === 24 ? JSON.stringify({ to: 'checkout' }) : null,
 }));
+
+const BUNDLE: IssueBundle = {
+  project: { id: 'p1', name: 'My App', slug: 'my-app' },
+  issue: {
+    id: 'i1',
+    title: 'TypeError: boom',
+    fingerprint: 'fp',
+    platform: 'android',
+    status: 'open',
+    firstSeen: 1_700_000_050_000,
+    lastSeen: 1_700_000_100_000,
+    eventCount: 3,
+  },
+  impact: {
+    distinctUsers: 2,
+    topDevices: [{ model: 'Pixel', events: 3 }],
+    topOs: [{ os: 'Android 14', events: 3 }],
+    releases: [{ release: '1.2.3+45', events: 3 }],
+    platforms: [{ platform: 'android', events: 3 }],
+  },
+  latestEvent: {
+    id: 'e1',
+    receivedAt: 1_700_000_100_000,
+    level: 'error',
+    platform: 'android',
+    release: '1.2.3+45',
+    exception: { type: 'TypeError', value: 'boom', mechanism: 'js-global' },
+    frames: [
+      {
+        function: 'render',
+        filename: 'src/App.tsx',
+        lineno: 42,
+        status: 'ok',
+        context: { pre: ['const x = 1;'], line: 'render();', post: ['return x;'] },
+      },
+    ],
+    breadcrumbs: [{ ts: 1_700_000_099_000, category: 'nav', level: 'info', message: 'home' }],
+  },
+  recentEvents: [
+    {
+      id: 'e1',
+      receivedAt: 1_700_000_100_000,
+      level: 'error',
+      platform: 'android',
+      release: '1.2.3+45',
+    },
+  ],
+  symbols: {
+    releaseId: 'r1',
+    platform: 'android',
+    mappingUploaded: true,
+    sourcemapUploaded: false,
+    maps: { web: 0, node: 0 },
+  },
+  truncated: { context: false, breadcrumbs: false },
+};
+
+const TOP_ISSUE: TopIssue = {
+  issueId: 'i1',
+  title: 'TypeError: boom',
+  status: 'open',
+  platform: 'android',
+  projectId: 'p1',
+  projectSlug: 'my-app',
+  projectName: 'My App',
+  windowEvents: 5,
+  eventCount: 12,
+  firstSeen: 1_700_000_050_000,
+  lastSeen: 1_700_000_100_000,
+};
+
+const MONITOR: Monitor = {
+  id: 'm1',
+  projectId: 'p1',
+  projectSlug: 'my-app',
+  slug: 'nightly',
+  name: 'Nightly',
+  intervalMinutes: 60,
+  graceMinutes: 15,
+  status: 'ok',
+  lastCheckInAt: 1_700_000_000_000,
+  createdAt: 1_699_000_000_000,
+  overdue: false,
+};
 
 // ── Fake backend ──────────────────────────────────────────────────────────────
 
@@ -227,6 +316,21 @@ class FakeBackend implements UhOhBackend {
       webhookFailures: 1,
     });
   }
+
+  getIssueBundle(input: { issueId: string }): Promise<IssueBundle | null> {
+    this.rec('getIssueBundle', input);
+    return Promise.resolve(input.issueId === 'i1' ? { ...BUNDLE } : null);
+  }
+
+  listTopIssues(input: ListTopIssuesInput): Promise<TopIssue[]> {
+    this.rec('listTopIssues', input);
+    return Promise.resolve([{ ...TOP_ISSUE }]);
+  }
+
+  listMonitors(input: ListMonitorsInput): Promise<Monitor[]> {
+    this.rec('listMonitors', input);
+    return Promise.resolve([{ ...MONITOR }]);
+  }
 }
 
 // ── Harness ───────────────────────────────────────────────────────────────────
@@ -270,7 +374,7 @@ beforeEach(async () => {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('tool registry', () => {
-  it('registers all ten tools exactly once', async () => {
+  it('registers all thirteen tools exactly once', async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(
@@ -278,11 +382,14 @@ describe('tool registry', () => {
         'create_project',
         'get_event',
         'get_issue',
+        'get_issue_bundle',
         'get_server_health',
         'list_issue_events',
         'list_issues',
+        'list_monitors',
         'list_projects',
         'list_releases',
+        'list_top_issues',
         'set_issue_status',
         'update_project',
       ].sort(),
@@ -560,5 +667,71 @@ describe('input validation', () => {
   it('rejects set_issue_status with an invalid status', async () => {
     const { isError } = await call(client, 'set_issue_status', { issueId: 'i1', status: 'nope' });
     expect(isError).toBe(true);
+  });
+});
+
+describe('bundle / top-issues / monitors (v0.5)', () => {
+  it('get_issue_bundle returns the bundle verbatim', async () => {
+    const { isError, data } = await call(client, 'get_issue_bundle', { issueId: 'i1' });
+    expect(isError).toBe(false);
+    expect((data['issue'] as Record<string, unknown>)['id']).toBe('i1');
+    expect(data['truncated']).toEqual({ context: false, breadcrumbs: false });
+    const frames = (data['latestEvent'] as Record<string, unknown>)['frames'] as Record<
+      string,
+      unknown
+    >[];
+    expect(frames[0]?.['context']).toMatchObject({ line: 'render();' });
+  });
+
+  it('get_issue_bundle is a not_found tool error for a missing issue', async () => {
+    const { isError, text } = await call(client, 'get_issue_bundle', { issueId: 'ghost' });
+    expect(isError).toBe(true);
+    expect(text).toContain('not_found');
+  });
+
+  it('list_top_issues forwards limit/days and renders ISO timestamps', async () => {
+    const { isError, data } = await call(client, 'list_top_issues', { limit: 5, days: 7 });
+    expect(isError).toBe(false);
+    expect(backend.last('listTopIssues')).toEqual({ limit: 5, days: 7 });
+    const issues = data['issues'] as Record<string, unknown>[];
+    expect(issues[0]).toMatchObject({ issueId: 'i1', projectSlug: 'my-app', windowEvents: 5 });
+    expect(issues[0]?.['lastSeen']).toBe('2023-11-14T22:15:00.000Z');
+  });
+
+  it('list_top_issues applies defaults', async () => {
+    await call(client, 'list_top_issues');
+    expect(backend.last('listTopIssues')).toEqual({ limit: 10, days: 14 });
+  });
+
+  it('list_monitors resolves an optional project ref to an id', async () => {
+    const { isError, data } = await call(client, 'list_monitors', { project: 'my-app' });
+    expect(isError).toBe(false);
+    expect(backend.last('listMonitors')).toEqual({ projectId: 'p1' });
+    const monitors = data['monitors'] as Record<string, unknown>[];
+    expect(monitors[0]).toMatchObject({ slug: 'nightly', projectSlug: 'my-app', overdue: false });
+    expect(monitors[0]?.['lastCheckInAt']).toBe('2023-11-14T22:13:20.000Z');
+  });
+
+  it('list_monitors with no project lists across all projects', async () => {
+    const { isError } = await call(client, 'list_monitors');
+    expect(isError).toBe(false);
+    expect(backend.last('listMonitors')).toEqual({});
+  });
+
+  it('list_monitors on an unknown project ref is a tool error', async () => {
+    const { isError, text } = await call(client, 'list_monitors', { project: 'nope' });
+    expect(isError).toBe(true);
+    expect(text).toContain('project_not_found');
+  });
+});
+
+describe('fix_crash prompt', () => {
+  it('is registered and renders imperative text referencing the issue', async () => {
+    const { prompts } = await client.listPrompts();
+    expect(prompts.map((p) => p.name)).toContain('fix_crash');
+    const got = await client.getPrompt({ name: 'fix_crash', arguments: { issueId: 'i1' } });
+    const text = (got.messages[0]?.content as { type: string; text: string }).text;
+    expect(text).toContain('get_issue_bundle');
+    expect(text).toContain('i1');
   });
 });

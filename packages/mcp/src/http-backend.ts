@@ -14,12 +14,17 @@ import {
   type EventRecord,
   type HealthReport,
   type Issue,
+  type IssueBundle,
   type IssueDetail,
   type IssueStatus,
   type ListIssuesInput,
+  type ListMonitorsInput,
+  type ListTopIssuesInput,
+  type Monitor,
   type Project,
   type Release,
   type ResolvedFrame,
+  type TopIssue,
   type UhOhBackend,
   type UpdateProjectInput,
 } from './backend.js';
@@ -268,6 +273,44 @@ export class HttpBackend implements UhOhBackend {
       `/api/projects/${encodeURIComponent(input.projectId)}/releases`,
     )) as { releases: Release[] };
     return body.releases;
+  }
+
+  async getIssueBundle(input: { issueId: string }): Promise<IssueBundle | null> {
+    return (await this.apiOrNull(
+      'GET',
+      `/api/issues/${encodeURIComponent(input.issueId)}/bundle`,
+    )) as IssueBundle | null;
+  }
+
+  async listTopIssues(input: ListTopIssuesInput): Promise<TopIssue[]> {
+    const qs = new URLSearchParams({ limit: String(input.limit), days: String(input.days) });
+    const body = (await this.api('GET', `/api/top-issues?${qs.toString()}`)) as {
+      issues: TopIssue[];
+    };
+    return body.issues;
+  }
+
+  async listMonitors(input: ListMonitorsInput): Promise<Monitor[]> {
+    // One project → its monitors route directly. No project → fan out across all
+    // projects (mirrors how getIssue composes getEvent). The per-project route
+    // returns rows already carrying projectSlug + overdue.
+    if (input.projectId !== undefined) {
+      const body = (await this.api(
+        'GET',
+        `/api/projects/${encodeURIComponent(input.projectId)}/monitors`,
+      )) as { monitors: Monitor[] };
+      return body.monitors;
+    }
+    const projects = await this.listProjects();
+    const all: Monitor[] = [];
+    for (const p of projects) {
+      const body = (await this.api(
+        'GET',
+        `/api/projects/${encodeURIComponent(p.id)}/monitors`,
+      )) as { monitors: Monitor[] };
+      all.push(...body.monitors);
+    }
+    return all;
   }
 
   async getHealth(): Promise<HealthReport> {

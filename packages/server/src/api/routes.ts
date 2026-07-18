@@ -11,12 +11,24 @@ import {
   rotateProjectPublicKey,
   updateProject,
 } from '../db/repos/projects.js';
+import { computeImpact } from '../db/repos/impact.js';
+import { topIssues } from '../db/repos/top-issues.js';
 import type { Db } from '../db/index.js';
 import { buildAuthMiddleware } from '../auth/middleware.js';
 import { buildUploadAuthMiddleware } from '../auth/symbol-token.js';
 import { symbolicateEvent } from '../symbolication/symbolicate.js';
+import { buildIssueBundle } from './bundle.js';
 import { validateWebhookUrl } from '../webhooks/url-guard.js';
 import { clampDays, issueStats, projectStats } from '../db/repos/stats.js';
+
+// list_top_issues bounds (mirrored by the MCP tool schema).
+const MAX_TOP_ISSUES = 25;
+const MAX_TOP_DAYS = 30;
+const clampInt = (raw: unknown, min: number, max: number, dflt: number): number => {
+  const n = typeof raw === 'number' ? raw : Number(raw);
+  if (!Number.isFinite(n)) return dflt;
+  return Math.max(min, Math.min(max, Math.floor(n)));
+};
 
 // User-settable statuses (PATCH). 'regressed' is system-set by ingest and is
 // intentionally NOT accepted from users.
@@ -218,6 +230,35 @@ export const registerApiRoutes = (
       const issue = getIssue(db, req.params.id);
       if (!issue) return reply.code(404).send({ error: 'not_found' });
       return issueStats(db, issue.id, clampDays(req.query.days));
+    },
+  );
+
+  // CONTRACT I — issue impact roll-up.
+  app.get<{ Params: { id: string } }>('/api/issues/:id/impact', { preHandler }, (req, reply) => {
+    const issue = getIssue(db, req.params.id);
+    if (!issue) return reply.code(404).send({ error: 'not_found' });
+    return computeImpact(db, issue.id);
+  });
+
+  // CONTRACT B — the full fix-dossier bundle (size-bounded server-side).
+  app.get<{ Params: { id: string } }>(
+    '/api/issues/:id/bundle',
+    { preHandler },
+    async (req, reply) => {
+      const bundle = await buildIssueBundle(db, req.params.id);
+      if (!bundle) return reply.code(404).send({ error: 'not_found' });
+      return bundle;
+    },
+  );
+
+  // Open/regressed issues across ALL projects, ranked by windowed event volume.
+  app.get<{ Querystring: { limit?: string; days?: string } }>(
+    '/api/top-issues',
+    { preHandler },
+    (req) => {
+      const limit = clampInt(req.query.limit, 1, MAX_TOP_ISSUES, MAX_TOP_ISSUES);
+      const days = clampInt(req.query.days, 1, MAX_TOP_DAYS, 14);
+      return { issues: topIssues(db, { limit, days }) };
     },
   );
 

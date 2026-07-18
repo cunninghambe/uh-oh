@@ -3,6 +3,8 @@ import { Link, useParams } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 
 import { api, type Breadcrumb, type Issue as IssueT, type ResolvedFrame } from '../api.js';
+import { CodeContext } from '../components/CodeContext.js';
+import { ImpactPanel } from '../components/ImpactPanel.js';
 import { PlatformBadge } from '../components/PlatformBadge.js';
 import { RegressedBadge } from '../components/RegressedBadge.js';
 import { Sparkline } from '../components/Sparkline.js';
@@ -54,17 +56,23 @@ const renderSymbolicatedFrame = (rawFrame: StackFrame, resolved: ResolvedFrame, 
   return (
     <div
       key={idx}
-      className={`px-3 py-1.5 font-mono text-xs border-l-2 ${
+      className={`border-l-2 ${
         rawFrame.inApp ? 'border-amber-500 bg-zinc-900' : 'border-transparent text-zinc-500'
       }`}
     >
-      <span className="text-zinc-300">{fn}</span>
-      <span className="text-zinc-500"> at </span>
-      <span className="text-zinc-400">
-        {location}
-        {pos}
-      </span>
-      {badge && <span className="ml-2 text-zinc-600 text-xs">{badge}</span>}
+      <div className="px-3 py-1.5 font-mono text-xs">
+        <span className="text-zinc-300">{fn}</span>
+        <span className="text-zinc-500"> at </span>
+        <span className="text-zinc-400">
+          {location}
+          {pos}
+        </span>
+        {badge && <span className="ml-2 text-zinc-600 text-xs">{badge}</span>}
+      </div>
+      {/* v0.5 CONTRACT S: absent whenever the server couldn't attach source context (older
+          build, out-of-app frame, no source map, beyond the first-8-in-app cap, etc.) — the
+          frame above renders identically to pre-v0.5 either way. */}
+      {resolved.context && <CodeContext context={resolved.context} lineno={resolved.lineno} />}
     </div>
   );
 };
@@ -132,6 +140,14 @@ export const Issue = () => {
   const statsQ = useQuery({
     queryKey: ['issue-stats', issueId],
     queryFn: () => api.getIssueStats(issueId, 14),
+    retry: false,
+  });
+
+  // v0.5 CONTRACT I: server agent work landing concurrently, may 404 until it does. Same
+  // degrade-gracefully rule as statsQ above — isError just means "hide the Impact panel".
+  const impactQ = useQuery({
+    queryKey: ['issue-impact', issueId],
+    queryFn: () => api.getIssueImpact(issueId),
     retry: false,
   });
 
@@ -234,6 +250,10 @@ export const Issue = () => {
           )}
         </div>
       </div>
+
+      {/* v0.5 CONTRACT I: renders nothing itself (impactQ.data undefined, or an empty payload)
+          if the impact endpoint 404s or the issue genuinely has no impact data yet. */}
+      {impactQ.data && <ImpactPanel impact={impactQ.data} />}
 
       <section>
         <div className="flex items-center justify-between mb-2">

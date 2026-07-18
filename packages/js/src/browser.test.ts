@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { EventEnvelopeSchema } from '@uh-oh/types';
 
 import { Client } from './uh-oh-client.js';
-import { fakeNavigator, fakeStorage, fakeWindow, mockFetch } from './test-support.js';
+import { fakeNavigator, fakeStorage, fakeWindow, mockFetch, mockRawFetch } from './test-support.js';
 
 const DSN = 'https://pk@errors.example.com';
 const SPOOL_KEY = 'uh-oh:spool';
@@ -89,6 +89,22 @@ describe('browser handlers', () => {
     const c = browserClient({ fetchFn: f.fn });
     c.captureException(new Error('x'));
     await c.flush();
+    expect(f.calls[0]?.init.keepalive).toBe(true);
+    c.close();
+  });
+});
+
+describe('browser checkIn', () => {
+  it('posts to the check-in url with keepalive:true and method POST', async () => {
+    const f = mockRawFetch();
+    const c = browserClient({ fetchFn: f.fn });
+    c.checkIn('nightly-backup', { intervalMinutes: 15 });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(f.calls).toHaveLength(1);
+    expect(f.calls[0]?.url).toBe(
+      'https://errors.example.com/ingest/pk/check-in/nightly-backup?intervalMinutes=15',
+    );
+    expect(f.calls[0]?.init.method).toBe('POST');
     expect(f.calls[0]?.init.keepalive).toBe(true);
     c.close();
   });

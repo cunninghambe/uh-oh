@@ -51,6 +51,35 @@ export function mockFetch(script: FetchStep[] = []): MockFetch {
   return { fn, calls };
 }
 
+export interface RawFetchCall {
+  url: string;
+  init: FetchInitShape;
+}
+
+export interface MockRawFetch {
+  fn: (url: string, init: FetchInitShape) => Promise<{ ok: boolean; status: number }>;
+  calls: RawFetchCall[];
+}
+
+/**
+ * A fetch stub for endpoints with no JSON body (e.g. checkIn pings, whose
+ * body is the empty string). Behaves like `mockFetch` but records calls
+ * verbatim instead of parsing `init.body` as an envelope.
+ */
+export function mockRawFetch(script: FetchStep[] = []): MockRawFetch {
+  const calls: RawFetchCall[] = [];
+  const last = script.length > 0 ? script[script.length - 1] : undefined;
+  let i = 0;
+  const fn = (url: string, init: FetchInitShape): Promise<{ ok: boolean; status: number }> => {
+    calls.push({ url, init });
+    const step = script[i] ?? last ?? {};
+    i += 1;
+    if (step.reject) return Promise.reject(new Error('network down'));
+    return Promise.resolve({ ok: step.ok ?? true, status: step.status ?? 202 });
+  };
+  return { fn, calls };
+}
+
 export interface FakeStorage {
   storage: {
     getItem: (k: string) => string | null;

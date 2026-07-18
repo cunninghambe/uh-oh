@@ -22,6 +22,7 @@ import {
   readWebSymbolMap,
   type WebPlatform,
 } from './web-symbols.js';
+import { extractContext, MAX_CONTEXT_FRAMES, type SourceContext } from './source-context.js';
 
 export type SymbolicationStatus =
   | 'ok'
@@ -36,9 +37,25 @@ export type ResolvedFrame = {
   filename?: string;
   lineno?: number;
   status: SymbolicationStatus;
+  // CONTRACT S: surrounding source lines, present only for the first few in-app
+  // frames whose map embeds the original source. Absent otherwise.
+  context?: SourceContext;
 };
 
 type Consumer = BasicSourceMapConsumer | IndexedSourceMapConsumer;
+
+/**
+ * Source context for a freshly-resolved frame, or null when it isn't applicable
+ * (frame didn't resolve, or the map has no embedded content for the source).
+ * `resolved.filename` is the original source and `resolved.lineno` its 1-indexed
+ * line whenever status is 'ok'.
+ */
+const contextForResolved = (consumer: Consumer, resolved: ResolvedFrame): SourceContext | null => {
+  if (resolved.status !== 'ok') return null;
+  const { filename, lineno } = resolved;
+  if (typeof filename !== 'string' || typeof lineno !== 'number') return null;
+  return extractContext(consumer, filename, lineno);
+};
 
 const JS_EXTENSIONS_RE = /\.(js|jsx|ts|tsx)$/;
 const BUNDLE_NAME_RE = /^index\.android\.bundle$/;
@@ -245,6 +262,8 @@ const symbolicateWebFrames = async (
 
   const results: ResolvedFrame[] = [];
   const toPersist: Array<{ idx: number; resolved: ResolvedFrame }> = [];
+  // Bound how many in-app frames carry source context (CONTRACT S).
+  let inAppContext = 0;
 
   for (let i = 0; i < frames.length; i++) {
     const hit = cached.get(i);
@@ -269,10 +288,18 @@ const symbolicateWebFrames = async (
       resolved = buildWebPassthrough(frame, 'no_symbols');
     } else {
       const state = await stateFor(matched);
-      resolved =
-        state.kind === 'corrupt'
-          ? buildWebPassthrough(frame, 'corrupt_sourcemap')
-          : buildWebResolvedFrame(frame, state.consumer);
+      if (state.kind === 'corrupt') {
+        resolved = buildWebPassthrough(frame, 'corrupt_sourcemap');
+      } else {
+        resolved = buildWebResolvedFrame(frame, state.consumer);
+        if (frame.inApp) {
+          if (inAppContext < MAX_CONTEXT_FRAMES) {
+            const ctx = contextForResolved(state.consumer, resolved);
+            if (ctx) resolved = { ...resolved, context: ctx };
+          }
+          inAppContext++;
+        }
+      }
     }
     results.push(resolved);
     toPersist.push({ idx: i, resolved });
@@ -358,6 +385,8 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
 
   const results: ResolvedFrame[] = [];
   const toPersist: Array<{ idx: number; resolved: ResolvedFrame }> = [];
+  // Bound how many in-app frames carry source context (CONTRACT S).
+  let inAppContext = 0;
 
   for (let i = 0; i < frames.length; i++) {
     const hit = cached.get(i);
@@ -372,9 +401,20 @@ export const symbolicateEvent = async (db: Db, eventId: string): Promise<Resolve
       continue;
     }
 
-    const resolved = isJsFrame(frame)
+    let resolved = isJsFrame(frame)
       ? buildJsFrame(frame, jsConsumerState)
       : buildAndroidFrame(frame, proguardMapping, mappingCorrupt);
+
+    // Attach source context for in-app JS frames when a real consumer resolved
+    // them (Hermes single-map path). `jsConsumerState` is a Consumer object only
+    // when a source map was loaded successfully.
+    if (frame.inApp && typeof jsConsumerState === 'object') {
+      if (inAppContext < MAX_CONTEXT_FRAMES) {
+        const ctx = contextForResolved(jsConsumerState, resolved);
+        if (ctx) resolved = { ...resolved, context: ctx };
+      }
+      inAppContext++;
+    }
 
     results.push(resolved);
     toPersist.push({ idx: i, resolved });

@@ -28,6 +28,12 @@ export const metrics = {
     registers: [registry],
   }),
 
+  monitorMissed: new Counter({
+    name: 'uh_oh_monitor_missed_total',
+    help: 'Total monitor miss episodes (ok -> missed transitions)',
+    registers: [registry],
+  }),
+
   requestDuration: new Histogram({
     name: 'uh_oh_request_duration_seconds',
     help: 'HTTP request duration',

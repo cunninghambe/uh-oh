@@ -128,6 +128,15 @@ export interface CaptureOptions {
   mechanism?: Mechanism;
 }
 
+export interface CheckInOptions {
+  /**
+   * Minutes between expected check-ins. Required by the server on a
+   * monitor's first-ever ping (it 400s without it); optional on later pings
+   * (omit to leave the monitor's configured interval unchanged).
+   */
+  intervalMinutes?: number;
+}
+
 export interface BreadcrumbInput {
   category: string;
   message: string;
@@ -280,7 +289,7 @@ export interface ClientDeps {
 // ---------------------------------------------------------------------------
 
 const SDK_NAME = '@uh-oh/js';
-const SDK_VERSION = '0.3.0';
+const SDK_VERSION = '0.4.0';
 const SPOOL_KEY = 'uh-oh:spool';
 const SPOOL_FILE = 'uh-oh-spool.json';
 const SPOOL_DEBOUNCE_MS = 1_000;
@@ -295,6 +304,7 @@ const TYPE_MAX = 256;
 const VALUE_MAX = 4096;
 const CATEGORY_MAX = 64;
 const MESSAGE_MAX = 1024;
+const SLUG_RE = /^[a-z0-9-]{1,64}$/;
 
 const G: GlobalScope = globalThis as unknown as GlobalScope;
 
@@ -909,6 +919,75 @@ export class Client {
     this.fingerprint = parts;
   }
 
+  // ---- check-in (dead-man's-switch monitors) ------------------------------
+
+  /**
+   * Fire-and-forget check-in ping for a named monitor. One attempt only -
+   * never queued, spooled, or retried, since a late check-in is worthless.
+   * Silent no-op when uninitialised/no dsn; an invalid slug is dropped (debug
+   * log only). Never throws. No re-entrancy guard needed: unlike capture,
+   * this has no pipeline for a failure to loop back through.
+   */
+  checkIn(slug: string, opts?: CheckInOptions): void {
+    if (this.noop || this.closed) return;
+    try {
+      const dsn = this.dsn;
+      const fetchFn = this.fetchFn;
+      if (!dsn || !fetchFn) return;
+      if (typeof slug !== 'string' || !SLUG_RE.test(slug)) {
+        this.log('debug', `checkIn: invalid slug ${JSON.stringify(safeStr(slug, 80))}; dropped`);
+        return;
+      }
+      let url = `${dsn.ingestUrl}/check-in/${slug}`;
+      const interval = opts?.intervalMinutes;
+      if (typeof interval === 'number' && Number.isFinite(interval) && interval > 0) {
+        url += `?intervalMinutes=${String(Math.floor(interval))}`;
+      }
+      void this.sendCheckIn(url);
+    } catch (e) {
+      this.log('debug', 'checkIn failed internally', e);
+    }
+  }
+
+  /**
+   * Single-attempt POST for a check-in ping. Swallows every failure (network
+   * error, timeout, non-2xx) - there is no queue or retry timer for check-ins.
+   */
+  private async sendCheckIn(url: string): Promise<void> {
+    const fetchFn = this.fetchFn;
+    if (!fetchFn) return;
+    let controller: AbortControllerLike | undefined;
+    try {
+      const Ctor = G.AbortController;
+      if (Ctor) controller = new Ctor();
+    } catch {
+      controller = undefined;
+    }
+    const timer = controller
+      ? this.setTimeoutFn(() => {
+          try {
+            controller?.abort();
+          } catch {
+            // ignore
+          }
+        }, SEND_TIMEOUT_MS)
+      : null;
+    try {
+      const init: FetchInit = {
+        method: 'POST',
+        headers: {},
+        body: '',
+        ...(this.runtime === 'browser' ? { keepalive: true } : {}),
+        ...(controller ? { signal: controller.signal } : {}),
+      };
+      await fetchFn(url, init);
+    } catch {
+      // one attempt only - never retried, never throws
+    } finally {
+      if (timer !== null) this.clearTimeoutFn(timer);
+    }
+  }
+
   // ---- queue + transport -------------------------------------------------
 
   private enqueue(env: EventEnvelope): void {
@@ -1433,6 +1512,14 @@ export function setTag(key: string, value: string | null): void {
 export function setFingerprint(parts: string[] | null): void {
   try {
     current?.setFingerprint(parts);
+  } catch {
+    // never throw
+  }
+}
+
+export function checkIn(slug: string, opts?: CheckInOptions): void {
+  try {
+    current?.checkIn(slug, opts);
   } catch {
     // never throw
   }

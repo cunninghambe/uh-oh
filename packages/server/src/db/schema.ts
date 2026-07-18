@@ -125,20 +125,47 @@ export const sessions = sqliteTable('sessions', {
   expiresAt: integer('expires_at').notNull(),
 });
 
+// Check-in monitors (dead-man's-switch, §CONTRACT M). A monitor is "ok" while it
+// keeps pinging within interval+grace; a 60s sweep flips overdue monitors to
+// "missed" (dispatching once); the next ping recovers it. "paused" opts out.
+export const monitors = sqliteTable(
+  'monitors',
+  {
+    id: text('id').primaryKey(),
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    // Unique per project; validated against `[a-z0-9-]{1,64}` at the route.
+    slug: text('slug').notNull(),
+    name: text('name'),
+    intervalMinutes: integer('interval_minutes').notNull(),
+    graceMinutes: integer('grace_minutes').notNull(),
+    status: text('status', { enum: ['ok', 'missed', 'paused'] })
+      .notNull()
+      .default('ok'),
+    lastCheckInAt: integer('last_check_in_at'),
+    createdAt: integer('created_at').notNull(),
+  },
+  (t) => [uniqueIndex('monitors_project_slug_uniq').on(t.projectId, t.slug)],
+);
+
 export const webhookDispatches = sqliteTable(
   'webhook_dispatches',
   {
     id: text('id').primaryKey(),
-    issueId: text('issue_id')
-      .notNull()
-      .references(() => issues.id, { onDelete: 'cascade' }),
-    eventId: text('event_id')
-      .notNull()
-      .references(() => events.id, { onDelete: 'cascade' }),
+    // Nullable since v0.5: monitor dispatches (monitor.missed / monitor.recovered)
+    // carry no issue/event, only a monitorId. Issue dispatches keep both set.
+    issueId: text('issue_id').references(() => issues.id, { onDelete: 'cascade' }),
+    eventId: text('event_id').references(() => events.id, { onDelete: 'cascade' }),
+    // Set only for monitor.* dispatches; null for issue.* dispatches.
+    monitorId: text('monitor_id').references(() => monitors.id, { onDelete: 'cascade' }),
     url: text('url').notNull(),
-    // Webhook body `type` — 'issue.new' (default, preserves existing rows) or
-    // 'issue.regressed' for the resolved->regressed transition dispatch.
-    type: text('type', { enum: ['issue.new', 'issue.regressed'] })
+    // Webhook body `type` — 'issue.new' (default, preserves existing rows),
+    // 'issue.regressed' for the resolved->regressed transition, or the v0.5
+    // monitor lifecycle types.
+    type: text('type', {
+      enum: ['issue.new', 'issue.regressed', 'monitor.missed', 'monitor.recovered'],
+    })
       .notNull()
       .default('issue.new'),
     attempt: integer('attempt').notNull().default(0),
@@ -166,3 +193,5 @@ export type SymbolicationRow = typeof symbolications.$inferSelect;
 export type SessionRow = typeof sessions.$inferSelect;
 export type WebhookDispatchRow = typeof webhookDispatches.$inferSelect;
 export type WebhookDispatchInsert = typeof webhookDispatches.$inferInsert;
+export type MonitorRow = typeof monitors.$inferSelect;
+export type MonitorInsert = typeof monitors.$inferInsert;

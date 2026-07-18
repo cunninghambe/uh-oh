@@ -3,13 +3,41 @@ import type { AddressInfo } from 'node:net';
 import { BackendError, HttpBackend } from '@uh-oh/mcp';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
+import type { EventEnvelope } from '@uh-oh/types';
+
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
+import { createMonitor } from '../db/repos/monitors.js';
 import { cleanupExpiredSessions } from '../db/repos/sessions.js';
+import { ingest } from '../ingest/ingest.js';
+import { createRateLimiter } from '../ingest/rate-limit.js';
 import type { ProjectRow } from '../db/schema.js';
 import { buildServer } from '../server.js';
 import { TEST_SECRET } from '../auth/test-utils.js';
+
+const ENVELOPE: EventEnvelope = {
+  sdk: { name: '@uh-oh/react-native', version: '0.1.0' },
+  timestamp: '2026-07-01T00:00:00.000Z',
+  platform: 'android',
+  release: { version: '1.0.0', build: '1' },
+  level: 'error',
+  exception: {
+    type: 'Error',
+    value: 'boom',
+    mechanism: 'js-global',
+    stacktrace: [{ module: 'A', function: 'f', inApp: true }],
+  },
+  breadcrumbs: [],
+  device: { osName: 'Android', osVersion: '14', deviceModel: 'Pixel' },
+};
+
+const seedIssue = (): string => {
+  const rl = createRateLimiter({ capacity: 10, refillPerSec: 1 });
+  const res = ingest({ db, rateLimiter: rl }, project.publicKey, ENVELOPE);
+  if (res.kind !== 'stored') throw new Error(`seed failed: ${res.kind}`);
+  return res.issueId;
+};
 
 const PASSWORD = 'test-password';
 
@@ -84,6 +112,39 @@ describe('HttpBackend against a live server', () => {
     expect(health.ok).toBe(true);
     expect(health.metricsAvailable).toBe(true);
     expect(typeof health.eventsIngested).toBe('number');
+  });
+
+  it('fetches an issue bundle (and maps a missing issue to null)', async () => {
+    const issueId = seedIssue();
+    const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+    const bundle = await backend.getIssueBundle({ issueId });
+    expect(bundle?.issue.id).toBe(issueId);
+    expect(bundle?.project.slug).toBe('my-app');
+    expect(bundle?.truncated).toEqual({ context: false, breadcrumbs: false });
+    expect(await backend.getIssueBundle({ issueId: 'missing' })).toBeNull();
+  });
+
+  it('lists top issues across projects', async () => {
+    const issueId = seedIssue();
+    const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+    const top = await backend.listTopIssues({ limit: 10, days: 14 });
+    expect(top[0]).toMatchObject({ issueId, projectSlug: 'my-app', platform: 'android' });
+  });
+
+  it('lists monitors globally and scoped to a project', async () => {
+    createMonitor(db, {
+      projectId: project.id,
+      slug: 'nightly',
+      intervalMinutes: 10,
+      graceMinutes: 5,
+      now: Date.now() - 60 * 60_000,
+    });
+    const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+    const all = await backend.listMonitors({});
+    expect(all).toHaveLength(1);
+    expect(all[0]).toMatchObject({ slug: 'nightly', projectSlug: 'my-app', overdue: true });
+    const scoped = await backend.listMonitors({ projectId: project.id });
+    expect(scoped).toHaveLength(1);
   });
 
   it('aborts a slow request via the AbortController timeout', async () => {

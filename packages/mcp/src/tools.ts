@@ -18,9 +18,11 @@ import {
   type EventRecord,
   type Issue,
   type ListIssuesInput,
+  type Monitor,
   type Project,
   type Release,
   type ResolvedFrame,
+  type TopIssue,
   type UhOhBackend,
   type UpdateProjectInput,
 } from './backend.js';
@@ -158,6 +160,34 @@ const formatBreadcrumbs = (
     ? { breadcrumbs, breadcrumbsTruncated: rows.length - cap }
     : { breadcrumbs };
 };
+
+const formatTopIssue = (t: TopIssue): Record<string, unknown> =>
+  clean({
+    issueId: t.issueId,
+    title: t.title,
+    status: t.status,
+    platform: t.platform,
+    projectSlug: t.projectSlug,
+    projectName: t.projectName,
+    windowEvents: t.windowEvents,
+    eventCount: t.eventCount,
+    firstSeen: toIso(t.firstSeen),
+    lastSeen: toIso(t.lastSeen),
+  });
+
+const formatMonitor = (m: Monitor): Record<string, unknown> =>
+  clean({
+    id: m.id,
+    projectSlug: m.projectSlug,
+    slug: m.slug,
+    name: m.name,
+    intervalMinutes: m.intervalMinutes,
+    graceMinutes: m.graceMinutes,
+    status: m.status,
+    overdue: m.overdue,
+    lastCheckInAt: toIso(m.lastCheckInAt),
+    createdAt: toIso(m.createdAt),
+  });
 
 const formatEventSummary = (e: EventRecord): Record<string, unknown> => {
   const env = parseEnvelope(e.payload);
@@ -485,6 +515,85 @@ export const registerUhOhTools = (server: McpServer, backend: UhOhBackend): void
           }),
         );
       }),
+  );
+
+  server.registerTool(
+    'get_issue_bundle',
+    {
+      title: 'Get issue bundle',
+      description:
+        'Fetch the complete fix-dossier for an issue in ONE call: project, issue, impact roll-up, the latest event fully symbolicated with source context and breadcrumbs, recent events, and symbol availability. Deterministic and size-bounded (~64KB); the `truncated` field flags any dropped context/breadcrumbs. Timestamps are epoch milliseconds.',
+      inputSchema: { issueId: z.string().min(1) },
+      annotations: READ,
+    },
+    (args) =>
+      run(async () => {
+        const bundle = await backend.getIssueBundle({ issueId: args.issueId });
+        if (!bundle) throw new BackendError('issue not found', { code: 'not_found', status: 404 });
+        return ok(bundle);
+      }),
+  );
+
+  server.registerTool(
+    'list_top_issues',
+    {
+      title: 'List top issues',
+      description:
+        'List open and regressed issues across ALL projects, ranked by event volume within the last N days. Each carries its project slug, platform, and windowed + all-time counts.',
+      inputSchema: {
+        limit: z.number().int().min(1).max(25).default(10),
+        days: z.number().int().min(1).max(30).default(14),
+      },
+      annotations: READ,
+    },
+    (args) =>
+      run(async () => {
+        const issues = await backend.listTopIssues({ limit: args.limit, days: args.days });
+        return ok({ issues: issues.map(formatTopIssue) });
+      }),
+  );
+
+  server.registerTool(
+    'list_monitors',
+    {
+      title: 'List monitors',
+      description:
+        'List check-in monitors, optionally scoped to one project (by id or slug). Each includes its cadence, status (ok, missed, or paused), last check-in, and a computed overdue flag.',
+      inputSchema: { project: z.string().min(1).optional() },
+      annotations: READ,
+    },
+    (args) =>
+      run(async () => {
+        const input =
+          args.project !== undefined
+            ? { projectId: await resolveProjectId(backend, args.project) }
+            : {};
+        const monitors = await backend.listMonitors(input);
+        return ok({ monitors: monitors.map(formatMonitor) });
+      }),
+  );
+
+  // Prompt: instruct an agent to pull the bundle and produce a fix. Kept short
+  // and imperative — the heavy lifting is the deterministic bundle behind it.
+  server.registerPrompt(
+    'fix_crash',
+    {
+      title: 'Fix a crash',
+      description:
+        'Diagnose and fix a specific uh-oh issue by pulling its bundle and patching the offending code.',
+      argsSchema: { issueId: z.string().min(1) },
+    },
+    ({ issueId }) => ({
+      messages: [
+        {
+          role: 'user',
+          content: {
+            type: 'text',
+            text: `Fix uh-oh issue ${issueId}. First call get_issue_bundle with issueId "${issueId}". Read the symbolicated stack frames, their source context, the breadcrumbs, and the impact to pinpoint the root cause. Then find the offending code in this repository and apply the smallest correct fix. Report the root cause, the exact frame(s) it maps to, and the change you made.`,
+          },
+        },
+      ],
+    }),
   );
 };
 
