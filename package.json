@@ -1,0 +1,26 @@
+{
+  "name": "@uh-oh/js",
+  "version": "0.5.0",
+  "description": "Lightweight self-hosted crash reporting client for browser JS and Node.",
+  "type": "module",
+  "main": "./dist/uh-oh-client.js",
+  "types": "./dist/uh-oh-client.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/uh-oh-client.d.ts",
+      "import": "./dist/uh-oh-client.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cunninghambe/uh-oh",
+    "directory": "packages/js"
+  },
+  "license": "MIT",
+  "private": false
+}
