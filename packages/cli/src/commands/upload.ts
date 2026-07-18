@@ -155,10 +155,12 @@ export const upload = async (
   }
 
   const form = new FormData();
-  // path.basename, not split('/').pop(): the latter passes a Windows path
-  // like "C:\Users\dev\mapping.txt" through unmangled since it has no "/",
-  // so the server would receive the whole path as the filename.
-  form.append('file', new Blob([fileBuffer]), path.basename(args.file) || 'file');
+  // path.win32.basename, not plain basename: the win32 parser treats BOTH
+  // separators as separators, so a Windows path like "C:\Users\dev\mapping.txt"
+  // reduces to its filename even when the CLI runs on POSIX (plain
+  // path.basename on Linux passes the whole string through, and
+  // split('/').pop() has the same failure).
+  form.append('file', new Blob([fileBuffer]), path.win32.basename(args.file) || 'file');
   form.append('platform', effectivePlatform);
   if (kind === 'sourcemap' && !args.platform) {
     // Legacy hermes flow (no --platform given): keep sending the sourcemap

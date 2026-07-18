@@ -31,6 +31,13 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Build all workspace packages before typechecking: cross-package type
+      # resolution (e.g. the server importing @uh-oh/types and @uh-oh/mcp, and
+      # the web e2e tsconfig reaching into server source) resolves against each
+      # package's built dist/, which exists locally but not on a fresh runner.
+      - name: Build packages
+        run: pnpm -r build
+
       - name: Typecheck
         run: pnpm typecheck
 
