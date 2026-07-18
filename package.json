@@ -1,0 +1,32 @@
+{
+  "name": "@uh-oh/mcp",
+  "version": "0.1.0",
+  "description": "MCP server and tool registry for uh-oh self-hosted crash reporting (stdio bin: uh-oh-mcp).",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "uh-oh-mcp": "./dist/stdio.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.4.3"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/cunninghambe/uh-oh",
+    "directory": "packages/mcp"
+  },
+  "license": "MIT",
+  "private": false
+}
