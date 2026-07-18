@@ -13,6 +13,7 @@ A single Node process + SQLite + a small React dashboard. Designed for anyone wh
 - Symbolicates Hermes JS and Android ProGuard stacks server-side, on demand (web/node frames render raw for now)
 - Single-user JWT-gated dashboard with project + issue + release + symbol-upload UIs
 - Fires a generic outbound webhook per project on new issues (wire it to Slack, Discord, email, whatever)
+- MCP-native: 10 tools (projects, issues, symbolicated events, status changes, health) via the `uh-oh-mcp` stdio bin or the JWT-gated `POST /mcp` Streamable-HTTP endpoint — triage crashes from Claude Code (see `SPEC.md` §17)
 - AsyncStorage-backed event spool on the RN SDK side — events survive offline-at-crash-time and crash-before-network
 
 ## What it does NOT do (intentionally)

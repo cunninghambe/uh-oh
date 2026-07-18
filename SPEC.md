@@ -340,6 +340,9 @@ POST   /api/releases/:id/symbols (multipart: file, platform, sourcemap?)
 
 GET    /healthz                                                  → { ok: true }                  [exists]
 GET    /metrics                                                  → Prometheus text format        [exists]
+
+POST   /mcp   (Authorization: Bearer <jwt>)                      → MCP Streamable HTTP, stateless [exists — §17]
+GET/DELETE /mcp                                                  → 405 (POST-only, stateless)     [exists — §17]
 ```
 
 Pagination note: the issues list is **offset-based** (`limit`/`offset`, response `{ issues, total }`); the per-issue events list accepts `page=` (1-indexed) per the original spec, plus `offset=` for symmetry. PATCH `webhookUrl` is SSRF-validated (see §2 Hardening) and returns 400 for private/loopback/metadata targets.
@@ -548,3 +551,29 @@ Shipped after the v0.1 robustness pass. Adds first-class `platform: 'web'` and `
 **Consumer conventions:** env vars `UH_OH_DSN` (server) / `NEXT_PUBLIC_UH_OH_DSN` (browser); Next.js apps wire via `instrumentation.ts` (`register()` guarded to the nodejs runtime + `onRequestError`), `instrumentation-client.ts`, and `app/global-error.tsx`.
 
 **Known v0.2 gaps:** no symbolication for web/node stacks (frames render raw; Node server stacks are usually readable anyway); no Node disk spool; symbol upload remains Android-only.
+
+---
+
+## 17. MCP addendum — `@uh-oh/mcp` + `/mcp` endpoint
+
+uh-oh is MCP-native: the same tool registry (defined once in `packages/mcp` against a `UhOhBackend` interface) is served two ways.
+
+**Tools (10):** `list_projects`, `create_project`, `update_project` (webhook URL passes SSRF validation), `list_issues` (project by id or slug; status/sort/pagination), `get_issue` (latest event + symbolicated frames + last-20 breadcrumbs), `list_issue_events`, `get_event` (symbolicated), `set_issue_status` (`open|resolved|ignored`), `list_releases`, `get_server_health` (healthz + parsed metrics subset). Read-only tools carry `readOnlyHint: true`; nothing is `destructiveHint`. Outputs are LLM-shaped: compact JSON, nulls dropped, ISO timestamps, frames reduced to `{ function, file, line, col, inApp, status }`, list caps ≤ 100.
+
+**Stdio (primary):** the `uh-oh-mcp` bin (HttpBackend over `/api/*`) — env `UH_OH_SERVER_URL` + `UH_OH_ADMIN_PASSWORD`, auto-login with one re-login on 401, all diagnostics on stderr, stdout reserved for the protocol.
+
+```
+claude mcp add uh-oh \
+  --env UH_OH_SERVER_URL=https://errors.example.com \
+  --env UH_OH_ADMIN_PASSWORD=<admin-password> \
+  -- uh-oh-mcp
+```
+
+**Streamable HTTP:** `POST /mcp` on the server itself (InProcessBackend, no HTTP hop), stateless with a fresh transport per request, gated by the same JWT middleware as `/api/*`; `GET`/`DELETE` → 405. nginx proxies `location = /mcp` (1 MB body cap). Because JWTs expire in 24h, stdio (auto-login) is the durable path; the HTTP form suits ad-hoc token-scoped access:
+
+```
+claude mcp add --transport http uh-oh-remote https://errors.example.com/mcp \
+  --header "Authorization: Bearer <jwt>"
+```
+
+**Distribution:** `mcp-dist` orphan branch (mirrors `sdk-dist`/`js-dist`), produced by `scripts/build-mcp-dist.mjs`; install via `pnpm add github:cunninghambe/uh-oh#mcp-dist`.

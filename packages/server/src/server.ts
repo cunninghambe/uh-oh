@@ -14,6 +14,8 @@ import { createIpRateLimiter } from './hardening/ip-rate-limit.js';
 import { securityHeadersHook } from './hardening/security-headers.js';
 import { registerMetricsRoute } from './metrics/route.js';
 import { metrics } from './metrics/registry.js';
+import { registerMcpRoute } from './mcp/route.js';
+import { InProcessBackend } from './mcp/in-process-backend.js';
 
 export type ServerDeps = {
   db: Db;
@@ -143,6 +145,9 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
     deps.maxSymbolBytes ?? DEFAULT_MAX_SYMBOL_BYTES,
   );
   registerMetricsRoute(app);
+  // MCP (Streamable HTTP) over the same tool registry the stdio bin uses,
+  // backed by an in-process backend (no HTTP hop). JWT-gated like /api/*.
+  registerMcpRoute(app, deps.db, deps.secret, new InProcessBackend(deps.db));
 
   app.setErrorHandler((err: FastifyError, _req, reply) => {
     const status = err.statusCode ?? 500;

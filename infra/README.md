@@ -345,6 +345,7 @@ ls /etc/letsencrypt/renewal-hooks/deploy/
 - `/ingest/` rate-limited to 50 req/sec per IP (burst 100, `nodelay`) — deliberately generous; a crash storm (many devices hitting the same bug at once) is legitimate traffic, this is just a ceiling.
 - `/ingest/` body cap `client_max_body_size 1m` (crash envelopes are small JSON, not file uploads); `/api/` keeps the server-wide `client_max_body_size 50m` for symbol uploads.
 - `/api/` and `/ingest/` (and `/api/auth/login`) reverse-proxied to `127.0.0.1:3300`.
+- `/mcp` (exact match) reverse-proxied to `127.0.0.1:3300` — the JWT-gated MCP Streamable-HTTP endpoint, body capped at `client_max_body_size 1m` (JSON-RPC envelopes are small; the 50m `/api/` cap is only for symbol uploads).
 - `/healthz` proxied, access log suppressed.
 - `/metrics` restricted to `127.0.0.1` (deny all external access) — scrape it locally on the box, or via an SSH tunnel (`ssh -L 9090:127.0.0.1:443 <host>` then hit `https://127.0.0.1:9090/metrics` with the `Host` header set, or simpler: `ssh <host> curl -s https://127.0.0.1/metrics -k -H 'Host: <domain>'`).
 - gzip for `text/plain`, `text/css`, `text/javascript`, `application/javascript`, `application/json`, `image/svg+xml`.

@@ -47,7 +47,7 @@ jobs:
         run: pnpm --filter @uh-oh/web build
 
       - name: Unit test scripts/ (node:test — no vitest dep at the repo root)
-        run: node --test scripts/build-sdk-dist.test.mjs scripts/vendor-js-client.test.mjs scripts/build-js-dist.test.mjs
+        run: node --test scripts/build-sdk-dist.test.mjs scripts/vendor-js-client.test.mjs scripts/build-js-dist.test.mjs scripts/build-mcp-dist.test.mjs
 
       # shellcheck ships preinstalled on the ubuntu-latest runner image, but
       # install explicitly anyway so this step doesn't silently start
