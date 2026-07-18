@@ -19,7 +19,11 @@ import { registerMetricsRoute } from './metrics/route.js';
 import { metrics } from './metrics/registry.js';
 import { registerMcpRoute } from './mcp/route.js';
 import { InProcessBackend } from './mcp/in-process-backend.js';
-import { MIN_SYMBOL_TOKEN_LENGTH } from './auth/symbol-token.js';
+import {
+  MIN_SYMBOL_TOKEN_LENGTH,
+  SYMBOL_TOKEN_HEADER,
+  symbolTokenMatches,
+} from './auth/symbol-token.js';
 
 export type ServerDeps = {
   db: Db;
@@ -108,6 +112,17 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
 
   app.addHook('onRequest', async (req, reply) => {
     if (SKIP_IP_RATE_LIMIT.has(req.url)) return;
+    // Requests presenting a VALID symbol-upload token bypass the per-IP limiter:
+    // deploy pipelines legitimately fire hundreds of sequential map uploads in
+    // seconds, which would exhaust a per-minute IP budget (seen in production on
+    // the first real deploys). The token is a secret, constant-time compared, so
+    // this is an authenticated bulk lane, not an anonymous bypass.
+    if (deps.symbolToken) {
+      const provided = req.headers[SYMBOL_TOKEN_HEADER];
+      if (typeof provided === 'string' && symbolTokenMatches(provided, deps.symbolToken)) {
+        return;
+      }
+    }
     if (!ipLimiter.consume(req.ip, Date.now())) {
       return reply.code(429).header('Retry-After', '60').send({ error: 'rate_limit_exceeded' });
     }

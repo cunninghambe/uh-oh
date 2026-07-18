@@ -180,6 +180,12 @@ async function upsertRelease(serverBase, token, projectId, version, build, platf
   return data.release.id;
 }
 
+function sleep(ms) {
+  return new Promise(function (r) {
+    setTimeout(r, ms);
+  });
+}
+
 async function uploadOne(serverBase, token, releaseId, item) {
   const form = new FormData();
   const buf = readFileSync(item.absPath);
@@ -191,12 +197,20 @@ async function uploadOne(serverBase, token, releaseId, item) {
   form.append('file', new Blob([buf]), basename(item.absPath));
   const headers = {};
   headers[TOKEN_HEADER] = token;
-  const res = await fetch(serverBase + '/api/releases/' + releaseId + '/symbols', {
-    method: 'POST',
-    headers: headers,
-    body: form,
-  });
-  return res.ok;
+  // Up to 3 attempts on 429: a rate-limited server tells us when to come back
+  // (Retry-After, capped at 30s). Other failures are final for this file.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const res = await fetch(serverBase + '/api/releases/' + releaseId + '/symbols', {
+      method: 'POST',
+      headers: headers,
+      body: form,
+    });
+    if (res.ok) return true;
+    if (res.status !== 429) return false;
+    const ra = Number(res.headers.get('retry-after'));
+    await sleep(Math.min(Number.isFinite(ra) && ra > 0 ? ra * 1000 : 2000, 30000));
+  }
+  return false;
 }
 
 async function main() {
