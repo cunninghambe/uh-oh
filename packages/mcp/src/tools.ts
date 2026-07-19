@@ -290,6 +290,50 @@ const resolveProjectId = async (backend: UhOhBackend, ref: string): Promise<stri
 const READ = { readOnlyHint: true, destructiveHint: false } as const;
 const WRITE = { readOnlyHint: false, destructiveHint: false } as const;
 
+// ── Read scope (v0.7 §22) ─────────────────────────────────────────────────────
+
+/** How a caller is authorized to use the registry. The read token yields
+ *  `readonly`; the JWT-authenticated HTTP path and the stdio backend are
+ *  `full`. */
+export type ToolScope = 'full' | 'readonly';
+
+/**
+ * Per-tool read/write classification — the SINGLE source of truth for the
+ * read-scope gate. `true` tools only read and run under a read token; `false`
+ * tools mutate and are rejected under a read scope. The gate reads THIS table
+ * (data), never the tool name, and each flag is asserted per tool in the tests.
+ */
+export const TOOL_READONLY: Record<string, boolean> = {
+  list_projects: true,
+  create_project: false,
+  update_project: false,
+  list_issues: true,
+  get_issue: true,
+  list_issue_events: true,
+  get_event: true,
+  set_issue_status: false,
+  list_releases: true,
+  get_server_health: true,
+  get_issue_bundle: true,
+  list_top_issues: true,
+  list_monitors: true,
+  get_usage_summary: true,
+};
+
+/** The tool error a mutating tool returns when invoked under a read scope. */
+export const scopeError = (tool: string): CallToolResult => ({
+  content: [
+    {
+      type: 'text',
+      text: JSON.stringify({
+        error: 'read_scope',
+        message: `read token cannot ${tool}; use the JWT-authenticated dashboard or stdio backend`,
+      }),
+    },
+  ],
+  isError: true,
+});
+
 // User-settable statuses (set_issue_status). 'regressed' is system-set.
 const STATUS = z.enum(['open', 'resolved', 'ignored']);
 // list_issues filter — additionally accepts the system-set 'regressed'.
@@ -298,9 +342,24 @@ const SORT = z.enum(['lastSeen', 'eventCount', 'firstSeen']);
 
 /**
  * Register every uh-oh tool on `server`, backed by `backend`. This is the only
- * place tools are defined; both transports call it.
+ * place tools are defined; both transports call it. Under a `readonly` scope
+ * (the read token on `POST /mcp`), the mutating tools return the scope error
+ * instead of touching the backend; read tools are unaffected.
  */
-export const registerUhOhTools = (server: McpServer, backend: UhOhBackend): void => {
+export const registerUhOhTools = (
+  server: McpServer,
+  backend: UhOhBackend,
+  opts: { scope?: ToolScope } = {},
+): void => {
+  const scope = opts.scope ?? 'full';
+
+  // A mutating tool invoked under a read scope returns the scope error and does
+  // NOT reach the backend. Read tools always run. The allow/deny decision reads
+  // the TOOL_READONLY table (data), never the tool name. Every mutating tool
+  // handler must route through this guard.
+  const guard = (name: string, fn: () => Promise<CallToolResult>): Promise<CallToolResult> =>
+    scope === 'readonly' && !TOOL_READONLY[name] ? Promise.resolve(scopeError(name)) : fn();
+
   server.registerTool(
     'list_projects',
     {
@@ -321,8 +380,10 @@ export const registerUhOhTools = (server: McpServer, backend: UhOhBackend): void
       annotations: WRITE,
     },
     (args) =>
-      run(async () =>
-        ok({ project: formatProject(await backend.createProject({ name: args.name })) }),
+      guard('create_project', () =>
+        run(async () =>
+          ok({ project: formatProject(await backend.createProject({ name: args.name })) }),
+        ),
       ),
   );
 
@@ -341,17 +402,19 @@ export const registerUhOhTools = (server: McpServer, backend: UhOhBackend): void
       annotations: WRITE,
     },
     (args) =>
-      run(async () => {
-        const input: UpdateProjectInput = {
-          projectId: args.projectId,
-          ...(args.name !== undefined ? { name: args.name } : {}),
-          ...(args.webhookUrl !== undefined ? { webhookUrl: args.webhookUrl } : {}),
-          ...(args.alertDedupeMinutes !== undefined
-            ? { alertDedupeMinutes: args.alertDedupeMinutes }
-            : {}),
-        };
-        return ok({ project: formatProject(await backend.updateProject(input)) });
-      }),
+      guard('update_project', () =>
+        run(async () => {
+          const input: UpdateProjectInput = {
+            projectId: args.projectId,
+            ...(args.name !== undefined ? { name: args.name } : {}),
+            ...(args.webhookUrl !== undefined ? { webhookUrl: args.webhookUrl } : {}),
+            ...(args.alertDedupeMinutes !== undefined
+              ? { alertDedupeMinutes: args.alertDedupeMinutes }
+              : {}),
+          };
+          return ok({ project: formatProject(await backend.updateProject(input)) });
+        }),
+      ),
   );
 
   server.registerTool(
@@ -468,14 +531,17 @@ export const registerUhOhTools = (server: McpServer, backend: UhOhBackend): void
       annotations: WRITE,
     },
     (args) =>
-      run(async () => {
-        const updated = await backend.setIssueStatus({
-          issueId: args.issueId,
-          status: args.status,
-        });
-        if (!updated) throw new BackendError('issue not found', { code: 'not_found', status: 404 });
-        return ok({ issue: formatIssue(updated) });
-      }),
+      guard('set_issue_status', () =>
+        run(async () => {
+          const updated = await backend.setIssueStatus({
+            issueId: args.issueId,
+            status: args.status,
+          });
+          if (!updated)
+            throw new BackendError('issue not found', { code: 'not_found', status: 404 });
+          return ok({ issue: formatIssue(updated) });
+        }),
+      ),
   );
 
   server.registerTool(
@@ -616,9 +682,14 @@ export const registerUhOhTools = (server: McpServer, backend: UhOhBackend): void
   );
 };
 
-/** Convenience: a fully-wired McpServer with every uh-oh tool registered. */
-export const createUhOhMcpServer = (backend: UhOhBackend): McpServer => {
+/** Convenience: a fully-wired McpServer with every uh-oh tool registered. Pass
+ *  `{ scope: 'readonly' }` (the read token on `POST /mcp`) to gate the mutating
+ *  tools behind the scope error. */
+export const createUhOhMcpServer = (
+  backend: UhOhBackend,
+  opts: { scope?: ToolScope } = {},
+): McpServer => {
   const server = new McpServer({ name: 'uh-oh', version: '0.1.0' });
-  registerUhOhTools(server, backend);
+  registerUhOhTools(server, backend, opts);
   return server;
 };

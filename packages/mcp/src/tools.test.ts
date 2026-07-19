@@ -23,7 +23,7 @@ import {
   type UpdateProjectInput,
   type UsageSummary,
 } from './backend.js';
-import { createUhOhMcpServer } from './tools.js';
+import { createUhOhMcpServer, TOOL_READONLY, scopeError, type ToolScope } from './tools.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -349,8 +349,11 @@ class FakeBackend implements UhOhBackend {
 
 type ToolResult = { isError: boolean; data: Record<string, unknown>; text: string };
 
-const makeClient = async (backend: UhOhBackend): Promise<Client> => {
-  const server = createUhOhMcpServer(backend);
+const makeClient = async (
+  backend: UhOhBackend,
+  opts: { scope?: ToolScope } = {},
+): Promise<Client> => {
+  const server = createUhOhMcpServer(backend, opts);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: 'test-client', version: '0.0.0' });
   await server.connect(serverTransport);
@@ -419,6 +422,102 @@ describe('tool registry', () => {
       expect(ann?.destructiveHint, `${name} destructiveHint`).toBe(false);
       expect(ann?.readOnlyHint, `${name} readOnlyHint`).toBe(!writes.has(name));
     }
+  });
+});
+
+describe('read scope (§22)', () => {
+  // The per-tool readonly flag is the data source for the read-scope gate. It
+  // must exactly match the readOnlyHint annotation and cover every tool once.
+  const EXPECTED_READONLY: Record<string, boolean> = {
+    list_projects: true,
+    create_project: false,
+    update_project: false,
+    list_issues: true,
+    get_issue: true,
+    list_issue_events: true,
+    get_event: true,
+    set_issue_status: false,
+    list_releases: true,
+    get_server_health: true,
+    get_issue_bundle: true,
+    list_top_issues: true,
+    list_monitors: true,
+    get_usage_summary: true,
+  };
+
+  it('flags each tool readonly exactly as expected (and every registered tool once)', async () => {
+    const { tools } = await client.listTools();
+    const names = tools.map((t) => t.name).sort();
+    // The TOOL_READONLY table covers exactly the registered tools.
+    expect(Object.keys(TOOL_READONLY).sort()).toEqual(names);
+    for (const name of names) {
+      expect(TOOL_READONLY[name], `${name} readonly flag`).toBe(EXPECTED_READONLY[name]);
+    }
+  });
+
+  it('the readonly flag matches the readOnlyHint annotation for every tool', async () => {
+    const { tools } = await client.listTools();
+    for (const t of tools) {
+      expect(TOOL_READONLY[t.name], `${t.name}`).toBe(t.annotations?.readOnlyHint);
+    }
+  });
+
+  it('scopeError has the { error: read_scope, message } shape naming the tool', () => {
+    const res = scopeError('set_issue_status');
+    expect(res.isError).toBe(true);
+    const content = res.content as Array<{ type: string; text: string }>;
+    const parsed = JSON.parse(content[0]?.text ?? '{}') as { error: string; message: string };
+    expect(parsed.error).toBe('read_scope');
+    expect(parsed.message).toContain('set_issue_status');
+    expect(parsed.message).toContain('JWT-authenticated dashboard or stdio backend');
+  });
+
+  describe('with a readonly-scoped server', () => {
+    let readClient: Client;
+    let readBackend: FakeBackend;
+
+    beforeEach(async () => {
+      readBackend = new FakeBackend();
+      readClient = await makeClient(readBackend, { scope: 'readonly' });
+    });
+
+    it('read tools still work under a read scope', async () => {
+      const { isError, data } = await call(readClient, 'list_projects');
+      expect(isError).toBe(false);
+      expect((data['projects'] as unknown[]).length).toBe(1);
+
+      const issue = await call(readClient, 'get_issue', { issueId: 'i1' });
+      expect(issue.isError).toBe(false);
+    });
+
+    for (const tool of ['create_project', 'update_project', 'set_issue_status'] as const) {
+      it(`mutating tool ${tool} returns the scope error and does NOT touch the backend`, async () => {
+        const args =
+          tool === 'create_project'
+            ? { name: 'X' }
+            : tool === 'update_project'
+              ? { projectId: 'p1', name: 'Y' }
+              : { issueId: 'i1', status: 'resolved' };
+        const { isError, data } = await call(readClient, tool, args);
+        expect(isError).toBe(true);
+        expect(data['error']).toBe('read_scope');
+        expect(data['message']).toContain(tool);
+        // The backend method was never invoked.
+        const method =
+          tool === 'create_project'
+            ? 'createProject'
+            : tool === 'update_project'
+              ? 'updateProject'
+              : 'setIssueStatus';
+        expect(readBackend.calls.some((c) => c.method === method)).toBe(false);
+      });
+    }
+
+    it('the full (default) scope still executes mutating tools', async () => {
+      const { isError, data } = await call(client, 'create_project', { name: 'Second App' });
+      expect(isError).toBe(false);
+      expect(data['project']).toMatchObject({ name: 'Second App' });
+    });
   });
 });
 
