@@ -651,3 +651,24 @@ Cookie-less, self-hosted product analytics on the same rails as crash reporting.
 **Client (`@uh-oh/js` 0.5.0).** `trackPageview(path?)`, `trackEvent(name, props?)`, and opt-in `init({ analytics: { auto: true } })` — initial pageview (with raw referrer, first pageview only), History pushState/replaceState + popstate hooks with consecutive-path dedupe, restored cleanly on `close()`. Separate lossy batch queue (cap 20, 5s debounce, sendBeacon on pagehide, no retry/spool — analytics is best-effort by design). Validation mirrors the server; nothing here can throw or mint an identifier.
 
 **Dashboard.** Usage section per project: visitors/pageviews/events headline, dual-series 30-day trend (SVG, shared-scale fitting), top pages/referrers/events bars, 7/30/90-day toggle; hidden entirely when the endpoint is absent.
+
+---
+
+## 22. v0.7 addendum — scoped read access for agent debugging
+
+**Problem.** Everything useful for debugging (issues, events, stats, bundles, usage) sits behind the 24h dashboard JWT, and the `/mcp` endpoint shares that gate. An agent session debugging a consumer app (the motivating case: a bookforge session unable to pull that project's crash events) has no durable, headless way in: JWTs expire daily and minting one requires the dashboard password. The symbol-upload token (§19) already proved the pattern for narrow, long-lived, headless auth; this addendum applies it to reads.
+
+**Scoped read token.** Optional env `UH_OH_READ_TOKEN` (min 16 chars; boot fails if set shorter, mirroring `UH_OH_SYMBOL_TOKEN`). Requests carrying `X-Uh-Oh-Read-Token` (constant-time compared, never logged) are authorized on exactly the read-only surface:
+
+- `GET /api/projects`, `GET /api/projects/:id/{issues,stats,releases,monitors}`, `GET /api/projects/:id/usage/summary`
+- `GET /api/issues/:id` and `GET /api/issues/:id/{events,impact,stats,bundle}`
+- `GET /api/events/:id`
+
+Everything else — every POST/PATCH/DELETE, auth routes, rotate-key, monitor CRUD, the admin surface — rejects the read token exactly as it rejects no auth. The token never appears in logs or error bodies.
+
+**MCP with a read scope.** `POST /mcp` additionally accepts the read token (same header). A request authorized this way carries a `readonly` auth scope: tools that only read (project/issue/event listing and getters, top issues, stats, bundles, health, usage summary, monitor listing) work; mutating tools (issue status changes, monitor create/edit/delete, anything that writes) return a tool error naming the scope ("read token cannot <tool>; use the JWT-authenticated dashboard or stdio backend"). The stdio backend and JWT-authenticated HTTP path are unchanged. The tool registry gains a per-tool `readonly` flag so the gate is data, not a name-matching heuristic, and the flag is asserted per tool in tests.
+
+**Deployment (the box).** Set `UH_OH_READ_TOKEN` in the server env; register the HTTP MCP endpoint with the machine's agent bridge (hetzner-mcp) so sessions reach it via `mcp_call`, supplying the header from the bridge's service config (add per-service header support to the bridge if it lacks it; it is internal tooling). Bridge restarts disconnect live agent sessions: restart it LAST, verify over plain ssh (which does not depend on the bridge), and confirm `mcp_services` shows uh-oh healthy afterward.
+
+**Acceptance.** With the token set: `curl -H "X-Uh-Oh-Read-Token: ..." /api/projects` lists projects while the same request without the header stays 401 and any write with the header stays 401; an MCP `list_issues` through the bridge returns the bookforge project's real issues; an MCP status-change tool through the read path returns the scope error and changes nothing; a boot with a 15-char token fails with a clear message; the dashboard, JWT flows, ingest, symbol uploads, and stdio MCP behave byte-identically to v0.6. Unit tests cover the route allowlist (each allowed route with the token, one representative rejection per verb class), the constant-time comparison, the per-tool readonly flags, and the scope error shape.
+
