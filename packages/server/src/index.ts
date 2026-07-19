@@ -4,6 +4,7 @@ import { applyMigrations, openDb } from './db/index.js';
 import { buildServer } from './server.js';
 import { secretFromEnv } from './auth/jwt.js';
 import { symbolTokenFromEnv } from './auth/symbol-token.js';
+import { readTokenFromEnv } from './auth/read-token.js';
 import { cleanupExpiredSessions } from './db/repos/sessions.js';
 import { pruneOldData, resolveRetentionDays } from './db/repos/retention.js';
 import { startDispatcher } from './webhooks/dispatcher.js';
@@ -48,6 +49,16 @@ if (isMain) {
     process.exit(1);
   }
 
+  // Optional scoped read token (CONTRACT R, §22). Unset = feature off; set but
+  // too short = fail boot with a clear error.
+  let readToken: string | undefined;
+  try {
+    readToken = readTokenFromEnv();
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  }
+
   const dbPath = process.env['UH_OH_DB'] ?? './uh-oh.db';
   const port = Number(process.env['UH_OH_PORT'] ?? 3300);
   const host = process.env['UH_OH_HOST'] ?? '0.0.0.0';
@@ -75,6 +86,7 @@ if (isMain) {
     ipRatePerMinute,
     ipRateBurst,
     symbolToken,
+    readToken,
   });
   app.log.level = logLevel;
   const dispatcherHandle = startDispatcher({ db, logger: app.log, dashboardUrl });

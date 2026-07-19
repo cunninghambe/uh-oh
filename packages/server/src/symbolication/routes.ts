@@ -10,6 +10,7 @@ import { PlatformSchema, ReleaseInfoSchema } from '@uh-oh/types';
 
 import type { Db } from '../db/index.js';
 import { buildUploadAuthMiddleware } from '../auth/symbol-token.js';
+import { buildReadAuthMiddleware } from '../auth/read-token.js';
 import {
   getReleaseById,
   listReleasesForProject,
@@ -82,6 +83,7 @@ export const registerSymbolizationRoutes = (
   secret: Uint8Array,
   maxSymbolBytes: number = DEFAULT_MAX_SYMBOL_BYTES,
   symbolToken?: string,
+  readToken?: string,
 ): void => {
   app.register(multipart, { limits: { fileSize: maxSymbolBytes } });
 
@@ -91,10 +93,19 @@ export const registerSymbolizationRoutes = (
   // this behaves exactly like the JWT-only middleware.
   const auth = buildUploadAuthMiddleware({ db, secret, symbolToken });
   const preHandler = auth as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
+  // CONTRACT R (§22): the release LIST is also on the read allowlist, so it
+  // accepts the read token, the symbol token, OR a JWT. The POST upsert and the
+  // symbols list/upload routes stay on the upload/JWT `preHandler` only.
+  const readPreHandler = buildReadAuthMiddleware({
+    db,
+    secret,
+    readToken,
+    fallback: preHandler,
+  }) as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
 
   app.get<{ Params: { id: string } }>(
     '/api/projects/:id/releases',
-    { preHandler },
+    { preHandler: readPreHandler },
     (req, reply) => {
       const project = getProjectById(db, req.params.id);
       if (!project) return reply.code(404).send({ error: 'project_not_found' });

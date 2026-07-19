@@ -42,12 +42,13 @@ chmod 600 /etc/uh-oh/server.env
 
 ### Optional environment variables
 
-| Variable                | Default | Description                                                                                                |
-| ----------------------- | ------- | ---------------------------------------------------------------------------------------------------------- |
-| `UH_OH_LOG_LEVEL`       | `info`  | Pino log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal`.                                        |
-| `UH_OH_IP_RATE_PER_MIN` | `120`   | Per-IP global rate limit — requests allowed per minute window.                                             |
-| `UH_OH_IP_RATE_BURST`   | `20`    | Per-IP burst allowance on top of the per-minute rate.                                                      |
-| `UH_OH_RETENTION_DAYS`  | `90`    | How long event/issue data is retained before pruning. See the commented example in `uh-oh-server.service`. |
+| Variable                | Default | Description                                                                                                                                                                                                                                                          |
+| ----------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `UH_OH_LOG_LEVEL`       | `info`  | Pino log level: `trace`, `debug`, `info`, `warn`, `error`, `fatal`.                                                                                                                                                                                                  |
+| `UH_OH_IP_RATE_PER_MIN` | `120`   | Per-IP global rate limit — requests allowed per minute window.                                                                                                                                                                                                       |
+| `UH_OH_IP_RATE_BURST`   | `20`    | Per-IP burst allowance on top of the per-minute rate.                                                                                                                                                                                                                |
+| `UH_OH_RETENTION_DAYS`  | `90`    | How long event/issue data is retained before pruning. See the commented example in `uh-oh-server.service`.                                                                                                                                                           |
+| `UH_OH_READ_TOKEN`      | _unset_ | Scoped read token (§22, min 16 chars — a shorter value fails boot). When set, requests bearing `X-Uh-Oh-Read-Token` reach the read-only API surface and a read-only `POST /mcp` tool scope without a JWT. Generate with `openssl rand -hex 24`. Unset = feature off. |
 
 Static env vars set directly in `uh-oh-server.service` (not in `server.env`):
 

@@ -24,6 +24,7 @@ import {
   SYMBOL_TOKEN_HEADER,
   symbolTokenMatches,
 } from './auth/symbol-token.js';
+import { MIN_READ_TOKEN_LENGTH } from './auth/read-token.js';
 
 export type ServerDeps = {
   db: Db;
@@ -43,6 +44,13 @@ export type ServerDeps = {
    * WITHOUT a JWT. Unset = feature off.
    */
   symbolToken?: string | undefined;
+  /**
+   * Scoped read token (CONTRACT R, §22). When set (≥16 chars), requests bearing
+   * `X-Uh-Oh-Read-Token` are authorized on the read-only debugging surface
+   * WITHOUT a JWT, and on `POST /mcp` carry a `readonly` tool scope. Unset =
+   * feature off.
+   */
+  readToken?: string | undefined;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -61,6 +69,11 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   if (deps.symbolToken !== undefined && deps.symbolToken.length < MIN_SYMBOL_TOKEN_LENGTH) {
     throw new Error(
       `buildServer: symbolToken must be at least ${String(MIN_SYMBOL_TOKEN_LENGTH)} characters`,
+    );
+  }
+  if (deps.readToken !== undefined && deps.readToken.length < MIN_READ_TOKEN_LENGTH) {
+    throw new Error(
+      `buildServer: readToken must be at least ${String(MIN_READ_TOKEN_LENGTH)} characters`,
     );
   }
 
@@ -182,19 +195,21 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   registerUsageIngestRoute(app, deps.db, usageLimiter);
 
   registerAuthRoutes(app, deps.db, deps.secret, deps.password, loginLimiter);
-  registerApiRoutes(app, deps.db, deps.secret, deps.symbolToken);
-  registerMonitorRoutes(app, deps.db, deps.secret);
+  registerApiRoutes(app, deps.db, deps.secret, deps.symbolToken, deps.readToken);
+  registerMonitorRoutes(app, deps.db, deps.secret, deps.readToken);
   registerSymbolizationRoutes(
     app,
     deps.db,
     deps.secret,
     deps.maxSymbolBytes ?? DEFAULT_MAX_SYMBOL_BYTES,
     deps.symbolToken,
+    deps.readToken,
   );
   registerMetricsRoute(app);
   // MCP (Streamable HTTP) over the same tool registry the stdio bin uses,
-  // backed by an in-process backend (no HTTP hop). JWT-gated like /api/*.
-  registerMcpRoute(app, deps.db, deps.secret, new InProcessBackend(deps.db));
+  // backed by an in-process backend (no HTTP hop). JWT-gated like /api/*, and
+  // additionally the read token for a readonly tool scope (§22).
+  registerMcpRoute(app, deps.db, deps.secret, new InProcessBackend(deps.db), deps.readToken);
 
   app.setErrorHandler((err: FastifyError, _req, reply) => {
     const status = err.statusCode ?? 500;

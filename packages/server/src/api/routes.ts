@@ -16,6 +16,7 @@ import { topIssues } from '../db/repos/top-issues.js';
 import type { Db } from '../db/index.js';
 import { buildAuthMiddleware } from '../auth/middleware.js';
 import { buildUploadAuthMiddleware } from '../auth/symbol-token.js';
+import { buildReadAuthMiddleware } from '../auth/read-token.js';
 import { symbolicateEvent } from '../symbolication/symbolicate.js';
 import { buildIssueBundle } from './bundle.js';
 import { validateWebhookUrl } from '../webhooks/url-guard.js';
@@ -52,6 +53,7 @@ export const registerApiRoutes = (
   db: Db,
   secret: Uint8Array,
   symbolToken?: string,
+  readToken?: string,
 ): void => {
   const auth = buildAuthMiddleware({ db, secret });
   const preHandler = auth as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
@@ -62,8 +64,24 @@ export const registerApiRoutes = (
     req: FastifyRequest,
     reply: FastifyReply,
   ) => Promise<void>;
+  // CONTRACT R (§22): the read token authorizes exactly the allowlisted GET
+  // routes below. `readPreHandler` accepts the read token OR a JWT; the
+  // non-allowlisted routes keep the JWT-only `preHandler` (or upload handler),
+  // so they reject the read token exactly as they reject no auth.
+  const readPreHandler = buildReadAuthMiddleware({ db, secret, readToken }) as (
+    req: FastifyRequest,
+    reply: FastifyReply,
+  ) => Promise<void>;
+  // GET /api/projects belongs to BOTH allowlists: read token, symbol token, OR
+  // a JWT. Read is tried first, then it falls back to the upload handler.
+  const readOrUploadPreHandler = buildReadAuthMiddleware({
+    db,
+    secret,
+    readToken,
+    fallback: uploadPreHandler,
+  }) as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
 
-  app.get('/api/projects', { preHandler: uploadPreHandler }, () => ({
+  app.get('/api/projects', { preHandler: readOrUploadPreHandler }, () => ({
     projects: listProjects(db),
   }));
 
@@ -153,7 +171,7 @@ export const registerApiRoutes = (
   app.get<{
     Params: { id: string };
     Querystring: { status?: string; sort?: string; limit?: string; offset?: string };
-  }>('/api/projects/:id/issues', { preHandler }, (req, reply) => {
+  }>('/api/projects/:id/issues', { preHandler: readPreHandler }, (req, reply) => {
     const project = getProjectById(db, req.params.id);
     if (!project) return reply.code(404).send({ error: 'project_not_found' });
     const status = isFilterStatus(req.query.status) ? req.query.status : undefined;
@@ -175,7 +193,7 @@ export const registerApiRoutes = (
 
   app.get<{ Params: { id: string }; Querystring: { days?: string } }>(
     '/api/projects/:id/stats',
-    { preHandler },
+    { preHandler: readPreHandler },
     (req, reply) => {
       const project = getProjectById(db, req.params.id);
       if (!project) return reply.code(404).send({ error: 'project_not_found' });
@@ -187,7 +205,7 @@ export const registerApiRoutes = (
   // default 30).
   app.get<{ Params: { id: string }; Querystring: { days?: string } }>(
     '/api/projects/:id/usage/summary',
-    { preHandler },
+    { preHandler: readPreHandler },
     (req, reply) => {
       const project = getProjectById(db, req.params.id);
       if (!project) return reply.code(404).send({ error: 'project_not_found' });
@@ -195,13 +213,17 @@ export const registerApiRoutes = (
     },
   );
 
-  app.get<{ Params: { id: string } }>('/api/issues/:id', { preHandler }, (req, reply) => {
-    const issue = getIssue(db, req.params.id);
-    if (!issue) return reply.code(404).send({ error: 'not_found' });
-    const latest = getLatestEventForIssue(db, issue.id);
-    const breadcrumbs = latest ? listBreadcrumbs(db, latest.id) : [];
-    return { issue, latestEvent: latest, breadcrumbs };
-  });
+  app.get<{ Params: { id: string } }>(
+    '/api/issues/:id',
+    { preHandler: readPreHandler },
+    (req, reply) => {
+      const issue = getIssue(db, req.params.id);
+      if (!issue) return reply.code(404).send({ error: 'not_found' });
+      const latest = getLatestEventForIssue(db, issue.id);
+      const breadcrumbs = latest ? listBreadcrumbs(db, latest.id) : [];
+      return { issue, latestEvent: latest, breadcrumbs };
+    },
+  );
 
   app.patch<{ Params: { id: string }; Body: unknown }>(
     '/api/issues/:id',
@@ -220,7 +242,7 @@ export const registerApiRoutes = (
   app.get<{
     Params: { id: string };
     Querystring: { limit?: string; offset?: string; page?: string };
-  }>('/api/issues/:id/events', { preHandler }, (req, reply) => {
+  }>('/api/issues/:id/events', { preHandler: readPreHandler }, (req, reply) => {
     const issue = getIssue(db, req.params.id);
     if (!issue) return reply.code(404).send({ error: 'not_found' });
     const limit = req.query.limit ? Math.max(1, Math.min(200, Number(req.query.limit))) : 50;
@@ -238,7 +260,7 @@ export const registerApiRoutes = (
 
   app.get<{ Params: { id: string }; Querystring: { days?: string } }>(
     '/api/issues/:id/stats',
-    { preHandler },
+    { preHandler: readPreHandler },
     (req, reply) => {
       const issue = getIssue(db, req.params.id);
       if (!issue) return reply.code(404).send({ error: 'not_found' });
@@ -247,16 +269,20 @@ export const registerApiRoutes = (
   );
 
   // CONTRACT I — issue impact roll-up.
-  app.get<{ Params: { id: string } }>('/api/issues/:id/impact', { preHandler }, (req, reply) => {
-    const issue = getIssue(db, req.params.id);
-    if (!issue) return reply.code(404).send({ error: 'not_found' });
-    return computeImpact(db, issue.id);
-  });
+  app.get<{ Params: { id: string } }>(
+    '/api/issues/:id/impact',
+    { preHandler: readPreHandler },
+    (req, reply) => {
+      const issue = getIssue(db, req.params.id);
+      if (!issue) return reply.code(404).send({ error: 'not_found' });
+      return computeImpact(db, issue.id);
+    },
+  );
 
   // CONTRACT B — the full fix-dossier bundle (size-bounded server-side).
   app.get<{ Params: { id: string } }>(
     '/api/issues/:id/bundle',
-    { preHandler },
+    { preHandler: readPreHandler },
     async (req, reply) => {
       const bundle = await buildIssueBundle(db, req.params.id);
       if (!bundle) return reply.code(404).send({ error: 'not_found' });
@@ -277,7 +303,7 @@ export const registerApiRoutes = (
 
   app.get<{ Params: { id: string }; Querystring: { symbolicate?: string } }>(
     '/api/events/:id',
-    { preHandler },
+    { preHandler: readPreHandler },
     async (req, reply) => {
       const event = getEvent(db, req.params.id);
       if (!event) return reply.code(404).send({ error: 'not_found' });

@@ -2,14 +2,16 @@
 // stdio bin uses, backed by the InProcessBackend. Stateless mode: a fresh
 // McpServer + transport per request (sessionIdGenerator undefined,
 // enableJsonResponse true), wired through Fastify's raw req/res. Auth is the
-// SAME JWT middleware as /api/* (Authorization: Bearer). GET/DELETE → 405,
-// since stateless mode only needs POST.
+// SAME JWT middleware as /api/* (Authorization: Bearer), plus the scoped read
+// token (§22): a read-token request carries a `readonly` tool scope, so the
+// mutating tools return the scope error. GET/DELETE → 405, since stateless mode
+// only needs POST.
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 import { StreamableHTTPServerTransport, createUhOhMcpServer, type UhOhBackend } from '@uh-oh/mcp';
 
-import { buildAuthMiddleware } from '../auth/middleware.js';
+import { buildReadAuthMiddleware, isReadTokenAuth } from '../auth/read-token.js';
 import type { Db } from '../db/index.js';
 
 export const registerMcpRoute = (
@@ -17,8 +19,12 @@ export const registerMcpRoute = (
   db: Db,
   secret: Uint8Array,
   backend: UhOhBackend,
+  readToken?: string,
 ): void => {
-  const auth = buildAuthMiddleware({ db, secret });
+  // JWT OR the read token. A JWT yields the full tool scope; the read token
+  // yields `readonly`. When no read token is configured this is exactly the JWT
+  // middleware, so the endpoint behaves byte-identically to v0.6.
+  const auth = buildReadAuthMiddleware({ db, secret, readToken });
   const preHandler = auth as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
 
   app.post<{ Body: unknown }>('/mcp', { preHandler }, async (req, reply) => {
@@ -26,7 +32,9 @@ export const registerMcpRoute = (
     // directly to reply.raw, so Fastify must not also try to send a reply.
     reply.hijack();
 
-    const server = createUhOhMcpServer(backend);
+    // A read-token request is scoped to read-only tools; a JWT request is full.
+    const scope = isReadTokenAuth(req) ? 'readonly' : 'full';
+    const server = createUhOhMcpServer(backend, { scope });
     // Stateless mode: OMITTING sessionIdGenerator leaves it `undefined`, which
     // the transport reads as "session management disabled" (a fresh transport
     // per request). This is exactly the `sessionIdGenerator: undefined` the MCP

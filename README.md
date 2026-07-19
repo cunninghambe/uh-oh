@@ -14,6 +14,7 @@ A single Node process + SQLite + a small React dashboard. Designed for anyone wh
 - Single-user JWT-gated dashboard with project + issue + release + symbol-upload UIs
 - Fires a generic outbound webhook per project on new issues (wire it to Slack, Discord, email, whatever)
 - MCP-native: 14 tools (projects, issues, symbolicated events, status changes, health, issue bundles, top issues, monitors) via the `uh-oh-mcp` stdio bin or the JWT-gated `POST /mcp` Streamable-HTTP endpoint — triage crashes from Claude Code (see `SPEC.md` §17, §20)
+- Scoped read token for headless agent debugging: set `UH_OH_READ_TOKEN` and an agent session reaches the read-only API surface (and a read-only `POST /mcp` tool scope, where mutating tools are refused) via the `X-Uh-Oh-Read-Token` header — no daily dashboard JWT (see `SPEC.md` §22)
 - Fix dossiers: `get_issue_bundle` returns issue + impact + symbolicated stack **with the original source lines** (extracted from your uploaded source maps) in one call — everything an agent needs to go crash → fix
 - Dead-man's-switch monitors: check-in pings on the ingest keypath, a 60s sweep, and `monitor.missed`/`monitor.recovered` webhooks — know when a worker, cron, or Apps Script goes silent (see `SPEC.md` §20)
 - Privacy-first usage analytics: cookie-less pageviews + custom events (no client IDs, daily-rotating server-side visitor hash, raw IP/UA never stored), with a per-project Usage dashboard and MCP summary tool (see `SPEC.md` §21)

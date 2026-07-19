@@ -5,6 +5,7 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 import { buildAuthMiddleware } from '../auth/middleware.js';
+import { buildReadAuthMiddleware } from '../auth/read-token.js';
 import type { Db } from '../db/index.js';
 import {
   deleteMonitor,
@@ -26,13 +27,24 @@ const withOverdue = (m: MonitorRow, now: number): MonitorRow & { overdue: boolea
   overdue: isOverdue(m, now),
 });
 
-export const registerMonitorRoutes = (app: FastifyInstance, db: Db, secret: Uint8Array): void => {
+export const registerMonitorRoutes = (
+  app: FastifyInstance,
+  db: Db,
+  secret: Uint8Array,
+  readToken?: string,
+): void => {
   const auth = buildAuthMiddleware({ db, secret });
   const preHandler = auth as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
+  // CONTRACT R (§22): the monitor LIST is on the read allowlist (read token OR
+  // JWT); monitor CRUD below keeps the JWT-only `preHandler`.
+  const readPreHandler = buildReadAuthMiddleware({ db, secret, readToken }) as (
+    req: FastifyRequest,
+    reply: FastifyReply,
+  ) => Promise<void>;
 
   app.get<{ Params: { id: string } }>(
     '/api/projects/:id/monitors',
-    { preHandler },
+    { preHandler: readPreHandler },
     (req, reply) => {
       const project = getProjectById(db, req.params.id);
       if (!project) return reply.code(404).send({ error: 'project_not_found' });
