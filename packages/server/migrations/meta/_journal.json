@@ -50,6 +50,13 @@
       "when": 1784381382070,
       "tag": "0006_usage_analytics",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1784832413921,
+      "tag": "0007_agent_loop",
+      "breakpoints": true
     }
   ]
 }

@@ -32,12 +32,14 @@ export const registerMonitorRoutes = (
   db: Db,
   secret: Uint8Array,
   readToken?: string,
+  agentToken?: string,
 ): void => {
   const auth = buildAuthMiddleware({ db, secret });
   const preHandler = auth as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
-  // CONTRACT R (§22): the monitor LIST is on the read allowlist (read token OR
-  // JWT); monitor CRUD below keeps the JWT-only `preHandler`.
-  const readPreHandler = buildReadAuthMiddleware({ db, secret, readToken }) as (
+  // CONTRACT R (§22) + A (§23): the monitor LIST is on the read allowlist (read
+  // token, agent token, OR JWT); monitor CRUD below keeps the JWT-only
+  // `preHandler`, rejecting both scoped tokens.
+  const readPreHandler = buildReadAuthMiddleware({ db, secret, readToken, agentToken }) as (
     req: FastifyRequest,
     reply: FastifyReply,
   ) => Promise<void>;

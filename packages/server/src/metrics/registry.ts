@@ -40,6 +40,24 @@ export const metrics = {
     registers: [registry],
   }),
 
+  issueSpikes: new Counter({
+    name: 'uh_oh_issue_spikes_total',
+    help: 'Total issue spike episodes (transitions into the spiking state)',
+    registers: [registry],
+  }),
+
+  fixVerified: new Counter({
+    name: 'uh_oh_fix_verified_total',
+    help: 'Total fix attempts confirmed by the verify sweep (deployed -> verified)',
+    registers: [registry],
+  }),
+
+  fixFailed: new Counter({
+    name: 'uh_oh_fix_failed_total',
+    help: 'Total fix attempts marked failed (by PATCH or the regression hook)',
+    registers: [registry],
+  }),
+
   requestDuration: new Histogram({
     name: 'uh_oh_request_duration_seconds',
     help: 'HTTP request duration',

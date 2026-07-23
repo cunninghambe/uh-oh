@@ -14,14 +14,17 @@ import { z } from 'zod';
 
 import {
   BackendError,
+  type Annotation,
   type BreadcrumbRecord,
   type EventRecord,
+  type FixAttempt,
   type Issue,
   type ListIssuesInput,
   type Monitor,
   type Project,
   type Release,
   type ResolvedFrame,
+  type SimilarIssue,
   type TopIssue,
   type UhOhBackend,
   type UpdateProjectInput,
@@ -189,6 +192,44 @@ const formatMonitor = (m: Monitor): Record<string, unknown> =>
     createdAt: toIso(m.createdAt),
   });
 
+const formatAnnotation = (a: Annotation): Record<string, unknown> =>
+  clean({
+    id: a.id,
+    issueId: a.issueId,
+    author: a.author,
+    kind: a.kind,
+    body: a.body,
+    createdAt: toIso(a.createdAt),
+  });
+
+const formatFixAttempt = (f: FixAttempt): Record<string, unknown> =>
+  clean({
+    id: f.id,
+    issueId: f.issueId,
+    prUrl: f.prUrl,
+    commitSha: f.commitSha,
+    state: f.state,
+    createdAt: toIso(f.createdAt),
+    deployedAt: toIso(f.deployedAt),
+    updatedAt: toIso(f.updatedAt),
+  });
+
+const formatSimilarIssue = (s: SimilarIssue): Record<string, unknown> =>
+  clean({
+    issue: clean({
+      id: s.issue.id,
+      projectId: s.issue.projectId,
+      projectSlug: s.issue.projectSlug,
+      title: s.issue.title,
+      status: s.issue.status,
+      platform: s.issue.platform,
+      lastSeen: toIso(s.issue.lastSeen),
+      eventCount: s.issue.eventCount,
+    }),
+    fixAttempts: s.fixAttempts.map(formatFixAttempt),
+    annotationCount: s.annotationCount,
+  });
+
 const formatEventSummary = (e: EventRecord): Record<string, unknown> => {
   const env = parseEnvelope(e.payload);
   return clean({
@@ -290,49 +331,69 @@ const resolveProjectId = async (backend: UhOhBackend, ref: string): Promise<stri
 const READ = { readOnlyHint: true, destructiveHint: false } as const;
 const WRITE = { readOnlyHint: false, destructiveHint: false } as const;
 
-// ── Read scope (v0.7 §22) ─────────────────────────────────────────────────────
+// ── Scope model (v0.7 §22, generalized in v0.8 §23) ───────────────────────────
 
 /** How a caller is authorized to use the registry. The read token yields
- *  `readonly`; the JWT-authenticated HTTP path and the stdio backend are
- *  `full`. */
-export type ToolScope = 'full' | 'readonly';
+ *  `readonly`; the agent token yields `agent`; the JWT-authenticated HTTP path
+ *  and the stdio backend are `full`. */
+export type ToolScope = 'full' | 'agent' | 'readonly';
 
 /**
- * Per-tool read/write classification — the SINGLE source of truth for the
- * read-scope gate. `true` tools only read and run under a read token; `false`
- * tools mutate and are rejected under a read scope. The gate reads THIS table
- * (data), never the tool name, and each flag is asserted per tool in the tests.
+ * Per-tool minimum scope required to invoke it — the SINGLE source of truth for
+ * the scope gate. `read` tools run under any request scope; `agent` tools
+ * require at least the agent token; `admin` tools require the JWT (stdio is
+ * always `full`). The gate reads THIS table (data), never the tool name, and
+ * each flag is asserted per tool in the tests. `read` is what v0.7 called
+ * `readonly: true`.
  */
-export const TOOL_READONLY: Record<string, boolean> = {
-  list_projects: true,
-  create_project: false,
-  update_project: false,
-  list_issues: true,
-  get_issue: true,
-  list_issue_events: true,
-  get_event: true,
-  set_issue_status: false,
-  list_releases: true,
-  get_server_health: true,
-  get_issue_bundle: true,
-  list_top_issues: true,
-  list_monitors: true,
-  get_usage_summary: true,
+export type RequiredScope = 'read' | 'agent' | 'admin';
+
+export const TOOL_SCOPE: Record<string, RequiredScope> = {
+  list_projects: 'read',
+  create_project: 'admin',
+  update_project: 'admin',
+  list_issues: 'read',
+  get_issue: 'read',
+  list_issue_events: 'read',
+  get_event: 'read',
+  // v0.8 §23: reclassified from admin to agent — the agent loop needs to move
+  // an issue through open/resolved/ignored without a JWT.
+  set_issue_status: 'agent',
+  list_releases: 'read',
+  get_server_health: 'read',
+  get_issue_bundle: 'read',
+  list_top_issues: 'read',
+  list_monitors: 'read',
+  get_usage_summary: 'read',
+  list_similar_issues: 'read',
+  annotate_issue: 'agent',
+  record_fix_attempt: 'agent',
 };
 
-/** The tool error a mutating tool returns when invoked under a read scope. */
-export const scopeError = (tool: string): CallToolResult => ({
-  content: [
-    {
-      type: 'text',
-      text: JSON.stringify({
-        error: 'read_scope',
-        message: `read token cannot ${tool}; use the JWT-authenticated dashboard or stdio backend`,
-      }),
-    },
-  ],
-  isError: true,
-});
+/**
+ * The tool error a request scope narrower than a tool's requirement returns.
+ * `requestingScope` names which token was too narrow — `readonly` (the v0.7
+ * read token) is the default, matching the original §22 message shape exactly;
+ * `agent` (the v0.8 agent token) names itself analogously.
+ */
+export const scopeError = (
+  tool: string,
+  requestingScope: 'readonly' | 'agent' = 'readonly',
+): CallToolResult => {
+  const label = requestingScope === 'readonly' ? 'read token' : 'agent token';
+  return {
+    content: [
+      {
+        type: 'text',
+        text: JSON.stringify({
+          error: requestingScope === 'readonly' ? 'read_scope' : 'agent_scope',
+          message: `${label} cannot ${tool}; use the JWT-authenticated dashboard or stdio backend`,
+        }),
+      },
+    ],
+    isError: true,
+  };
+};
 
 // User-settable statuses (set_issue_status). 'regressed' is system-set.
 const STATUS = z.enum(['open', 'resolved', 'ignored']);
@@ -340,11 +401,28 @@ const STATUS = z.enum(['open', 'resolved', 'ignored']);
 const FILTER_STATUS = z.enum(['open', 'resolved', 'ignored', 'regressed']);
 const SORT = z.enum(['lastSeen', 'eventCount', 'firstSeen']);
 
+// annotate_issue (§23). 'system' is server-written only (the fix-attempt audit
+// trail), so it is intentionally absent — passing it is a schema-level
+// "Invalid arguments" tool error, never reaching the backend. Caps mirror the
+// server's MAX_ANNOTATION_BODY / MAX_ANNOTATION_AUTHOR.
+const CLIENT_ANNOTATION_KIND = z.enum(['note', 'root_cause', 'fix_plan', 'verification']);
+const ANNOTATION_BODY_MAX = 16 * 1024;
+const ANNOTATION_AUTHOR_MAX = 128;
+
+// record_fix_attempt (§23). 'filed' is the implicit creation state (never a
+// transition target) and 'verified' is system-set only, so neither is a valid
+// input — both are schema-level "Invalid arguments" tool errors. Cap and regex
+// mirror the server's MAX_PR_URL / COMMIT_SHA_RE (releases.commit_sha).
+const CLIENT_FIX_TRANSITION = z.enum(['deployed', 'failed']);
+const PR_URL_MAX = 512;
+const COMMIT_SHA_RE = /^[0-9a-f]{7,40}$/i;
+
 /**
  * Register every uh-oh tool on `server`, backed by `backend`. This is the only
  * place tools are defined; both transports call it. Under a `readonly` scope
- * (the read token on `POST /mcp`), the mutating tools return the scope error
- * instead of touching the backend; read tools are unaffected.
+ * (the read token) only `read` tools run; under an `agent` scope (the agent
+ * token) `read` and `agent` tools run; a request scope narrower than a tool's
+ * required scope returns the scope error instead of touching the backend.
  */
 export const registerUhOhTools = (
   server: McpServer,
@@ -353,12 +431,19 @@ export const registerUhOhTools = (
 ): void => {
   const scope = opts.scope ?? 'full';
 
-  // A mutating tool invoked under a read scope returns the scope error and does
-  // NOT reach the backend. Read tools always run. The allow/deny decision reads
-  // the TOOL_READONLY table (data), never the tool name. Every mutating tool
-  // handler must route through this guard.
-  const guard = (name: string, fn: () => Promise<CallToolResult>): Promise<CallToolResult> =>
-    scope === 'readonly' && !TOOL_READONLY[name] ? Promise.resolve(scopeError(name)) : fn();
+  // A tool invoked under a request scope narrower than its TOOL_SCOPE
+  // requirement returns the scope error and does NOT reach the backend. `full`
+  // always runs everything; `agent` additionally runs `agent` tools; `readonly`
+  // runs only `read` tools. The allow/deny decision reads the TOOL_SCOPE table
+  // (data), never the tool name. Only `agent`/`admin` tools are wrapped: a
+  // `read` tool is allowed under every request scope, so wrapping it would be a
+  // no-op passthrough (TOOL_SCOPE stays exhaustive either way; tests assert it).
+  const guard = (name: string, fn: () => Promise<CallToolResult>): Promise<CallToolResult> => {
+    if (scope === 'full') return fn();
+    const required = TOOL_SCOPE[name] ?? 'admin';
+    const allowed = required === 'read' || (scope === 'agent' && required === 'agent');
+    return allowed ? fn() : Promise.resolve(scopeError(name, scope));
+  };
 
   server.registerTool(
     'list_projects',
@@ -656,6 +741,87 @@ export const registerUhOhTools = (
         const projectId = await resolveProjectId(backend, args.project);
         return ok(await backend.getUsageSummary({ projectId, days: args.days }));
       }),
+  );
+
+  // ── v0.8 agent-loop tools (§23) ──────────────────────────────────────────
+
+  server.registerTool(
+    'list_similar_issues',
+    {
+      title: 'List similar issues',
+      description:
+        "Find fleet-wide issues that share this issue's exception-type prefix (the title text before the first ':', or the whole title when it has none), ranked by has-verified-fix, then annotation count, then recency. Each entry carries the candidate issue plus its fix attempts and annotation count — \"have we seen this before, and what fixed it\" in one call. Capped at 10.",
+      inputSchema: { issueId: z.string().min(1) },
+      annotations: READ,
+    },
+    (args) =>
+      run(async () => {
+        const similar = await backend.listSimilarIssues({ issueId: args.issueId });
+        if (similar === null)
+          throw new BackendError('issue not found', { code: 'not_found', status: 404 });
+        return ok({ similar: similar.map(formatSimilarIssue) });
+      }),
+  );
+
+  server.registerTool(
+    'annotate_issue',
+    {
+      title: 'Annotate issue',
+      description:
+        "Add an investigation note to an issue — a free-text 'note', 'root_cause', 'fix_plan', or 'verification' record — so the next investigation of the same crash does not start from zero. Body capped at 16KB (413 over); author defaults to 'agent'. The 'system' kind is written by the server only (the fix-attempt audit trail) and cannot be set here.",
+      inputSchema: {
+        issueId: z.string().min(1),
+        body: z.string().min(1).max(ANNOTATION_BODY_MAX),
+        kind: CLIENT_ANNOTATION_KIND.optional(),
+        author: z.string().min(1).max(ANNOTATION_AUTHOR_MAX).optional(),
+      },
+      annotations: WRITE,
+    },
+    (args) =>
+      guard('annotate_issue', () =>
+        run(async () => {
+          const annotation = await backend.createAnnotation({
+            issueId: args.issueId,
+            body: args.body,
+            ...(args.kind !== undefined ? { kind: args.kind } : {}),
+            ...(args.author !== undefined ? { author: args.author } : {}),
+          });
+          return ok({ annotation: formatAnnotation(annotation) });
+        }),
+      ),
+  );
+
+  server.registerTool(
+    'record_fix_attempt',
+    {
+      title: 'Record fix attempt',
+      description:
+        "Record or update a fix attempt for an issue by its PR URL: upserts by (issue, prUrl) into state 'filed' (a re-record with a different commitSha updates it), then — when state is given and differs from the attempt's current state — transitions it. Allowed transitions: filed->deployed, filed->failed, deployed->failed; anything else (including 'verified', which is system-set by the hourly verify sweep) is rejected. Marking 'deployed' resolves an open/regressed issue, re-arming regression detection. Returns the final fix attempt.",
+      inputSchema: {
+        issueId: z.string().min(1),
+        prUrl: z.string().min(1).max(PR_URL_MAX),
+        commitSha: z.string().regex(COMMIT_SHA_RE).optional(),
+        state: CLIENT_FIX_TRANSITION.optional(),
+      },
+      annotations: WRITE,
+    },
+    (args) =>
+      guard('record_fix_attempt', () =>
+        run(async () => {
+          let attempt = await backend.upsertFixAttempt({
+            issueId: args.issueId,
+            prUrl: args.prUrl,
+            ...(args.commitSha !== undefined ? { commitSha: args.commitSha.toLowerCase() } : {}),
+          });
+          if (args.state !== undefined && args.state !== attempt.state) {
+            attempt = await backend.transitionFixAttempt({
+              fixAttemptId: attempt.id,
+              state: args.state,
+            });
+          }
+          return ok({ fixAttempt: formatFixAttempt(attempt) });
+        }),
+      ),
   );
 
   // Prompt: instruct an agent to pull the bundle and produce a fix. Kept short

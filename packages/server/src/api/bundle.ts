@@ -1,12 +1,16 @@
 // CONTRACT B — the issue bundle: everything an agent needs to fix a crash in ONE
 // call (project, issue, impact, the latest event fully symbolicated with source
-// context + breadcrumbs, a few recent events, and symbol availability).
+// context + breadcrumbs, a few recent events, symbol availability, and — since
+// v0.8 §23 — the investigation record: recent annotations and fix attempts, plus
+// the project repo URL).
 //
 // Deterministic + size-bounded: the serialized bundle is hard-capped at ~64KB.
-// When over, we drop context lines first, then breadcrumbs, recording exactly
-// what was dropped in `truncated`. This function is the single source of truth,
-// shared by GET /api/issues/:id/bundle and the InProcessBackend; the HttpBackend
-// fetches the same route, so every path yields an identical bundle.
+// When over, we drop content in a fixed order — context lines first, then
+// breadcrumbs, then annotations oldest-first (annotations are the most protected
+// content) — recording exactly what was dropped in `truncated`. This function is
+// the single source of truth, shared by GET /api/issues/:id/bundle and the
+// InProcessBackend; the HttpBackend fetches the same route, so every path yields
+// an identical bundle.
 
 import type {
   BundleBreadcrumb,
@@ -23,14 +27,26 @@ import { computeImpact } from '../db/repos/impact.js';
 import { getIssue } from '../db/repos/issues.js';
 import { getProjectById } from '../db/repos/projects.js';
 import { getReleaseById } from '../db/repos/releases.js';
+import { listRecentAnnotations, toAnnotationView } from '../db/repos/annotations.js';
+import { listFixAttempts, toFixAttemptView } from '../db/repos/fix-attempts.js';
 import type { Db } from '../db/index.js';
 import { symbolicateEvent } from '../symbolication/symbolicate.js';
 import { listWebSymbolMaps } from '../symbolication/web-symbols.js';
+
+/**
+ * The server's v0.8 bundle. `IssueBundle` (defined in `@uh-oh/mcp`) now carries
+ * every agent-loop addition itself (project.repoUrl, annotations, fixAttempts,
+ * truncated.annotations), promoted there from this file's v0.8 draft, so this
+ * is a plain alias kept for call-site readability rather than a widening.
+ */
+export type ServerIssueBundle = IssueBundle;
 
 /** Hard cap on the serialized bundle (~64KB). */
 export const BUNDLE_MAX_BYTES = 64 * 1024;
 const BREADCRUMB_TAIL = 20;
 const RECENT_EVENTS = 3;
+/** Newest annotations carried in the bundle. */
+const ANNOTATION_TAIL = 10;
 
 type ParsedPayload = {
   release?: { version?: unknown; build?: unknown };
@@ -62,15 +78,17 @@ const parseCrumbData = (data: string): unknown => {
   }
 };
 
-const byteLength = (bundle: IssueBundle): number =>
+const byteLength = (bundle: ServerIssueBundle): number =>
   Buffer.byteLength(JSON.stringify(bundle), 'utf8');
 
 /**
  * Shrink `bundle` in place until it fits BUNDLE_MAX_BYTES, in the fixed order:
  * (1) strip source context from the latest event's frames, then (2) drop the
- * latest event's breadcrumbs. Records each step in `bundle.truncated`.
+ * latest event's breadcrumbs, then (3) drop annotations oldest-first (they are
+ * the most protected content, so they go last and the newest survive longest).
+ * Records each step in `bundle.truncated`.
  */
-const applyTruncation = (bundle: IssueBundle): void => {
+const applyTruncation = (bundle: ServerIssueBundle): void => {
   if (byteLength(bundle) <= BUNDLE_MAX_BYTES) return;
 
   const latest = bundle.latestEvent;
@@ -89,10 +107,21 @@ const applyTruncation = (bundle: IssueBundle): void => {
       latest.breadcrumbs = [];
       bundle.truncated.breadcrumbs = true;
     }
+    if (byteLength(bundle) <= BUNDLE_MAX_BYTES) return;
+  }
+
+  // Annotations are newest-first; drop from the tail (oldest) one at a time until
+  // it fits or none remain.
+  while (bundle.annotations.length > 0 && byteLength(bundle) > BUNDLE_MAX_BYTES) {
+    bundle.annotations.pop();
+    bundle.truncated.annotations = true;
   }
 };
 
-export const buildIssueBundle = async (db: Db, issueId: string): Promise<IssueBundle | null> => {
+export const buildIssueBundle = async (
+  db: Db,
+  issueId: string,
+): Promise<ServerIssueBundle | null> => {
   const issue = getIssue(db, issueId);
   if (!issue) return null;
   const project = getProjectById(db, issue.projectId);
@@ -165,8 +194,13 @@ export const buildIssueBundle = async (db: Db, issueId: string): Promise<IssueBu
     release: releaseLabel(e.payload),
   }));
 
-  const bundle: IssueBundle = {
-    project: { id: project.id, name: project.name, slug: project.slug },
+  // Investigation record (§23): the newest annotations (oldest-first drop order
+  // is applied during truncation) and all fix attempts, newest first.
+  const annotations = listRecentAnnotations(db, issueId, ANNOTATION_TAIL).map(toAnnotationView);
+  const fixAttempts = listFixAttempts(db, issueId).map(toFixAttemptView);
+
+  const bundle: ServerIssueBundle = {
+    project: { id: project.id, name: project.name, slug: project.slug, repoUrl: project.repoUrl },
     issue: {
       id: issue.id,
       title: issue.title,
@@ -181,7 +215,9 @@ export const buildIssueBundle = async (db: Db, issueId: string): Promise<IssueBu
     latestEvent,
     recentEvents,
     symbols,
-    truncated: { context: false, breadcrumbs: false },
+    annotations,
+    fixAttempts,
+    truncated: { context: false, breadcrumbs: false, annotations: false },
   };
 
   applyTruncation(bundle);

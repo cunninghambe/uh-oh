@@ -3,6 +3,7 @@ import { Link, useParams } from '@tanstack/react-router';
 import { useRef, useState } from 'react';
 
 import { ApiError, type Release, api } from '../api.js';
+import { CommitLink } from '../components/CommitLink.js';
 import {
   EAGER_MAP_COUNT_THRESHOLD,
   formatMapCounts,
@@ -133,10 +134,12 @@ const ReleaseRow = ({
   release,
   eagerMaps,
   onUploadDone,
+  repoUrl,
 }: {
   release: Release;
   eagerMaps: boolean;
   onUploadDone: () => void;
+  repoUrl: string | null | undefined;
 }) => {
   const [status, setStatus] = useState<RowUploadStatus>({
     mapping: 'idle',
@@ -185,6 +188,15 @@ const ReleaseRow = ({
         {release.version}+{release.build}
       </td>
       <td className="px-4 py-3 text-xs text-zinc-400">{release.platform}</td>
+      <td className="px-4 py-3 text-xs">
+        {/* v0.8 CONTRACT (SPEC §23 release<->commit): commitSha is optional (older server, or a
+            release ingested before an app started sending one) — nothing renders when absent. */}
+        {release.commitSha ? (
+          <CommitLink sha={release.commitSha} repoUrl={repoUrl} />
+        ) : (
+          <span className="text-zinc-600">—</span>
+        )}
+      </td>
       <td className="px-4 py-3 text-xs text-zinc-400">{formatTs(release.mappingUploadedAt)}</td>
       <td className="px-4 py-3 text-xs text-zinc-400">{formatTs(release.sourcemapUploadedAt)}</td>
       <td className="px-4 py-3">
@@ -271,6 +283,7 @@ export const Releases = () => {
               <tr>
                 <th className="px-4 py-2">Version</th>
                 <th className="px-4 py-2">Platform</th>
+                <th className="px-4 py-2">Commit</th>
                 <th className="px-4 py-2">Mapping uploaded</th>
                 <th className="px-4 py-2">Source map uploaded</th>
                 <th className="px-4 py-2">Maps</th>
@@ -285,6 +298,7 @@ export const Releases = () => {
                   release={r}
                   eagerMaps={releasesQ.data.releases.length <= EAGER_MAP_COUNT_THRESHOLD}
                   onUploadDone={invalidateReleases}
+                  repoUrl={project?.repoUrl}
                 />
               ))}
             </tbody>

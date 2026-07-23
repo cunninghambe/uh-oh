@@ -13,10 +13,12 @@ import {
 } from '../db/repos/projects.js';
 import { computeImpact } from '../db/repos/impact.js';
 import { topIssues } from '../db/repos/top-issues.js';
+import { listFixAttempts, toFixAttemptView } from '../db/repos/fix-attempts.js';
 import type { Db } from '../db/index.js';
 import { buildAuthMiddleware } from '../auth/middleware.js';
 import { buildUploadAuthMiddleware } from '../auth/symbol-token.js';
 import { buildReadAuthMiddleware } from '../auth/read-token.js';
+import { buildAgentAuthMiddleware } from '../auth/agent-token.js';
 import { symbolicateEvent } from '../symbolication/symbolicate.js';
 import { buildIssueBundle } from './bundle.js';
 import { validateWebhookUrl } from '../webhooks/url-guard.js';
@@ -54,6 +56,7 @@ export const registerApiRoutes = (
   secret: Uint8Array,
   symbolToken?: string,
   readToken?: string,
+  agentToken?: string,
 ): void => {
   const auth = buildAuthMiddleware({ db, secret });
   const preHandler = auth as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
@@ -64,20 +67,29 @@ export const registerApiRoutes = (
     req: FastifyRequest,
     reply: FastifyReply,
   ) => Promise<void>;
-  // CONTRACT R (§22): the read token authorizes exactly the allowlisted GET
-  // routes below. `readPreHandler` accepts the read token OR a JWT; the
-  // non-allowlisted routes keep the JWT-only `preHandler` (or upload handler),
-  // so they reject the read token exactly as they reject no auth.
-  const readPreHandler = buildReadAuthMiddleware({ db, secret, readToken }) as (
+  // CONTRACT R (§22) + A (§23): the read token authorizes exactly the allowlisted
+  // GET routes below; the agent token authorizes them too (it authorizes
+  // everything the read token does). `readPreHandler` accepts either scoped token
+  // OR a JWT; the non-allowlisted routes keep the JWT-only `preHandler` (or upload
+  // handler), so they reject both scoped tokens exactly as they reject no auth.
+  const readPreHandler = buildReadAuthMiddleware({ db, secret, readToken, agentToken }) as (
     req: FastifyRequest,
     reply: FastifyReply,
   ) => Promise<void>;
-  // GET /api/projects belongs to BOTH allowlists: read token, symbol token, OR
-  // a JWT. Read is tried first, then it falls back to the upload handler.
+  // CONTRACT A (§23): the agent token additionally authorizes exactly four writes
+  // (this one: PATCH /api/issues/:id). It accepts the agent token OR a JWT; a read
+  // token does NOT match and falls through to the JWT check (rejected).
+  const agentPreHandler = buildAgentAuthMiddleware({ db, secret, agentToken }) as (
+    req: FastifyRequest,
+    reply: FastifyReply,
+  ) => Promise<void>;
+  // GET /api/projects belongs to BOTH allowlists: read/agent token, symbol token,
+  // OR a JWT. Read is tried first, then it falls back to the upload handler.
   const readOrUploadPreHandler = buildReadAuthMiddleware({
     db,
     secret,
     readToken,
+    agentToken,
     fallback: uploadPreHandler,
   }) as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
 
@@ -111,12 +123,18 @@ export const registerApiRoutes = (
       if (typeof body !== 'object' || body === null) {
         return reply.code(400).send({ error: 'invalid_body' });
       }
-      const { webhookUrl, alertDedupeMinutes, name } = body as {
+      const { webhookUrl, alertDedupeMinutes, name, repoUrl } = body as {
         webhookUrl?: unknown;
         alertDedupeMinutes?: unknown;
         name?: unknown;
+        repoUrl?: unknown;
       };
-      const patch: { webhookUrl?: string | null; alertDedupeMinutes?: number; name?: string } = {};
+      const patch: {
+        webhookUrl?: string | null;
+        alertDedupeMinutes?: number;
+        name?: string;
+        repoUrl?: string | null;
+      } = {};
       if (webhookUrl !== undefined) {
         if (webhookUrl === null) {
           patch.webhookUrl = null;
@@ -145,6 +163,17 @@ export const registerApiRoutes = (
           return reply.code(400).send({ error: 'invalid_name' });
         }
         patch.name = name;
+      }
+      // repoUrl (§23): ≤512 chars, nullable to clear. The server never contacts
+      // the git host, so no SSRF check — it is only stored + echoed.
+      if (repoUrl !== undefined) {
+        if (repoUrl === null) {
+          patch.repoUrl = null;
+        } else if (typeof repoUrl !== 'string' || repoUrl.length > 512) {
+          return reply.code(400).send({ error: 'invalid_repoUrl' });
+        } else {
+          patch.repoUrl = repoUrl;
+        }
       }
       const updated = updateProject(db, req.params.id, patch);
       if (!updated) return reply.code(404).send({ error: 'not_found' });
@@ -221,13 +250,18 @@ export const registerApiRoutes = (
       if (!issue) return reply.code(404).send({ error: 'not_found' });
       const latest = getLatestEventForIssue(db, issue.id);
       const breadcrumbs = latest ? listBreadcrumbs(db, latest.id) : [];
-      return { issue, latestEvent: latest, breadcrumbs };
+      // §23: expose fix attempts (newest first) on the detail. spikeActive /
+      // lastSpikeAt ride along on the `issue` row itself.
+      const fixAttempts = listFixAttempts(db, issue.id).map(toFixAttemptView);
+      return { issue, latestEvent: latest, breadcrumbs, fixAttempts };
     },
   );
 
+  // CONTRACT A (§23): reclassified from JWT-only to agent scope — the agent token
+  // (or a JWT) may change an issue's status; the read token still cannot.
   app.patch<{ Params: { id: string }; Body: unknown }>(
     '/api/issues/:id',
-    { preHandler },
+    { preHandler: agentPreHandler },
     (req, reply) => {
       const status = (req.body as { status?: unknown } | null)?.status;
       // Only open|resolved|ignored are user-settable; PATCHing a regressed issue

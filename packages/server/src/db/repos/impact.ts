@@ -18,7 +18,10 @@ export type IssueImpact = {
   distinctUsers: number | null;
   topDevices: Array<{ model: string; events: number }>;
   topOs: Array<{ os: string; events: number }>;
-  releases: Array<{ release: string; events: number }>;
+  // `commitSha` (v0.8 §23) is the commit for that release label when a release row
+  // for the project carries one, else null. Derived from the releases table, not
+  // the event payload, so it survives even when the payload omits it.
+  releases: Array<{ release: string; events: number; commitSha: string | null }>;
   platforms: Array<{ platform: string; events: number }>;
 };
 
@@ -55,7 +58,7 @@ export const computeImpact = (db: DbOrTx, issueId: string): IssueImpact => {
     LIMIT ${TOP_N}
   `);
 
-  const releases = db.all<{ release: string; events: number }>(sql`
+  const releaseRows = db.all<{ release: string; events: number }>(sql`
     SELECT
       json_extract(payload, '$.release.version') || '+' || json_extract(payload, '$.release.build') AS release,
       COUNT(*) AS events
@@ -67,6 +70,27 @@ export const computeImpact = (db: DbOrTx, issueId: string): IssueImpact => {
     ORDER BY events DESC, release ASC
     LIMIT ${TOP_N}
   `);
+
+  // Attach the commit for each release label from the releases table (scoped to
+  // the issue's project). A label maps to at most one commit here; when several
+  // platform rows share a version+build we take the lexically-first non-null sha
+  // so the result is deterministic.
+  const commitRows = db.all<{ label: string; commitSha: string | null }>(sql`
+    SELECT version || '+' || build AS label, commit_sha AS commitSha
+    FROM releases
+    WHERE project_id = (SELECT project_id FROM issues WHERE id = ${issueId})
+      AND commit_sha IS NOT NULL
+    ORDER BY label ASC, commit_sha ASC
+  `);
+  const commitByLabel = new Map<string, string>();
+  for (const c of commitRows) {
+    if (c.commitSha !== null && !commitByLabel.has(c.label))
+      commitByLabel.set(c.label, c.commitSha);
+  }
+  const releases = releaseRows.map((r) => ({
+    ...r,
+    commitSha: commitByLabel.get(r.release) ?? null,
+  }));
 
   const platforms = db.all<{ platform: string; events: number }>(sql`
     SELECT platform, COUNT(*) AS events

@@ -62,6 +62,8 @@ const makeListFiles = (opts?: {
   };
 };
 
+const noCommit = (): Promise<string | undefined> => Promise.resolve(undefined);
+
 const makeDeps = (
   cfg: Config | null,
   fetchResponses: Array<{ status: number; body: unknown }>,
@@ -69,6 +71,7 @@ const makeDeps = (
     listFiles?: (dir: string) => Promise<string[]>;
     statSize?: number;
     statFile?: (p: string) => Promise<{ size: number }>;
+    resolveCommitSha?: (flagValue: string | undefined) => Promise<string | undefined>;
   },
 ): NextSourcemapsDeps & { logs: string[] } => {
   const logs: string[] = [];
@@ -79,6 +82,7 @@ const makeDeps = (
     readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
     statFile: opts?.statFile ?? (() => Promise.resolve({ size: opts?.statSize ?? 1024 })),
     listFiles: opts?.listFiles ?? makeListFiles(),
+    resolveCommitSha: opts?.resolveCommitSha ?? noCommit,
     logs,
   };
 };
@@ -126,6 +130,7 @@ describe('uploadNextSourcemaps', () => {
       readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
       statFile: () => Promise.resolve({ size: 1024 }),
       listFiles: makeListFiles(),
+      resolveCommitSha: noCommit,
       logs,
     };
 
@@ -222,6 +227,7 @@ describe('uploadNextSourcemaps', () => {
       readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
       statFile: () => Promise.resolve({ size: 1024 }),
       listFiles: makeListFiles(),
+      resolveCommitSha: noCommit,
       logs,
     };
 
@@ -247,6 +253,94 @@ describe('uploadNextSourcemaps', () => {
     // Uploads then proceed for BOTH platforms against the resolved ids.
     expect(deps.logs.at(-1)).toBe('uploaded 2 web + 1 node maps (0 skipped)');
     expect(calls.slice(3).every((c) => c.url.endsWith('/symbols'))).toBe(true);
+  });
+
+  it('passes --commit through to resolveCommitSha and includes the resolved commitSha on every upsert', async () => {
+    const calls: FetchCall[] = [];
+    const seenFlagValues: Array<string | undefined> = [];
+    const cfg: Config = { server: 'http://localhost:3300', token: 'tok' };
+    const deps: NextSourcemapsDeps & { logs: string[] } = {
+      config: { read: () => Promise.resolve(cfg) },
+      fetchFn: makeCapturingFetch(
+        [
+          { status: 200, body: { projects: [baseProject] } },
+          { status: 200, body: { releases: [] } }, // neither platform exists yet
+          { status: 201, body: { release: webRelease } }, // upsert web
+          { status: 201, body: { release: nodeRelease } }, // upsert node
+          { status: 200, body: { release: webRelease } }, // upload 1/3 (web)
+          { status: 200, body: { release: webRelease } }, // upload 2/3 (web)
+          { status: 200, body: { release: nodeRelease } }, // upload 3/3 (node)
+        ],
+        calls,
+      ),
+      log: () => {},
+      readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
+      statFile: () => Promise.resolve({ size: 1024 }),
+      listFiles: makeListFiles(),
+      resolveCommitSha: (flagValue) => {
+        seenFlagValues.push(flagValue);
+        return Promise.resolve('abc1234');
+      },
+      logs: [],
+    };
+
+    const code = await uploadNextSourcemaps(deps, {
+      project: 'my-app',
+      release: '1.0.0+42',
+      dir: '/app/.next',
+      commit: 'ABC1234',
+    });
+
+    expect(code).toBe(0);
+    expect(seenFlagValues).toEqual(['ABC1234']);
+    const upserts = calls.filter(
+      (c) =>
+        c.url === 'http://localhost:3300/api/projects/proj-1/releases' && c.init.method === 'POST',
+    );
+    expect(upserts).toHaveLength(2);
+    for (const upsert of upserts) {
+      expect(JSON.parse(upsert.init.body as string)).toMatchObject({ commitSha: 'abc1234' });
+    }
+  });
+
+  it('omits commitSha from the upsert body when resolveCommitSha resolves nothing', async () => {
+    const calls: FetchCall[] = [];
+    const cfg: Config = { server: 'http://localhost:3300', token: 'tok' };
+    const deps: NextSourcemapsDeps & { logs: string[] } = {
+      config: { read: () => Promise.resolve(cfg) },
+      fetchFn: makeCapturingFetch(
+        [
+          { status: 200, body: { projects: [baseProject] } },
+          { status: 200, body: { releases: [] } },
+          { status: 201, body: { release: webRelease } }, // upsert web
+          { status: 201, body: { release: nodeRelease } }, // upsert node
+          { status: 200, body: { release: webRelease } }, // upload 1/3 (web)
+          { status: 200, body: { release: webRelease } }, // upload 2/3 (web)
+          { status: 200, body: { release: nodeRelease } }, // upload 3/3 (node)
+        ],
+        calls,
+      ),
+      log: () => {},
+      readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
+      statFile: () => Promise.resolve({ size: 1024 }),
+      listFiles: makeListFiles(),
+      resolveCommitSha: noCommit,
+      logs: [],
+    };
+
+    const code = await uploadNextSourcemaps(deps, {
+      project: 'my-app',
+      release: '1.0.0+42',
+      dir: '/app/.next',
+    });
+
+    expect(code).toBe(0);
+    const upsert = calls.find(
+      (c) =>
+        c.url === 'http://localhost:3300/api/projects/proj-1/releases' && c.init.method === 'POST',
+    );
+    expect(upsert).toBeDefined();
+    expect(JSON.parse(upsert?.init.body as string)).not.toHaveProperty('commitSha');
   });
 
   it('a failed release upsert fails only that platform and continues with the other', async () => {

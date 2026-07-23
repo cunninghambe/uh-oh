@@ -115,7 +115,7 @@ describe('computeImpact', () => {
     seed({ platform: 'web', release: { version: '2.0.0', build: '9' } });
     seed({ platform: 'node', release: { version: '2.0.0', build: '10' } });
     const impact = computeImpact(db, issueId);
-    expect(impact.releases[0]).toEqual({ release: '2.0.0+9', events: 2 });
+    expect(impact.releases[0]).toEqual({ release: '2.0.0+9', events: 2, commitSha: null });
     expect(impact.platforms[0]).toEqual({ platform: 'web', events: 2 });
     expect(impact.platforms.map((p) => p.platform)).toContain('node');
   });

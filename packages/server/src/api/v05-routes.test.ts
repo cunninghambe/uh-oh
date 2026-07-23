@@ -72,7 +72,7 @@ describe('GET /api/issues/:id/impact', () => {
     const impact = res.json<IssueImpact>();
     expect(impact.distinctUsers).toBe(3);
     expect(impact.platforms[0]).toEqual({ platform: 'web', events: 3 });
-    expect(impact.releases[0]).toEqual({ release: '1.0.0+1', events: 3 });
+    expect(impact.releases[0]).toEqual({ release: '1.0.0+1', events: 3, commitSha: null });
   });
 });
 
@@ -97,7 +97,7 @@ describe('GET /api/issues/:id/bundle', () => {
     const bundle = res.json<IssueBundle>();
     expect(bundle.issue.id).toBe(issueId);
     expect(bundle.project.slug).toBe(project.slug);
-    expect(bundle.truncated).toEqual({ context: false, breadcrumbs: false });
+    expect(bundle.truncated).toEqual({ context: false, breadcrumbs: false, annotations: false });
     expect(res.rawPayload.length).toBeLessThanOrEqual(64 * 1024);
   });
 });

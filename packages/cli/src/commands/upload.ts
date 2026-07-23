@@ -13,6 +13,10 @@ export type UploadDeps = {
   log: (line: string) => void;
   readFile: (path: string) => Promise<Buffer>;
   statFile: (path: string) => Promise<{ size: number }>;
+  // Resolves the commitSha to send with the release upsert (SPEC 23):
+  // --commit flag, UH_OH_COMMIT_SHA env, guarded `git rev-parse HEAD`, in
+  // that order; undefined means nothing valid resolved (already logged).
+  resolveCommitSha: (flagValue: string | undefined) => Promise<string | undefined>;
 };
 
 type ProjectRow = { id: string; slug: string };
@@ -35,6 +39,7 @@ export const upload = async (
     file: string;
     platform?: UploadPlatform;
     bundlePath?: string;
+    commit?: string;
   },
 ): Promise<number> => {
   const cfg = await deps.config.read();
@@ -95,6 +100,7 @@ export const upload = async (
   // (POST /api/projects/:id/releases → 201 created / 200 existing). The legacy
   // android flows keep requiring a device-seen release, unchanged.
   if (!rel && kind === 'sourcemap' && args.platform) {
+    const commitSha = await deps.resolveCommitSha(args.commit);
     const createdResult = await apiFetch<{ release: ReleaseRow }>(
       `${cfg.server}/api/projects/${project.id}/releases`,
       {
@@ -104,6 +110,7 @@ export const upload = async (
           version: parsed.version,
           build: parsed.build,
           platform: effectivePlatform,
+          ...(commitSha ? { commitSha } : {}),
         }),
         token: cfg.token,
       },

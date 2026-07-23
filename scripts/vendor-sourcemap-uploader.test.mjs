@@ -9,11 +9,12 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { createServer } from 'node:http';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   EMITTED_FILENAME,
@@ -54,6 +55,10 @@ function tmp(label) {
   return mkdtempSync(join(tmpdir(), `uh-oh-smu-${label}-`));
 }
 
+// The uh-oh repo checkout itself - a real git repo, used as a deterministic
+// fixture for the "resolves via git rev-parse HEAD" tests below.
+const REPO_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+
 /**
  * Emits the uploader into `dir` and returns its path.
  * @param {string} dir
@@ -66,25 +71,29 @@ function emit(dir) {
 }
 
 /**
- * Runs a node script as a child process with the three UH_OH_* vars stripped
+ * Runs a node script as a child process with the four UH_OH_* vars stripped
  * from the base env (so the host machine's config can't leak into a test),
- * then applies `overrides` (a value of undefined deletes the key).
+ * then applies `overrides` (a value of undefined deletes the key). `cwd`
+ * controls where the script (and, for the commit tests, its internal `git
+ * rev-parse HEAD`) runs; it defaults to this process's cwd when omitted.
  * @param {string} scriptPath
  * @param {string[]} args
  * @param {Record<string, string | undefined>} [overrides]
+ * @param {string} [cwd]
  * @returns {Promise<{ code: number, stdout: string, stderr: string }>}
  */
-function runNode(scriptPath, args, overrides = {}) {
+function runNode(scriptPath, args, overrides = {}, cwd = undefined) {
   const env = { ...process.env };
   delete env.UH_OH_SERVER_URL;
   delete env.UH_OH_SYMBOL_TOKEN;
   delete env.UH_OH_PROJECT;
+  delete env.UH_OH_COMMIT_SHA;
   for (const [k, v] of Object.entries(overrides)) {
     if (v === undefined) delete env[k];
     else env[k] = v;
   }
   return new Promise((res) => {
-    execFile(process.execPath, [scriptPath, ...args], { env }, (err, stdout, stderr) => {
+    execFile(process.execPath, [scriptPath, ...args], { env, cwd }, (err, stdout, stderr) => {
       const code = err ? (typeof err.code === 'number' ? err.code : 1) : 0;
       res({ code, stdout, stderr });
     });
@@ -531,6 +540,192 @@ void test('--dry-run lists maps and makes no network requests', async () => {
     assert.match(r.stdout, /would upload 1 web \+ 1 node/);
   } finally {
     await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Emitted script: commit resolution (UH_OH_COMMIT_SHA / git rev-parse HEAD).
+// ---------------------------------------------------------------------------
+
+void test('sends the resolved UH_OH_COMMIT_SHA (lowercased) on every release upsert', async () => {
+  const dir = tmp('commit-env');
+  const stub = await startStub({
+    project: 'my-app',
+    version: '1.4.2',
+    build: '37',
+    existingPlatforms: [],
+  });
+  try {
+    const build = join(dir, '.next');
+    makeFixture(build);
+    const script = emit(dir);
+    const r = await runNode(script, ['--dir', build, '--release', '1.4.2+37'], {
+      ...stub.env,
+      UH_OH_COMMIT_SHA: 'ABCDEF1',
+    });
+    assert.equal(r.code, 0, r.stderr);
+
+    const upserts = stub.requests.filter(
+      (q) => q.method === 'POST' && q.url === '/api/projects/proj-1/releases',
+    );
+    assert.equal(upserts.length, 2, 'one upsert per missing platform');
+    for (const upsert of upserts) {
+      const body = /** @type {{ commitSha?: string }} */ (parseJson(upsert.body));
+      assert.equal(body.commitSha, 'abcdef1', 'commitSha is sent lowercased');
+    }
+    assert.equal(r.stdout.includes('omitting commitSha'), false);
+  } finally {
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test('an invalid UH_OH_COMMIT_SHA is omitted with exactly one log line, and upserts still succeed', async () => {
+  const dir = tmp('commit-env-bad');
+  const stub = await startStub({
+    project: 'my-app',
+    version: '1.4.2',
+    build: '37',
+    existingPlatforms: [],
+  });
+  try {
+    const build = join(dir, '.next');
+    makeFixture(build);
+    const script = emit(dir);
+    const r = await runNode(script, ['--dir', build, '--release', '1.4.2+37'], {
+      ...stub.env,
+      UH_OH_COMMIT_SHA: 'not-a-sha',
+    });
+    assert.equal(r.code, 0, r.stderr);
+
+    const upserts = stub.requests.filter(
+      (q) => q.method === 'POST' && q.url === '/api/projects/proj-1/releases',
+    );
+    assert.equal(upserts.length, 2, 'one upsert per missing platform');
+    for (const upsert of upserts) {
+      const body = /** @type {{ commitSha?: string }} */ (parseJson(upsert.body));
+      assert.equal(Object.hasOwn(body, 'commitSha'), false, 'commitSha is omitted, not sent empty');
+    }
+
+    const lines = r.stdout.split('\n').filter((l) => l.includes('omitting commitSha'));
+    assert.equal(lines.length, 1, `expected exactly one log line, got:\n${r.stdout}`);
+    assert.match(lines[0], /ignoring invalid UH_OH_COMMIT_SHA/);
+  } finally {
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test('falls back to `git rev-parse HEAD` when UH_OH_COMMIT_SHA is unset, resolving the real HEAD of cwd', async () => {
+  const dir = tmp('commit-git');
+  const stub = await startStub({
+    project: 'my-app',
+    version: '1.4.2',
+    build: '37',
+    existingPlatforms: [],
+  });
+  try {
+    const build = join(dir, '.next');
+    makeFixture(build);
+    const script = emit(dir);
+    const expectedSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT })
+      .toString()
+      .trim()
+      .toLowerCase();
+
+    const r = await runNode(script, ['--dir', build, '--release', '1.4.2+37'], stub.env, REPO_ROOT);
+    assert.equal(r.code, 0, r.stderr);
+
+    const upserts = stub.requests.filter(
+      (q) => q.method === 'POST' && q.url === '/api/projects/proj-1/releases',
+    );
+    assert.equal(upserts.length, 2);
+    for (const upsert of upserts) {
+      const body = /** @type {{ commitSha?: string }} */ (parseJson(upsert.body));
+      assert.equal(body.commitSha, expectedSha);
+    }
+  } finally {
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test('omits commitSha with exactly one log line when run outside any git repository', async () => {
+  const nonGitRoot = tmp('commit-nogit');
+  const dir = tmp('commit-nogit-build');
+  const stub = await startStub({
+    project: 'my-app',
+    version: '1.4.2',
+    build: '37',
+    existingPlatforms: [],
+  });
+  try {
+    const build = join(dir, '.next');
+    makeFixture(build);
+    const script = emit(dir);
+    const r = await runNode(
+      script,
+      ['--dir', build, '--release', '1.4.2+37'],
+      stub.env,
+      nonGitRoot,
+    );
+    assert.equal(r.code, 0, r.stderr);
+
+    const upserts = stub.requests.filter(
+      (q) => q.method === 'POST' && q.url === '/api/projects/proj-1/releases',
+    );
+    assert.equal(upserts.length, 2);
+    for (const upsert of upserts) {
+      const body = /** @type {{ commitSha?: string }} */ (parseJson(upsert.body));
+      assert.equal(Object.hasOwn(body, 'commitSha'), false);
+    }
+
+    const lines = r.stdout.split('\n').filter((l) => l.includes('omitting commitSha'));
+    assert.equal(lines.length, 1, `expected exactly one log line, got:\n${r.stdout}`);
+    assert.match(lines[0], /no commit SHA resolved/);
+  } finally {
+    await stub.close();
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(nonGitRoot, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Generator: commit-resolution logic is present in the emitted output.
+// ---------------------------------------------------------------------------
+
+void test('the generator output contains the commit-resolution logic, still has no em dash, and still parses', () => {
+  const dir = tmp('commit-static');
+  try {
+    for (const src of [UPLOADER_TEMPLATE, buildHeader('x')]) {
+      assert.equal(src.includes('—'), false, 'no em dash');
+    }
+    assert.ok(UPLOADER_TEMPLATE.includes('UH_OH_COMMIT_SHA'), 'reads the env var');
+    assert.ok(UPLOADER_TEMPLATE.includes('gitRevParseHead'), 'has the guarded git helper');
+    assert.ok(UPLOADER_TEMPLATE.includes('resolveCommitSha'), 'has the resolver');
+    assert.ok(UPLOADER_TEMPLATE.includes('COMMIT_SHA_RE'), 'validates against the SHA regex');
+    assert.ok(UPLOADER_TEMPLATE.includes('commitSha'), 'sends commitSha on the upsert');
+
+    const script = emit(dir);
+    const written = readFileSync(script, 'utf8');
+    assert.equal(written.includes('—'), false, 'emitted file has no em dash');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+void test('the emitted script is syntactically valid (node --check)', async () => {
+  const dir = tmp('commit-syntax');
+  try {
+    const script = emit(dir);
+    await new Promise((resolvePromise, rejectPromise) => {
+      execFile(process.execPath, ['--check', script], (err, _stdout, stderr) => {
+        if (err) rejectPromise(new Error(stderr || err.message));
+        else resolvePromise(undefined);
+      });
+    });
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

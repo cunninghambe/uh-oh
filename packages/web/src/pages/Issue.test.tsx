@@ -18,7 +18,9 @@ import {
   api,
   type Breadcrumb,
   type EventRow,
+  type FixAttempt,
   type Issue as IssueT,
+  type Project as ProjectT,
   type ResolvedFrame,
 } from '../api.js';
 import { Issue } from './Issue.js';
@@ -68,6 +70,17 @@ const baseEvent: EventRow = {
 };
 
 const breadcrumbs: Breadcrumb[] = [];
+
+const sampleProject: ProjectT = {
+  id: 'p1',
+  name: 'Demo',
+  slug: 'demo',
+  publicKey: 'pk_1',
+  webhookUrl: null,
+  repoUrl: null,
+  alertDedupeMinutes: 30,
+  createdAt: Date.now(),
+};
 
 const renderIssue = () => {
   const router = buildRouter('/issues/i1');
@@ -175,5 +188,120 @@ describe('Issue page — v0.5 CONTRACT I (impact panel)', () => {
       expect(api.getIssueImpact).toHaveBeenCalled();
     });
     expect(screen.queryByText('Impact')).not.toBeInTheDocument();
+  });
+});
+
+describe('Issue page — v0.8 CONTRACT (SPEC §23 spike badge)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('renders a Spike badge in the header when the issue is actively spiking', async () => {
+    vi.spyOn(api, 'getIssue').mockResolvedValue({
+      issue: { ...baseIssue, spikeActive: true },
+      latestEvent: baseEvent,
+      breadcrumbs,
+    });
+    vi.spyOn(api, 'listIssueEvents').mockResolvedValue({ events: [], total: 0 });
+    vi.spyOn(api, 'getIssueImpact').mockRejectedValue(new ApiError(404, 'not found'));
+    vi.spyOn(api, 'getEvent').mockResolvedValue({ event: baseEvent, breadcrumbs, frames: [] });
+    vi.spyOn(api, 'getProject').mockRejectedValue(new ApiError(404, 'not found'));
+    vi.spyOn(api, 'listIssueAnnotations').mockRejectedValue(new ApiError(404, 'not found'));
+
+    renderIssue();
+
+    expect(await screen.findByText('Spike')).toBeInTheDocument();
+  });
+
+  it('renders no Spike badge when the issue is not spiking (false or absent)', async () => {
+    vi.spyOn(api, 'getIssue').mockResolvedValue({
+      issue: { ...baseIssue, spikeActive: false },
+      latestEvent: baseEvent,
+      breadcrumbs,
+    });
+    vi.spyOn(api, 'listIssueEvents').mockResolvedValue({ events: [], total: 0 });
+    vi.spyOn(api, 'getIssueImpact').mockRejectedValue(new ApiError(404, 'not found'));
+    vi.spyOn(api, 'getEvent').mockResolvedValue({ event: baseEvent, breadcrumbs, frames: [] });
+    vi.spyOn(api, 'getProject').mockRejectedValue(new ApiError(404, 'not found'));
+    vi.spyOn(api, 'listIssueAnnotations').mockRejectedValue(new ApiError(404, 'not found'));
+
+    renderIssue();
+
+    await screen.findByText('Boom');
+    expect(screen.queryByText('Spike')).not.toBeInTheDocument();
+  });
+});
+
+describe('Issue page — v0.8 CONTRACT (SPEC §23 fix attempts panel wiring)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const baseFixAttempt: FixAttempt = {
+    id: 'fa1',
+    prUrl: 'https://github.com/org/repo/pull/1',
+    commitSha: 'abcdef0123456',
+    state: 'filed',
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+
+  it('renders the panel with an empty state when fixAttempts is present but empty', async () => {
+    vi.spyOn(api, 'getIssue').mockResolvedValue({
+      issue: baseIssue,
+      latestEvent: baseEvent,
+      breadcrumbs,
+      fixAttempts: [],
+    });
+    vi.spyOn(api, 'listIssueEvents').mockResolvedValue({ events: [], total: 0 });
+    vi.spyOn(api, 'getIssueImpact').mockRejectedValue(new ApiError(404, 'not found'));
+    vi.spyOn(api, 'getEvent').mockResolvedValue({ event: baseEvent, breadcrumbs, frames: [] });
+    vi.spyOn(api, 'getProject').mockResolvedValue({ project: sampleProject });
+    vi.spyOn(api, 'listIssueAnnotations').mockRejectedValue(new ApiError(404, 'not found'));
+
+    renderIssue();
+
+    expect(await screen.findByText('Fix attempts')).toBeInTheDocument();
+    expect(screen.getByText('No fix attempts yet.')).toBeInTheDocument();
+  });
+
+  it('renders no Fix attempts panel when fixAttempts is absent (older server)', async () => {
+    vi.spyOn(api, 'getIssue').mockResolvedValue({
+      issue: baseIssue,
+      latestEvent: baseEvent,
+      breadcrumbs,
+      // fixAttempts intentionally omitted — mirrors an older server's JSON.
+    });
+    vi.spyOn(api, 'listIssueEvents').mockResolvedValue({ events: [], total: 0 });
+    vi.spyOn(api, 'getIssueImpact').mockRejectedValue(new ApiError(404, 'not found'));
+    vi.spyOn(api, 'getEvent').mockResolvedValue({ event: baseEvent, breadcrumbs, frames: [] });
+    vi.spyOn(api, 'getProject').mockResolvedValue({ project: sampleProject });
+    vi.spyOn(api, 'listIssueAnnotations').mockRejectedValue(new ApiError(404, 'not found'));
+
+    renderIssue();
+
+    await screen.findByText('Boom');
+    expect(screen.queryByText('Fix attempts')).not.toBeInTheDocument();
+  });
+
+  it("links a fix attempt's commit SHA using the project's repoUrl", async () => {
+    vi.spyOn(api, 'getIssue').mockResolvedValue({
+      issue: baseIssue,
+      latestEvent: baseEvent,
+      breadcrumbs,
+      fixAttempts: [baseFixAttempt],
+    });
+    vi.spyOn(api, 'listIssueEvents').mockResolvedValue({ events: [], total: 0 });
+    vi.spyOn(api, 'getIssueImpact').mockRejectedValue(new ApiError(404, 'not found'));
+    vi.spyOn(api, 'getEvent').mockResolvedValue({ event: baseEvent, breadcrumbs, frames: [] });
+    vi.spyOn(api, 'getProject').mockResolvedValue({
+      project: { ...sampleProject, repoUrl: 'https://github.com/org/repo' },
+    });
+    vi.spyOn(api, 'listIssueAnnotations').mockRejectedValue(new ApiError(404, 'not found'));
+
+    renderIssue();
+
+    const link = await screen.findByRole('link', { name: 'abcdef0' });
+    expect(link).toHaveAttribute('href', 'https://github.com/org/repo/commit/abcdef0123456');
   });
 });

@@ -7,8 +7,12 @@
 
 import {
   BackendError,
+  type Annotation,
+  type ClientAnnotationKind,
+  type ClientFixAttemptTransition,
   type EventDetail,
   type EventRecord,
+  type FixAttempt,
   type HealthReport,
   type Issue,
   type IssueBundle,
@@ -20,6 +24,7 @@ import {
   type Monitor,
   type Project,
   type Release,
+  type SimilarIssue,
   type TopIssue,
   type UhOhBackend,
   type UpdateProjectInput,
@@ -37,10 +42,24 @@ import { topIssues } from '../db/repos/top-issues.js';
 import { usageSummary } from '../db/repos/usage-summary.js';
 import type { Db } from '../db/index.js';
 import type { ProjectRow } from '../db/schema.js';
-import { registry } from '../metrics/registry.js';
+import { metrics, registry } from '../metrics/registry.js';
 import { symbolicateEvent } from '../symbolication/symbolicate.js';
 import { validateWebhookUrl } from '../webhooks/url-guard.js';
 import { parseMetricsSubset } from '@uh-oh/mcp';
+import {
+  MAX_ANNOTATION_BODY,
+  createAnnotation,
+  writeSystemAnnotation,
+  toAnnotationView,
+} from '../db/repos/annotations.js';
+import {
+  applyFixAttemptTransition,
+  getFixAttempt,
+  isAllowedClientTransition,
+  toFixAttemptView,
+  upsertFixAttempt,
+} from '../db/repos/fix-attempts.js';
+import { similarIssues } from '../db/repos/similar.js';
 
 export class InProcessBackend implements UhOhBackend {
   constructor(private readonly db: Db) {}
@@ -170,5 +189,107 @@ export class InProcessBackend implements UhOhBackend {
     // Same aggregation the GET /api/projects/:id/usage/summary route runs, so
     // the in-process and HTTP backends return identical summaries.
     return Promise.resolve(usageSummary(this.db, input.projectId, input.days));
+  }
+
+  // ── v0.8 agent-loop (§23) ───────────────────────────────────────────────────
+
+  listSimilarIssues(input: { issueId: string }): Promise<SimilarIssue[] | null> {
+    // Mirrors GET /api/issues/:id/similar, which 404s on an unknown issue.
+    if (!getIssue(this.db, input.issueId)) return Promise.resolve(null);
+    return Promise.resolve(similarIssues(this.db, input.issueId));
+  }
+
+  createAnnotation(input: {
+    issueId: string;
+    body: string;
+    kind?: ClientAnnotationKind;
+    author?: string;
+  }): Promise<Annotation> {
+    // Mirrors POST /api/issues/:id/annotations, which 404s on an unknown issue.
+    if (!getIssue(this.db, input.issueId)) {
+      throw new BackendError('issue not found', { code: 'not_found', status: 404 });
+    }
+    // The route caps the body by BYTES (413), not chars — the tool's zod schema
+    // only caps chars, so a multi-byte body could slip past it. Re-check here
+    // for parity with the HTTP path.
+    if (Buffer.byteLength(input.body, 'utf8') > MAX_ANNOTATION_BODY) {
+      throw new BackendError('annotation body too large', {
+        code: 'body_too_large',
+        status: 413,
+      });
+    }
+    const row = createAnnotation(
+      this.db,
+      {
+        issueId: input.issueId,
+        body: input.body,
+        ...(input.kind !== undefined ? { kind: input.kind } : {}),
+        ...(input.author !== undefined ? { author: input.author } : {}),
+      },
+      Date.now(),
+    );
+    return Promise.resolve(toAnnotationView(row));
+  }
+
+  upsertFixAttempt(input: {
+    issueId: string;
+    prUrl: string;
+    commitSha?: string;
+  }): Promise<FixAttempt> {
+    // Mirrors POST /api/issues/:id/fix-attempts, which 404s on an unknown issue.
+    if (!getIssue(this.db, input.issueId)) {
+      throw new BackendError('issue not found', { code: 'not_found', status: 404 });
+    }
+    const { attempt } = upsertFixAttempt(
+      this.db,
+      {
+        issueId: input.issueId,
+        prUrl: input.prUrl,
+        ...(input.commitSha !== undefined ? { commitSha: input.commitSha } : {}),
+      },
+      Date.now(),
+    );
+    return Promise.resolve(toFixAttemptView(attempt));
+  }
+
+  transitionFixAttempt(input: {
+    fixAttemptId: string;
+    state: ClientFixAttemptTransition;
+  }): Promise<FixAttempt> {
+    // Mirrors PATCH /api/fix-attempts/:id: 404 on an unknown attempt, 400 on a
+    // transition the state machine does not allow, a system annotation audit
+    // trail on every transition, and marking 'deployed' resolves an open or
+    // regressed issue (re-arming §18 regression detection).
+    const attempt = getFixAttempt(this.db, input.fixAttemptId);
+    if (!attempt) {
+      throw new BackendError('fix attempt not found', { code: 'not_found', status: 404 });
+    }
+    if (!isAllowedClientTransition(attempt.state, input.state)) {
+      throw new BackendError(`invalid transition ${attempt.state} -> ${input.state}`, {
+        code: 'invalid_transition',
+        status: 400,
+      });
+    }
+
+    const now = Date.now();
+    this.db.transaction((tx) => {
+      applyFixAttemptTransition(tx, attempt, input.state, now);
+      writeSystemAnnotation(
+        tx,
+        attempt.issueId,
+        `fix attempt ${input.state}: ${attempt.prUrl} (${attempt.state} -> ${input.state})`,
+        now,
+      );
+      if (input.state === 'deployed') {
+        const issue = getIssue(tx, attempt.issueId);
+        if (issue && (issue.status === 'open' || issue.status === 'regressed')) {
+          setIssueStatus(tx, attempt.issueId, 'resolved');
+        }
+      }
+    });
+    if (input.state === 'failed') metrics.fixFailed.inc();
+
+    const updated = getFixAttempt(this.db, attempt.id);
+    return Promise.resolve(toFixAttemptView(updated ?? attempt));
   }
 }

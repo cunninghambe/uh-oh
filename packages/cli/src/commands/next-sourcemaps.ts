@@ -13,6 +13,10 @@ export type NextSourcemapsDeps = {
   // [] (not reject) when `dir` does not exist — a Next.js static export has
   // no `server/` output, and that's a normal, zero-file case, not an error.
   listFiles: (dir: string) => Promise<string[]>;
+  // Resolves the commitSha to send with the release upsert (SPEC 23):
+  // --commit flag, UH_OH_COMMIT_SHA env, guarded `git rev-parse HEAD`, in
+  // that order; undefined means nothing valid resolved (already logged).
+  resolveCommitSha: (flagValue: string | undefined) => Promise<string | undefined>;
 };
 
 type ProjectRow = { id: string; slug: string };
@@ -111,7 +115,7 @@ const uploadOne = async (
 
 export const uploadNextSourcemaps = async (
   deps: NextSourcemapsDeps,
-  args: { project: string; release: string; dir: string; dryRun?: boolean },
+  args: { project: string; release: string; dir: string; dryRun?: boolean; commit?: string },
 ): Promise<number> => {
   const parsed = parseRelease(args.release);
   if (!parsed) {
@@ -163,6 +167,7 @@ export const uploadNextSourcemaps = async (
     return 2;
   }
   const { server, token } = cfg;
+  const commitSha = await deps.resolveCommitSha(args.commit);
 
   const projectsResult = await apiFetch<{ projects: ProjectRow[] }>(
     `${server}/api/projects`,
@@ -204,7 +209,12 @@ export const uploadNextSourcemaps = async (
       {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ version: parsed.version, build: parsed.build, platform }),
+        body: JSON.stringify({
+          version: parsed.version,
+          build: parsed.build,
+          platform,
+          ...(commitSha ? { commitSha } : {}),
+        }),
         token,
       },
       deps.fetchFn,

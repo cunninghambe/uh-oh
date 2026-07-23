@@ -4,8 +4,13 @@ import { beforeEach, describe, expect, it } from 'vitest';
 
 import {
   BackendError,
+  type Annotation,
   type BreadcrumbRecord,
+  type ClientAnnotationKind,
+  type ClientFixAttemptTransition,
   type EventRecord,
+  type FixAttempt,
+  type FixAttemptState,
   type HealthReport,
   type Issue,
   type IssueBundle,
@@ -18,12 +23,19 @@ import {
   type Project,
   type Release,
   type ResolvedFrame,
+  type SimilarIssue,
   type TopIssue,
   type UhOhBackend,
   type UpdateProjectInput,
   type UsageSummary,
 } from './backend.js';
-import { createUhOhMcpServer, TOOL_READONLY, scopeError, type ToolScope } from './tools.js';
+import {
+  createUhOhMcpServer,
+  TOOL_SCOPE,
+  scopeError,
+  type RequiredScope,
+  type ToolScope,
+} from './tools.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -116,8 +128,43 @@ const BREADCRUMBS: BreadcrumbRecord[] = Array.from({ length: 25 }, (_, i) => ({
   data: i === 24 ? JSON.stringify({ to: 'checkout' }) : null,
 }));
 
+const ANNOTATION: Annotation = {
+  id: 'an1',
+  issueId: 'i1',
+  author: 'agent',
+  kind: 'note',
+  body: 'looked into it, seems to be a null deref',
+  createdAt: 1_700_000_150_000,
+};
+
+const FIX_ATTEMPT: FixAttempt = {
+  id: 'fa1',
+  issueId: 'i1',
+  prUrl: 'https://github.com/org/repo/pull/1',
+  commitSha: null,
+  state: 'filed',
+  createdAt: 1_700_000_160_000,
+  deployedAt: null,
+  updatedAt: 1_700_000_160_000,
+};
+
+const SIMILAR_ISSUE: SimilarIssue = {
+  issue: {
+    id: 'i2',
+    projectId: 'p1',
+    projectSlug: 'my-app',
+    title: 'TypeError: boom',
+    status: 'resolved',
+    platform: 'android',
+    lastSeen: 1_700_000_140_000,
+    eventCount: 9,
+  },
+  fixAttempts: [{ ...FIX_ATTEMPT, id: 'fa2', state: 'verified' }],
+  annotationCount: 4,
+};
+
 const BUNDLE: IssueBundle = {
-  project: { id: 'p1', name: 'My App', slug: 'my-app' },
+  project: { id: 'p1', name: 'My App', slug: 'my-app', repoUrl: null },
   issue: {
     id: 'i1',
     title: 'TypeError: boom',
@@ -169,7 +216,9 @@ const BUNDLE: IssueBundle = {
     sourcemapUploaded: false,
     maps: { web: 0, node: 0 },
   },
-  truncated: { context: false, breadcrumbs: false },
+  annotations: [],
+  fixAttempts: [],
+  truncated: { context: false, breadcrumbs: false, annotations: false },
 };
 
 const TOP_ISSUE: TopIssue = {
@@ -204,11 +253,21 @@ const MONITOR: Monitor = {
 
 const SSRF_URL = 'http://169.254.169.254/';
 
+// Mirrors the server's ALLOWED_CLIENT_TRANSITIONS (db/repos/fix-attempts.ts).
+const ALLOWED_FIX_TRANSITIONS: Record<FixAttemptState, readonly FixAttemptState[]> = {
+  filed: ['deployed', 'failed'],
+  deployed: ['failed'],
+  verified: [],
+  failed: [],
+};
+
 class FakeBackend implements UhOhBackend {
   projects: Project[] = [{ ...PROJECT }];
   // Widened to the surfaced Issue status so tests can exercise 'regressed'
   // (system-set) flowing through list_issues / get_issue.
   issueStatus: Issue['status'] = 'open';
+  // Tracks the one seeded fix attempt (fa1) across upsert/transition calls.
+  fixState: FixAttemptState = 'filed';
   calls: Array<{ method: string; input?: unknown }> = [];
 
   private rec(method: string, input?: unknown): void {
@@ -343,6 +402,65 @@ class FakeBackend implements UhOhBackend {
       totals: { pageviews: 3, visitors: 2, events: 1 },
     });
   }
+
+  listSimilarIssues(input: { issueId: string }): Promise<SimilarIssue[] | null> {
+    this.rec('listSimilarIssues', input);
+    if (input.issueId !== 'i1') return Promise.resolve(null);
+    return Promise.resolve([{ ...SIMILAR_ISSUE }]);
+  }
+
+  createAnnotation(input: {
+    issueId: string;
+    body: string;
+    kind?: ClientAnnotationKind;
+    author?: string;
+  }): Promise<Annotation> {
+    this.rec('createAnnotation', input);
+    if (input.issueId !== 'i1') {
+      throw new BackendError('issue not found', { code: 'not_found', status: 404 });
+    }
+    return Promise.resolve({
+      ...ANNOTATION,
+      body: input.body,
+      kind: input.kind ?? 'note',
+      author: input.author && input.author.length > 0 ? input.author : 'agent',
+    });
+  }
+
+  upsertFixAttempt(input: {
+    issueId: string;
+    prUrl: string;
+    commitSha?: string;
+  }): Promise<FixAttempt> {
+    this.rec('upsertFixAttempt', input);
+    if (input.issueId !== 'i1') {
+      throw new BackendError('issue not found', { code: 'not_found', status: 404 });
+    }
+    return Promise.resolve({
+      ...FIX_ATTEMPT,
+      prUrl: input.prUrl,
+      commitSha: input.commitSha ?? FIX_ATTEMPT.commitSha,
+      state: this.fixState,
+    });
+  }
+
+  transitionFixAttempt(input: {
+    fixAttemptId: string;
+    state: ClientFixAttemptTransition;
+  }): Promise<FixAttempt> {
+    this.rec('transitionFixAttempt', input);
+    if (input.fixAttemptId !== 'fa1') {
+      throw new BackendError('fix attempt not found', { code: 'not_found', status: 404 });
+    }
+    if (!ALLOWED_FIX_TRANSITIONS[this.fixState].includes(input.state)) {
+      throw new BackendError(`invalid transition ${this.fixState} -> ${input.state}`, {
+        code: 'invalid_transition',
+        status: 400,
+      });
+    }
+    this.fixState = input.state;
+    return Promise.resolve({ ...FIX_ATTEMPT, state: this.fixState });
+  }
 }
 
 // ── Harness ───────────────────────────────────────────────────────────────────
@@ -388,28 +506,31 @@ beforeEach(async () => {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+const ALL_TOOL_NAMES = [
+  'create_project',
+  'get_event',
+  'get_issue',
+  'get_issue_bundle',
+  'get_server_health',
+  'get_usage_summary',
+  'list_issue_events',
+  'list_issues',
+  'list_monitors',
+  'list_projects',
+  'list_releases',
+  'list_similar_issues',
+  'list_top_issues',
+  'set_issue_status',
+  'update_project',
+  'annotate_issue',
+  'record_fix_attempt',
+].sort();
+
 describe('tool registry', () => {
-  it('registers all fourteen tools exactly once', async () => {
+  it('registers all seventeen tools exactly once', async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    expect(names).toEqual(
-      [
-        'create_project',
-        'get_event',
-        'get_issue',
-        'get_issue_bundle',
-        'get_server_health',
-        'get_usage_summary',
-        'list_issue_events',
-        'list_issues',
-        'list_monitors',
-        'list_projects',
-        'list_releases',
-        'list_top_issues',
-        'set_issue_status',
-        'update_project',
-      ].sort(),
-    );
+    expect(names).toEqual(ALL_TOOL_NAMES);
     // No accidental duplicate registrations.
     expect(new Set(names).size).toBe(names.length);
   });
@@ -417,7 +538,13 @@ describe('tool registry', () => {
   it('annotates reads readOnly and writes non-readOnly, all non-destructive', async () => {
     const { tools } = await client.listTools();
     const byName = new Map(tools.map((t) => [t.name, t.annotations]));
-    const writes = new Set(['create_project', 'update_project', 'set_issue_status']);
+    const writes = new Set([
+      'create_project',
+      'update_project',
+      'set_issue_status',
+      'annotate_issue',
+      'record_fix_attempt',
+    ]);
     for (const [name, ann] of byName) {
       expect(ann?.destructiveHint, `${name} destructiveHint`).toBe(false);
       expect(ann?.readOnlyHint, `${name} readOnlyHint`).toBe(!writes.has(name));
@@ -425,54 +552,70 @@ describe('tool registry', () => {
   });
 });
 
-describe('read scope (§22)', () => {
-  // The per-tool readonly flag is the data source for the read-scope gate. It
-  // must exactly match the readOnlyHint annotation and cover every tool once.
-  const EXPECTED_READONLY: Record<string, boolean> = {
-    list_projects: true,
-    create_project: false,
-    update_project: false,
-    list_issues: true,
-    get_issue: true,
-    list_issue_events: true,
-    get_event: true,
-    set_issue_status: false,
-    list_releases: true,
-    get_server_health: true,
-    get_issue_bundle: true,
-    list_top_issues: true,
-    list_monitors: true,
-    get_usage_summary: true,
+describe('scope model (v0.7 §22, generalized in v0.8 §23)', () => {
+  // The per-tool TOOL_SCOPE table is the data source for the scope gate. It
+  // must exactly match the readOnlyHint annotation (for 'read' tools) and cover
+  // every registered tool exactly once.
+  const EXPECTED_SCOPE: Record<string, RequiredScope> = {
+    list_projects: 'read',
+    create_project: 'admin',
+    update_project: 'admin',
+    list_issues: 'read',
+    get_issue: 'read',
+    list_issue_events: 'read',
+    get_event: 'read',
+    set_issue_status: 'agent',
+    list_releases: 'read',
+    get_server_health: 'read',
+    get_issue_bundle: 'read',
+    list_top_issues: 'read',
+    list_monitors: 'read',
+    get_usage_summary: 'read',
+    list_similar_issues: 'read',
+    annotate_issue: 'agent',
+    record_fix_attempt: 'agent',
   };
 
-  it('flags each tool readonly exactly as expected (and every registered tool once)', async () => {
+  it('flags each tool with its expected scope (and every registered tool once)', async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
-    // The TOOL_READONLY table covers exactly the registered tools.
-    expect(Object.keys(TOOL_READONLY).sort()).toEqual(names);
+    // The TOOL_SCOPE table covers exactly the registered tools.
+    expect(Object.keys(TOOL_SCOPE).sort()).toEqual(names);
     for (const name of names) {
-      expect(TOOL_READONLY[name], `${name} readonly flag`).toBe(EXPECTED_READONLY[name]);
+      expect(TOOL_SCOPE[name], `${name} scope`).toBe(EXPECTED_SCOPE[name]);
     }
   });
 
-  it('the readonly flag matches the readOnlyHint annotation for every tool', async () => {
+  it("a 'read' scope tool's readOnlyHint is true; every other tool's is false", async () => {
     const { tools } = await client.listTools();
     for (const t of tools) {
-      expect(TOOL_READONLY[t.name], `${t.name}`).toBe(t.annotations?.readOnlyHint);
+      expect(t.annotations?.readOnlyHint, `${t.name}`).toBe(TOOL_SCOPE[t.name] === 'read');
     }
   });
 
-  it('scopeError has the { error: read_scope, message } shape naming the tool', () => {
+  it('scopeError defaults to the read-token shape (§22, unchanged)', () => {
     const res = scopeError('set_issue_status');
     expect(res.isError).toBe(true);
     const content = res.content as Array<{ type: string; text: string }>;
     const parsed = JSON.parse(content[0]?.text ?? '{}') as { error: string; message: string };
     expect(parsed.error).toBe('read_scope');
-    expect(parsed.message).toContain('set_issue_status');
-    expect(parsed.message).toContain('JWT-authenticated dashboard or stdio backend');
+    expect(parsed.message).toBe(
+      'read token cannot set_issue_status; use the JWT-authenticated dashboard or stdio backend',
+    );
   });
 
-  describe('with a readonly-scoped server', () => {
+  it("scopeError('agent') names the agent token analogously", () => {
+    const res = scopeError('create_project', 'agent');
+    expect(res.isError).toBe(true);
+    const content = res.content as Array<{ type: string; text: string }>;
+    const parsed = JSON.parse(content[0]?.text ?? '{}') as { error: string; message: string };
+    expect(parsed.error).toBe('agent_scope');
+    expect(parsed.message).toBe(
+      'agent token cannot create_project; use the JWT-authenticated dashboard or stdio backend',
+    );
+  });
+
+  describe('with a readonly-scoped server (the read token)', () => {
     let readClient: Client;
     let readBackend: FakeBackend;
 
@@ -490,14 +633,26 @@ describe('read scope (§22)', () => {
       expect(issue.isError).toBe(false);
     });
 
-    for (const tool of ['create_project', 'update_project', 'set_issue_status'] as const) {
-      it(`mutating tool ${tool} returns the scope error and does NOT touch the backend`, async () => {
+    for (const tool of [
+      'create_project',
+      'update_project',
+      'set_issue_status',
+      'annotate_issue',
+      'record_fix_attempt',
+    ] as const) {
+      it(`${tool} (scope ${
+        tool === 'create_project' || tool === 'update_project' ? 'admin' : 'agent'
+      }) returns the read_scope error and does NOT touch the backend`, async () => {
         const args =
           tool === 'create_project'
             ? { name: 'X' }
             : tool === 'update_project'
               ? { projectId: 'p1', name: 'Y' }
-              : { issueId: 'i1', status: 'resolved' };
+              : tool === 'set_issue_status'
+                ? { issueId: 'i1', status: 'resolved' }
+                : tool === 'annotate_issue'
+                  ? { issueId: 'i1', body: 'note' }
+                  : { issueId: 'i1', prUrl: 'https://gh/pr/1' };
         const { isError, data } = await call(readClient, tool, args);
         expect(isError).toBe(true);
         expect(data['error']).toBe('read_scope');
@@ -508,7 +663,11 @@ describe('read scope (§22)', () => {
             ? 'createProject'
             : tool === 'update_project'
               ? 'updateProject'
-              : 'setIssueStatus';
+              : tool === 'set_issue_status'
+                ? 'setIssueStatus'
+                : tool === 'annotate_issue'
+                  ? 'createAnnotation'
+                  : 'upsertFixAttempt';
         expect(readBackend.calls.some((c) => c.method === method)).toBe(false);
       });
     }
@@ -518,6 +677,54 @@ describe('read scope (§22)', () => {
       expect(isError).toBe(false);
       expect(data['project']).toMatchObject({ name: 'Second App' });
     });
+  });
+
+  describe('with an agent-scoped server (the agent token, §23)', () => {
+    let agentClient: Client;
+    let agentBackend: FakeBackend;
+
+    beforeEach(async () => {
+      agentBackend = new FakeBackend();
+      agentClient = await makeClient(agentBackend, { scope: 'agent' });
+    });
+
+    it('read tools work under an agent scope', async () => {
+      const { isError } = await call(agentClient, 'list_projects');
+      expect(isError).toBe(false);
+    });
+
+    it('agent tools (set_issue_status, annotate_issue, record_fix_attempt) work under an agent scope', async () => {
+      const status = await call(agentClient, 'set_issue_status', {
+        issueId: 'i1',
+        status: 'resolved',
+      });
+      expect(status.isError).toBe(false);
+
+      const annotation = await call(agentClient, 'annotate_issue', {
+        issueId: 'i1',
+        body: 'investigated',
+      });
+      expect(annotation.isError).toBe(false);
+
+      const fix = await call(agentClient, 'record_fix_attempt', {
+        issueId: 'i1',
+        prUrl: 'https://gh/pr/1',
+      });
+      expect(fix.isError).toBe(false);
+    });
+
+    for (const tool of ['create_project', 'update_project'] as const) {
+      it(`admin tool ${tool} returns the agent_scope error naming the agent token, and does NOT touch the backend`, async () => {
+        const args = tool === 'create_project' ? { name: 'X' } : { projectId: 'p1', name: 'Y' };
+        const { isError, data } = await call(agentClient, tool, args);
+        expect(isError).toBe(true);
+        expect(data['error']).toBe('agent_scope');
+        expect(data['message']).toContain('agent token');
+        expect(data['message']).toContain(tool);
+        const method = tool === 'create_project' ? 'createProject' : 'updateProject';
+        expect(agentBackend.calls.some((c) => c.method === method)).toBe(false);
+      });
+    }
   });
 });
 
@@ -783,11 +990,14 @@ describe('input validation', () => {
 });
 
 describe('bundle / top-issues / monitors (v0.5)', () => {
-  it('get_issue_bundle returns the bundle verbatim', async () => {
+  it('get_issue_bundle returns the bundle verbatim, including the §23 investigation record', async () => {
     const { isError, data } = await call(client, 'get_issue_bundle', { issueId: 'i1' });
     expect(isError).toBe(false);
     expect((data['issue'] as Record<string, unknown>)['id']).toBe('i1');
-    expect(data['truncated']).toEqual({ context: false, breadcrumbs: false });
+    expect(data['truncated']).toEqual({ context: false, breadcrumbs: false, annotations: false });
+    expect((data['project'] as Record<string, unknown>)['repoUrl']).toBeNull();
+    expect(data['annotations']).toEqual([]);
+    expect(data['fixAttempts']).toEqual([]);
     const frames = (data['latestEvent'] as Record<string, unknown>)['frames'] as Record<
       string,
       unknown
@@ -878,5 +1088,211 @@ describe('fix_crash prompt', () => {
     const text = (got.messages[0]?.content as { type: string; text: string }).text;
     expect(text).toContain('get_issue_bundle');
     expect(text).toContain('i1');
+  });
+});
+
+describe('list_similar_issues (v0.8 §23)', () => {
+  it('returns similar issues, ISO timestamps, with fix attempts and annotation count', async () => {
+    const { isError, data } = await call(client, 'list_similar_issues', { issueId: 'i1' });
+    expect(isError).toBe(false);
+    expect(backend.last('listSimilarIssues')).toEqual({ issueId: 'i1' });
+    const similar = data['similar'] as Record<string, unknown>[];
+    expect(similar).toHaveLength(1);
+    const entry = similar[0] as Record<string, unknown>;
+    expect(entry['issue']).toMatchObject({ id: 'i2', projectSlug: 'my-app', status: 'resolved' });
+    expect((entry['issue'] as Record<string, unknown>)['lastSeen']).toBe(
+      '2023-11-14T22:15:40.000Z',
+    );
+    expect(entry['annotationCount']).toBe(4);
+    const fixAttempts = entry['fixAttempts'] as Record<string, unknown>[];
+    expect(fixAttempts[0]).toMatchObject({ id: 'fa2', state: 'verified' });
+  });
+
+  it('is a not_found tool error for an unknown issue', async () => {
+    const { isError, text } = await call(client, 'list_similar_issues', { issueId: 'ghost' });
+    expect(isError).toBe(true);
+    expect(text).toContain('not_found');
+  });
+
+  it('is annotated read-only', async () => {
+    const { tools } = await client.listTools();
+    const t = tools.find((x) => x.name === 'list_similar_issues');
+    expect(t?.annotations?.readOnlyHint).toBe(true);
+  });
+});
+
+describe('annotate_issue (v0.8 §23)', () => {
+  it('creates an annotation, defaulting kind to note and author to agent', async () => {
+    const { isError, data } = await call(client, 'annotate_issue', {
+      issueId: 'i1',
+      body: 'root cause found',
+    });
+    expect(isError).toBe(false);
+    expect(backend.last('createAnnotation')).toMatchObject({
+      issueId: 'i1',
+      body: 'root cause found',
+    });
+    const annotation = data['annotation'] as Record<string, unknown>;
+    expect(annotation).toMatchObject({ kind: 'note', author: 'agent', body: 'root cause found' });
+    expect(annotation['createdAt']).toBe('2023-11-14T22:15:50.000Z');
+  });
+
+  it('accepts an explicit kind and author', async () => {
+    const { isError, data } = await call(client, 'annotate_issue', {
+      issueId: 'i1',
+      body: 'shipped the fix in #42',
+      kind: 'fix_plan',
+      author: 'triage-bot',
+    });
+    expect(isError).toBe(false);
+    expect(data['annotation']).toMatchObject({ kind: 'fix_plan', author: 'triage-bot' });
+  });
+
+  it("rejects kind 'system' at the schema level (server-written only, never reaches the backend)", async () => {
+    const { isError, text } = await call(client, 'annotate_issue', {
+      issueId: 'i1',
+      body: 'nope',
+      kind: 'system',
+    });
+    expect(isError).toBe(true);
+    expect(text).toContain('Invalid arguments');
+    expect(backend.calls.some((c) => c.method === 'createAnnotation')).toBe(false);
+  });
+
+  it('rejects a missing body', async () => {
+    const { isError } = await call(client, 'annotate_issue', { issueId: 'i1' });
+    expect(isError).toBe(true);
+  });
+
+  it('is a not_found tool error for an unknown issue', async () => {
+    const { isError, text } = await call(client, 'annotate_issue', {
+      issueId: 'ghost',
+      body: 'x',
+    });
+    expect(isError).toBe(true);
+    expect(text).toContain('not_found');
+  });
+
+  it('is annotated a non-readOnly, non-destructive write', async () => {
+    const { tools } = await client.listTools();
+    const t = tools.find((x) => x.name === 'annotate_issue');
+    expect(t?.annotations?.readOnlyHint).toBe(false);
+    expect(t?.annotations?.destructiveHint).toBe(false);
+  });
+});
+
+describe('record_fix_attempt (v0.8 §23)', () => {
+  it('upserts a fix attempt without a state (stays filed)', async () => {
+    const { isError, data } = await call(client, 'record_fix_attempt', {
+      issueId: 'i1',
+      prUrl: 'https://github.com/org/repo/pull/1',
+    });
+    expect(isError).toBe(false);
+    expect(backend.last('upsertFixAttempt')).toMatchObject({
+      issueId: 'i1',
+      prUrl: 'https://github.com/org/repo/pull/1',
+    });
+    expect(data['fixAttempt']).toMatchObject({ id: 'fa1', state: 'filed' });
+    // No transition call — the requested state was never provided.
+    expect(backend.calls.some((c) => c.method === 'transitionFixAttempt')).toBe(false);
+  });
+
+  it('lower-cases a provided commitSha before upserting', async () => {
+    await call(client, 'record_fix_attempt', {
+      issueId: 'i1',
+      prUrl: 'https://gh/pr/1',
+      commitSha: 'ABCDEF0',
+    });
+    expect(backend.last('upsertFixAttempt')).toMatchObject({ commitSha: 'abcdef0' });
+  });
+
+  it('upserts then transitions in one call when state differs from the current state', async () => {
+    const { isError, data } = await call(client, 'record_fix_attempt', {
+      issueId: 'i1',
+      prUrl: 'https://gh/pr/1',
+      state: 'deployed',
+    });
+    expect(isError).toBe(false);
+    expect(backend.last('upsertFixAttempt')).toMatchObject({ issueId: 'i1' });
+    expect(backend.last('transitionFixAttempt')).toEqual({
+      fixAttemptId: 'fa1',
+      state: 'deployed',
+    });
+    expect(data['fixAttempt']).toMatchObject({ state: 'deployed' });
+  });
+
+  it('skips the transition call when the requested state already matches (idempotent re-record)', async () => {
+    await call(client, 'record_fix_attempt', {
+      issueId: 'i1',
+      prUrl: 'https://gh/pr/1',
+      state: 'deployed',
+    });
+    backend.calls.length = 0;
+    const { isError, data } = await call(client, 'record_fix_attempt', {
+      issueId: 'i1',
+      prUrl: 'https://gh/pr/1',
+      state: 'deployed',
+    });
+    expect(isError).toBe(false);
+    expect(data['fixAttempt']).toMatchObject({ state: 'deployed' });
+    expect(backend.calls.some((c) => c.method === 'transitionFixAttempt')).toBe(false);
+  });
+
+  it('surfaces an invalid transition (the server 400) as a tool error', async () => {
+    // filed -> failed is allowed; failed -> deployed is not.
+    await call(client, 'record_fix_attempt', {
+      issueId: 'i1',
+      prUrl: 'https://gh/pr/1',
+      state: 'failed',
+    });
+    const { isError, text } = await call(client, 'record_fix_attempt', {
+      issueId: 'i1',
+      prUrl: 'https://gh/pr/1',
+      state: 'deployed',
+    });
+    expect(isError).toBe(true);
+    expect(text).toContain('invalid_transition');
+  });
+
+  it("rejects state 'verified' at the schema level (system-set only, never reaches the backend)", async () => {
+    const { isError, text } = await call(client, 'record_fix_attempt', {
+      issueId: 'i1',
+      prUrl: 'https://gh/pr/1',
+      state: 'verified',
+    });
+    expect(isError).toBe(true);
+    expect(text).toContain('Invalid arguments');
+    expect(backend.calls.some((c) => c.method === 'upsertFixAttempt')).toBe(false);
+  });
+
+  it("rejects state 'filed' at the schema level (the implicit creation state, never a transition target)", async () => {
+    const { isError, text } = await call(client, 'record_fix_attempt', {
+      issueId: 'i1',
+      prUrl: 'https://gh/pr/1',
+      state: 'filed',
+    });
+    expect(isError).toBe(true);
+    expect(text).toContain('Invalid arguments');
+  });
+
+  it('rejects a missing prUrl', async () => {
+    const { isError } = await call(client, 'record_fix_attempt', { issueId: 'i1' });
+    expect(isError).toBe(true);
+  });
+
+  it('is a not_found tool error for an unknown issue', async () => {
+    const { isError, text } = await call(client, 'record_fix_attempt', {
+      issueId: 'ghost',
+      prUrl: 'https://gh/pr/1',
+    });
+    expect(isError).toBe(true);
+    expect(text).toContain('not_found');
+  });
+
+  it('is annotated a non-readOnly, non-destructive write', async () => {
+    const { tools } = await client.listTools();
+    const t = tools.find((x) => x.name === 'record_fix_attempt');
+    expect(t?.annotations?.readOnlyHint).toBe(false);
+    expect(t?.annotations?.destructiveHint).toBe(false);
   });
 });

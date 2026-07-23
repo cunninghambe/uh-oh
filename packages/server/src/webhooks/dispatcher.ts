@@ -5,6 +5,8 @@ import { getIssue } from '../db/repos/issues.js';
 import { getEvent } from '../db/repos/events.js';
 import { getMonitor } from '../db/repos/monitors.js';
 import { getProjectById } from '../db/repos/projects.js';
+import { computeSpikeStats } from '../db/repos/spikes.js';
+import { mostRecentlyDeployedAttempt, toFixAttemptView } from '../db/repos/fix-attempts.js';
 import {
   takeDueDispatches,
   markDispatchAttempt,
@@ -22,6 +24,9 @@ type DispatchRecord = {
   url: string;
   attempt: number;
   type: DispatchType;
+  // Enqueue time. issue.spike / fix.verified payloads are computed AS OF this
+  // instant so the delivered numbers match what the sweep saw at detection.
+  createdAt: number;
 };
 
 const BACKOFF_MS = [2000, 8000, 32000] as const;
@@ -140,6 +145,66 @@ const buildMonitorPayload = (
   };
 };
 
+/** Common { id, name, slug } / issue summary shared by the issue-scoped payloads. */
+const issueSummary = (issue: {
+  id: string;
+  fingerprint: string;
+  title: string;
+  eventCount: number;
+}) => ({
+  id: issue.id,
+  fingerprint: issue.fingerprint,
+  title: issue.title,
+  eventCount: issue.eventCount,
+});
+
+// issue.spike — no event; carries the spike stats computed AS OF the dispatch's
+// enqueue time so the delivered numbers match what the sweep detected.
+const buildSpikePayload = (
+  db: Db,
+  dispatch: DispatchRecord,
+  dashboardUrl: string | undefined,
+): object | null => {
+  if (!dispatch.issueId) return null;
+  const issue = getIssue(db, dispatch.issueId);
+  if (!issue) return null;
+  const project = getProjectById(db, issue.projectId);
+  if (!project) return null;
+  const stats = computeSpikeStats(db, issue.id, dispatch.createdAt);
+  return {
+    type: dispatch.type,
+    dispatchId: dispatch.id,
+    project: { id: project.id, name: project.name, slug: project.slug },
+    issue: issueSummary(issue),
+    stats: { lastHour: stats.lastHour, baselineHourly: stats.baselineHourly },
+    ...(dashboardUrl ? { url: `${dashboardUrl}/issues/${issue.id}` } : {}),
+  };
+};
+
+// fix.verified — no event; carries the verified attempt (the most-recently
+// deployed one as of enqueue time).
+const buildFixVerifiedPayload = (
+  db: Db,
+  dispatch: DispatchRecord,
+  dashboardUrl: string | undefined,
+): object | null => {
+  if (!dispatch.issueId) return null;
+  const issue = getIssue(db, dispatch.issueId);
+  if (!issue) return null;
+  const project = getProjectById(db, issue.projectId);
+  if (!project) return null;
+  const attempt = mostRecentlyDeployedAttempt(db, issue.id, dispatch.createdAt);
+  if (!attempt) return null;
+  return {
+    type: dispatch.type,
+    dispatchId: dispatch.id,
+    project: { id: project.id, name: project.name, slug: project.slug },
+    issue: issueSummary(issue),
+    fixAttempt: toFixAttemptView(attempt),
+    ...(dashboardUrl ? { url: `${dashboardUrl}/issues/${issue.id}` } : {}),
+  };
+};
+
 const buildPayload = (
   db: Db,
   dispatch: DispatchRecord,
@@ -148,6 +213,12 @@ const buildPayload = (
   if (dispatch.type === 'monitor.missed' || dispatch.type === 'monitor.recovered') {
     return buildMonitorPayload(db, dispatch, dashboardUrl);
   }
+  if (dispatch.type === 'issue.spike') {
+    return buildSpikePayload(db, dispatch, dashboardUrl);
+  }
+  if (dispatch.type === 'fix.verified') {
+    return buildFixVerifiedPayload(db, dispatch, dashboardUrl);
+  }
 
   if (!dispatch.issueId || !dispatch.eventId) return null;
   const issue = getIssue(db, dispatch.issueId);
@@ -155,6 +226,13 @@ const buildPayload = (
   if (!issue || !event) return null;
   const project = getProjectById(db, issue.projectId);
   if (!project) return null;
+  // For a regression, attach the fix attempt that did not hold (the most-recently
+  // deployed one) so the receiving agent knows which fix to revisit. Null when the
+  // regression was not preceded by a deploy.
+  const fixAttempt =
+    dispatch.type === 'issue.regressed'
+      ? mostRecentlyDeployedAttempt(db, issue.id, dispatch.createdAt)
+      : null;
   return {
     // 'issue.new' for a new-issue alert, 'issue.regressed' for the
     // resolved->regressed transition. Recorded on the row at enqueue time.
@@ -162,18 +240,16 @@ const buildPayload = (
     // Idempotency hint: receivers can dedupe on dispatchId (at-least-once delivery).
     dispatchId: dispatch.id,
     project: { id: project.id, name: project.name, slug: project.slug },
-    issue: {
-      id: issue.id,
-      fingerprint: issue.fingerprint,
-      title: issue.title,
-      eventCount: issue.eventCount,
-    },
+    issue: issueSummary(issue),
     event: {
       id: event.id,
       level: event.level,
       platform: event.platform,
       receivedAt: event.receivedAt,
     },
+    ...(dispatch.type === 'issue.regressed'
+      ? { fixAttempt: fixAttempt ? toFixAttemptView(fixAttempt) : null }
+      : {}),
     ...(dashboardUrl ? { url: `${dashboardUrl}/issues/${issue.id}` } : {}),
   };
 };

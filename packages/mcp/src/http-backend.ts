@@ -9,9 +9,13 @@
 
 import {
   BackendError,
+  type Annotation,
   type BreadcrumbRecord,
+  type ClientAnnotationKind,
+  type ClientFixAttemptTransition,
   type EventDetail,
   type EventRecord,
+  type FixAttempt,
   type HealthReport,
   type Issue,
   type IssueBundle,
@@ -24,6 +28,7 @@ import {
   type Project,
   type Release,
   type ResolvedFrame,
+  type SimilarIssue,
   type TopIssue,
   type UhOhBackend,
   type UpdateProjectInput,
@@ -320,6 +325,63 @@ export class HttpBackend implements UhOhBackend {
       'GET',
       `/api/projects/${encodeURIComponent(input.projectId)}/usage/summary?${qs.toString()}`,
     )) as UsageSummary;
+  }
+
+  // ── v0.8 agent-loop (§23) ───────────────────────────────────────────────────
+
+  async listSimilarIssues(input: { issueId: string }): Promise<SimilarIssue[] | null> {
+    const body = (await this.apiOrNull(
+      'GET',
+      `/api/issues/${encodeURIComponent(input.issueId)}/similar`,
+    )) as { similar: SimilarIssue[] } | null;
+    return body ? body.similar : null;
+  }
+
+  async createAnnotation(input: {
+    issueId: string;
+    body: string;
+    kind?: ClientAnnotationKind;
+    author?: string;
+  }): Promise<Annotation> {
+    const payload: Record<string, unknown> = { body: input.body };
+    if (input.kind !== undefined) payload['kind'] = input.kind;
+    if (input.author !== undefined) payload['author'] = input.author;
+    const body = (await this.api(
+      'POST',
+      `/api/issues/${encodeURIComponent(input.issueId)}/annotations`,
+      payload,
+    )) as { annotation: Annotation };
+    return body.annotation;
+  }
+
+  async upsertFixAttempt(input: {
+    issueId: string;
+    prUrl: string;
+    commitSha?: string;
+  }): Promise<FixAttempt> {
+    const payload: Record<string, unknown> = { prUrl: input.prUrl };
+    if (input.commitSha !== undefined) payload['commitSha'] = input.commitSha;
+    const body = (await this.api(
+      'POST',
+      `/api/issues/${encodeURIComponent(input.issueId)}/fix-attempts`,
+      payload,
+    )) as { fixAttempt: FixAttempt };
+    return body.fixAttempt;
+  }
+
+  async transitionFixAttempt(input: {
+    fixAttemptId: string;
+    state: ClientFixAttemptTransition;
+  }): Promise<FixAttempt> {
+    const body = (await this.api(
+      'PATCH',
+      `/api/fix-attempts/${encodeURIComponent(input.fixAttemptId)}`,
+      { state: input.state },
+    )) as { fixAttempt: FixAttempt | null };
+    if (!body.fixAttempt) {
+      throw new BackendError('fix attempt not found', { code: 'not_found', status: 404 });
+    }
+    return body.fixAttempt;
   }
 
   async getHealth(): Promise<HealthReport> {

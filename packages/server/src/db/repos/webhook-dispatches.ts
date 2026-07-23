@@ -4,13 +4,21 @@ import type { DbOrTx } from '../index.js';
 import { newId } from '../ids.js';
 import { webhookDispatches, type WebhookDispatchRow } from '../schema.js';
 
-export type DispatchType = 'issue.new' | 'issue.regressed' | 'monitor.missed' | 'monitor.recovered';
+export type DispatchType =
+  | 'issue.new'
+  | 'issue.regressed'
+  | 'monitor.missed'
+  | 'monitor.recovered'
+  | 'issue.spike'
+  | 'fix.verified';
 
 export type DispatchInsert = {
-  // Set for issue.* dispatches; null/omitted for monitor.* dispatches.
+  // Set for issue.* / fix.* dispatches; null/omitted for monitor.* dispatches.
   issueId?: string | null;
+  // Set only for issue.new / issue.regressed (the event that fired the alert);
+  // issue.spike and fix.verified carry no event.
   eventId?: string | null;
-  // Set for monitor.* dispatches; null/omitted for issue.* dispatches.
+  // Set for monitor.* dispatches; null/omitted otherwise.
   monitorId?: string | null;
   url: string;
   /** Webhook body `type`. Defaults to 'issue.new' when omitted. */

@@ -22,6 +22,7 @@ export const createProject = (
     publicKey: newPublicKey(),
     webhookUrl: input.webhookUrl ?? null,
     alertDedupeMinutes: 30,
+    repoUrl: null,
     createdAt: Date.now(),
   };
   db.insert(projects).values(row).run();
@@ -39,7 +40,7 @@ export const getProjectByPublicKey = (db: DbOrTx, publicKey: string): ProjectRow
 export const updateProject = (
   db: DbOrTx,
   id: string,
-  patch: Partial<Pick<ProjectRow, 'webhookUrl' | 'alertDedupeMinutes' | 'name'>>,
+  patch: Partial<Pick<ProjectRow, 'webhookUrl' | 'alertDedupeMinutes' | 'name' | 'repoUrl'>>,
 ): ProjectRow | null => {
   const existing = getProjectById(db, id);
   if (!existing) return null;

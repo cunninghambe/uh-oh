@@ -3,15 +3,16 @@
 // McpServer + transport per request (sessionIdGenerator undefined,
 // enableJsonResponse true), wired through Fastify's raw req/res. Auth is the
 // SAME JWT middleware as /api/* (Authorization: Bearer), plus the scoped read
-// token (§22): a read-token request carries a `readonly` tool scope, so the
-// mutating tools return the scope error. GET/DELETE → 405, since stateless mode
-// only needs POST.
+// token (§22) and the scoped agent token (§23): a read-token request carries a
+// `readonly` tool scope, an agent-token request carries an `agent` tool scope,
+// so tools outside what the token authorizes return the scope error.
+// GET/DELETE → 405, since stateless mode only needs POST.
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 
 import { StreamableHTTPServerTransport, createUhOhMcpServer, type UhOhBackend } from '@uh-oh/mcp';
 
-import { buildReadAuthMiddleware, isReadTokenAuth } from '../auth/read-token.js';
+import { buildReadAuthMiddleware, requestScope } from '../auth/read-token.js';
 import type { Db } from '../db/index.js';
 
 export const registerMcpRoute = (
@@ -20,11 +21,13 @@ export const registerMcpRoute = (
   secret: Uint8Array,
   backend: UhOhBackend,
   readToken?: string,
+  agentToken?: string,
 ): void => {
-  // JWT OR the read token. A JWT yields the full tool scope; the read token
-  // yields `readonly`. When no read token is configured this is exactly the JWT
-  // middleware, so the endpoint behaves byte-identically to v0.6.
-  const auth = buildReadAuthMiddleware({ db, secret, readToken });
+  // JWT OR the read token OR the agent token. A JWT yields the full tool scope;
+  // the read token yields `readonly`; the agent token yields `agent`. When
+  // neither token is configured this is exactly the JWT middleware, so the
+  // endpoint behaves byte-identically to v0.6.
+  const auth = buildReadAuthMiddleware({ db, secret, readToken, agentToken });
   const preHandler = auth as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
 
   app.post<{ Body: unknown }>('/mcp', { preHandler }, async (req, reply) => {
@@ -32,8 +35,8 @@ export const registerMcpRoute = (
     // directly to reply.raw, so Fastify must not also try to send a reply.
     reply.hijack();
 
-    // A read-token request is scoped to read-only tools; a JWT request is full.
-    const scope = isReadTokenAuth(req) ? 'readonly' : 'full';
+    // readonly (read token) | agent (agent token) | full (JWT).
+    const scope = requestScope(req);
     const server = createUhOhMcpServer(backend, { scope });
     // Stateless mode: OMITTING sessionIdGenerator leaves it `undefined`, which
     // the transport reads as "session management disabled" (a fresh transport

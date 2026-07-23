@@ -1,4 +1,4 @@
-import { desc, eq, sql } from 'drizzle-orm';
+import { and, desc, eq, gt, sql } from 'drizzle-orm';
 
 import type { DbOrTx } from '../index.js';
 import { newId } from '../ids.js';
@@ -45,3 +45,12 @@ export const getLatestEventForIssue = (db: DbOrTx, issueId: string): EventRow | 
     .orderBy(desc(events.receivedAt))
     .limit(1)
     .get() ?? null;
+
+/** True when the issue has any event strictly after `afterMs` (verify-sweep silence check). */
+export const hasEventSince = (db: DbOrTx, issueId: string, afterMs: number): boolean =>
+  db
+    .select({ id: events.id })
+    .from(events)
+    .where(and(eq(events.issueId, issueId), gt(events.receivedAt, afterMs)))
+    .limit(1)
+    .get() !== undefined;
