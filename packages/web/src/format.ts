@@ -14,3 +14,18 @@ export const relativeTime = (ms: number): string => {
   const d = Math.floor(h / 24);
   return `${String(d)}d ago`;
 };
+
+// v0.8 CONTRACT (SPEC §23 release<->commit / fix attempts): shared by Releases.tsx and
+// FixAttemptsPanel.tsx (via CommitLink.tsx) — "short (7-char) commit SHAs linked to
+// <repoUrl>/commit/<sha> when the project's repoUrl starts with https (plain text otherwise)".
+
+/** First 7 characters of a commit SHA — the short form shown throughout the dashboard. */
+export const shortSha = (sha: string): string => sha.slice(0, 7);
+
+/**
+ * Builds a commit URL from a project's repoUrl + a commit SHA, or null when the repo URL isn't
+ * usable as a link base (missing/null, or not https — e.g. an ssh/git URL). Callers render plain
+ * text instead of a link when this returns null.
+ */
+export const commitUrl = (repoUrl: string | null | undefined, sha: string): string | null =>
+  repoUrl && repoUrl.startsWith('https://') ? `${repoUrl}/commit/${sha}` : null;

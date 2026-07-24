@@ -162,10 +162,11 @@ export interface BundleSymbols {
 /**
  * CONTRACT B — everything an agent needs to fix a crash in one call. Serialized
  * form is hard-capped ~64KB by the server; `truncated` flags what was dropped
- * (context lines first, then breadcrumbs) to fit.
+ * (context lines first, then breadcrumbs, then annotations oldest-first — the
+ * v0.8 §23 order, annotations being the most protected content) to fit.
  */
 export interface IssueBundle {
-  project: { id: string; name: string; slug: string };
+  project: { id: string; name: string; slug: string; repoUrl: string | null };
   issue: {
     id: string;
     title: string;
@@ -180,7 +181,69 @@ export interface IssueBundle {
   latestEvent: BundleLatestEvent | null;
   recentEvents: BundleRecentEvent[];
   symbols: BundleSymbols | null;
-  truncated: { context: boolean; breadcrumbs: boolean };
+  /** The investigation record (§23): last 10 annotations newest-first, and
+   *  every fix attempt newest-first. */
+  annotations: Annotation[];
+  fixAttempts: FixAttempt[];
+  truncated: { context: boolean; breadcrumbs: boolean; annotations: boolean };
+}
+
+// ── v0.8 agent-loop DTOs (§23) ─────────────────────────────────────────────────
+// Investigation record (annotations, fix attempts) + fleet-wide similarity, all
+// plain data mirroring the server's `/api/*` JSON (this package never imports
+// from @uh-oh/server). Timestamps are epoch-ms, matching the REST payloads.
+
+/**
+ * Annotation kinds. 'system' is written by the server only (the audit trail of
+ * every fix-attempt state transition) — a client (the annotate_issue tool) may
+ * only ever set one of the other four.
+ */
+export type AnnotationKind = 'note' | 'root_cause' | 'fix_plan' | 'verification' | 'system';
+/** The kinds `annotate_issue` may set. */
+export type ClientAnnotationKind = Exclude<AnnotationKind, 'system'>;
+
+/** An issue annotation (issue detail, bundle, annotate_issue's response). */
+export interface Annotation {
+  id: string;
+  issueId: string;
+  author: string;
+  kind: AnnotationKind;
+  body: string;
+  createdAt: number;
+}
+
+export type FixAttemptState = 'filed' | 'deployed' | 'verified' | 'failed';
+/** States `record_fix_attempt` may transition a fix attempt to. 'filed' is the
+ *  implicit creation state (never a transition target); 'verified' is system-set
+ *  by the hourly verify sweep and is rejected in the tool's input schema. */
+export type ClientFixAttemptTransition = Extract<FixAttemptState, 'deployed' | 'failed'>;
+
+/** A tracked fix attempt (issue detail, bundle, record_fix_attempt's response). */
+export interface FixAttempt {
+  id: string;
+  issueId: string;
+  prUrl: string;
+  commitSha: string | null;
+  state: FixAttemptState;
+  createdAt: number;
+  deployedAt: number | null;
+  updatedAt: number;
+}
+
+/** A fleet-wide issue sharing an exception-type prefix (list_similar_issues). */
+export interface SimilarIssue {
+  issue: {
+    id: string;
+    projectId: string;
+    projectSlug: string;
+    title: string;
+    status: string;
+    platform: string | null;
+    lastSeen: number;
+    eventCount: number;
+  };
+  fixAttempts: FixAttempt[];
+  annotationCount: number;
 }
 
 /** A ranked open/regressed issue across all projects (list_top_issues). */
@@ -309,4 +372,34 @@ export interface UhOhBackend {
   listMonitors(input: ListMonitorsInput): Promise<Monitor[]>;
   /** CONTRACT U-API — usage analytics summary for a project over `days`. */
   getUsageSummary(input: { projectId: string; days: number }): Promise<UsageSummary>;
+
+  // ── v0.8 agent-loop (§23) ──────────────────────────────────────────────────
+
+  /** Fleet-wide issues sharing this issue's exception-type prefix, ranked by
+   *  has-verified-fix, annotation count, then recency (null if the issue is
+   *  unknown). */
+  listSimilarIssues(input: { issueId: string }): Promise<SimilarIssue[] | null>;
+  /** Add an investigation note to an issue. Rejects with `not_found` for an
+   *  unknown issue. */
+  createAnnotation(input: {
+    issueId: string;
+    body: string;
+    kind?: ClientAnnotationKind;
+    author?: string;
+  }): Promise<Annotation>;
+  /** Upsert a fix attempt by (issue, prUrl) into state `filed` (or update its
+   *  commitSha on an existing row). Rejects with `not_found` for an unknown
+   *  issue. */
+  upsertFixAttempt(input: {
+    issueId: string;
+    prUrl: string;
+    commitSha?: string;
+  }): Promise<FixAttempt>;
+  /** Transition a fix attempt to `deployed` or `failed`. Rejects with
+   *  `not_found` for an unknown attempt and `invalid_transition` (400) for a
+   *  transition the state machine does not allow. */
+  transitionFixAttempt(input: {
+    fixAttemptId: string;
+    state: ClientFixAttemptTransition;
+  }): Promise<FixAttempt>;
 }

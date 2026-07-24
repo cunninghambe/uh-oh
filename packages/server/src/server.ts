@@ -3,6 +3,7 @@ import Fastify, { type FastifyError, type FastifyInstance } from 'fastify';
 import type { z } from 'zod';
 
 import { registerApiRoutes } from './api/routes.js';
+import { registerAgentRoutes } from './api/agent-routes.js';
 import { registerMonitorRoutes } from './api/monitors-routes.js';
 import { registerAuthRoutes } from './auth/routes.js';
 import { createLoginLimiter } from './auth/login-limiter.js';
@@ -25,6 +26,7 @@ import {
   symbolTokenMatches,
 } from './auth/symbol-token.js';
 import { MIN_READ_TOKEN_LENGTH } from './auth/read-token.js';
+import { MIN_AGENT_TOKEN_LENGTH } from './auth/agent-token.js';
 
 export type ServerDeps = {
   db: Db;
@@ -51,6 +53,13 @@ export type ServerDeps = {
    * feature off.
    */
   readToken?: string | undefined;
+  /**
+   * Scoped agent token (CONTRACT A, §23). When set (≥16 chars), requests bearing
+   * `X-Uh-Oh-Agent-Token` are authorized on the read surface PLUS the four
+   * agent-loop writes (PATCH issue, POST annotations, POST fix-attempts, PATCH
+   * fix-attempts) WITHOUT a JWT. Unset = feature off.
+   */
+  agentToken?: string | undefined;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -74,6 +83,11 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   if (deps.readToken !== undefined && deps.readToken.length < MIN_READ_TOKEN_LENGTH) {
     throw new Error(
       `buildServer: readToken must be at least ${String(MIN_READ_TOKEN_LENGTH)} characters`,
+    );
+  }
+  if (deps.agentToken !== undefined && deps.agentToken.length < MIN_AGENT_TOKEN_LENGTH) {
+    throw new Error(
+      `buildServer: agentToken must be at least ${String(MIN_AGENT_TOKEN_LENGTH)} characters`,
     );
   }
 
@@ -195,8 +209,9 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   registerUsageIngestRoute(app, deps.db, usageLimiter);
 
   registerAuthRoutes(app, deps.db, deps.secret, deps.password, loginLimiter);
-  registerApiRoutes(app, deps.db, deps.secret, deps.symbolToken, deps.readToken);
-  registerMonitorRoutes(app, deps.db, deps.secret, deps.readToken);
+  registerApiRoutes(app, deps.db, deps.secret, deps.symbolToken, deps.readToken, deps.agentToken);
+  registerAgentRoutes(app, deps.db, deps.secret, deps.readToken, deps.agentToken);
+  registerMonitorRoutes(app, deps.db, deps.secret, deps.readToken, deps.agentToken);
   registerSymbolizationRoutes(
     app,
     deps.db,
@@ -204,12 +219,21 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
     deps.maxSymbolBytes ?? DEFAULT_MAX_SYMBOL_BYTES,
     deps.symbolToken,
     deps.readToken,
+    deps.agentToken,
   );
   registerMetricsRoute(app);
   // MCP (Streamable HTTP) over the same tool registry the stdio bin uses,
   // backed by an in-process backend (no HTTP hop). JWT-gated like /api/*, and
-  // additionally the read token for a readonly tool scope (§22).
-  registerMcpRoute(app, deps.db, deps.secret, new InProcessBackend(deps.db), deps.readToken);
+  // additionally the read token for a readonly tool scope (§22) and the agent
+  // token for an agent tool scope (§23).
+  registerMcpRoute(
+    app,
+    deps.db,
+    deps.secret,
+    new InProcessBackend(deps.db),
+    deps.readToken,
+    deps.agentToken,
+  );
 
   app.setErrorHandler((err: FastifyError, _req, reply) => {
     const status = err.statusCode ?? 500;

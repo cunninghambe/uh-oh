@@ -12,6 +12,8 @@ import { upsertIssue } from '../db/repos/issues.js';
 import { insertEvent } from '../db/repos/events.js';
 import { insertBreadcrumbs } from '../db/repos/breadcrumbs.js';
 import { upsertRelease, markSourcemapUploaded } from '../db/repos/releases.js';
+import { createAnnotation } from '../db/repos/annotations.js';
+import { upsertFixAttempt } from '../db/repos/fix-attempts.js';
 import { webSymbolMapPath } from '../symbolication/web-symbols.js';
 import { BUNDLE_MAX_BYTES, buildIssueBundle } from './bundle.js';
 import type { ProjectRow } from '../db/schema.js';
@@ -128,7 +130,12 @@ describe('buildIssueBundle', () => {
     expect(bundle).not.toBeNull();
     if (!bundle) return;
 
-    expect(bundle.project).toEqual({ id: project.id, name: project.name, slug: project.slug });
+    expect(bundle.project).toEqual({
+      id: project.id,
+      name: project.name,
+      slug: project.slug,
+      repoUrl: null,
+    });
     expect(bundle.issue).toMatchObject({ id: issue.id, platform: 'web', status: 'open' });
     expect(bundle.impact.distinctUsers).toBe(2);
     expect(bundle.impact.platforms[0]).toEqual({ platform: 'web', events: 4 });
@@ -151,7 +158,7 @@ describe('buildIssueBundle', () => {
       maps: { web: 1, node: 0 },
     });
 
-    expect(bundle.truncated).toEqual({ context: false, breadcrumbs: false });
+    expect(bundle.truncated).toEqual({ context: false, breadcrumbs: false, annotations: false });
   });
 
   it('keeps only the last 20 breadcrumbs', async () => {
@@ -195,7 +202,7 @@ describe('buildIssueBundle', () => {
     );
 
     const bundle = await buildIssueBundle(db, issue.id);
-    expect(bundle?.truncated).toEqual({ context: true, breadcrumbs: false });
+    expect(bundle?.truncated).toEqual({ context: true, breadcrumbs: false, annotations: false });
     // Context stripped from every frame; breadcrumbs retained.
     expect(bundle?.latestEvent?.frames.every((f) => f.context === undefined)).toBe(true);
     expect(bundle?.latestEvent?.breadcrumbs.length).toBeGreaterThan(0);
@@ -222,8 +229,85 @@ describe('buildIssueBundle', () => {
     );
 
     const bundle = await buildIssueBundle(db, issue.id);
-    expect(bundle?.truncated).toEqual({ context: true, breadcrumbs: true });
+    expect(bundle?.truncated).toEqual({ context: true, breadcrumbs: true, annotations: false });
     expect(bundle?.latestEvent?.breadcrumbs).toEqual([]);
+    expect(Buffer.byteLength(JSON.stringify(bundle))).toBeLessThanOrEqual(BUNDLE_MAX_BYTES);
+  });
+
+  it('carries the investigation record (annotations last 10 newest-first + fix attempts)', async () => {
+    const issue = seedIssue();
+    seedEvent(issue.id, null, [frame(false)]);
+    for (let i = 0; i < 12; i++)
+      createAnnotation(db, { issueId: issue.id, body: `note ${i}` }, 1000 + i);
+    upsertFixAttempt(db, { issueId: issue.id, prUrl: 'https://gh/pr/1' }, 2000);
+
+    const bundle = await buildIssueBundle(db, issue.id);
+    // Last 10, newest first.
+    expect(bundle?.annotations).toHaveLength(10);
+    expect(bundle?.annotations[0]?.body).toBe('note 11');
+    expect(bundle?.annotations[9]?.body).toBe('note 2');
+    expect(bundle?.fixAttempts).toHaveLength(1);
+    expect(bundle?.fixAttempts[0]?.prUrl).toBe('https://gh/pr/1');
+  });
+
+  it('protects annotations over breadcrumbs (drops context + breadcrumbs, keeps annotations)', async () => {
+    const release = newWebRelease();
+    await uploadMap(release.id, 'static/chunks/main.js');
+    const issue = seedIssue();
+    const frames = Array.from({ length: 8 }, () => frame(true));
+    const eventId = seedEvent(issue.id, release.id, frames);
+    // ~90KB of breadcrumbs — over the cap even after context is dropped.
+    insertBreadcrumbs(
+      db,
+      eventId,
+      Array.from({ length: 20 }, (_, i) => ({
+        ts: i,
+        category: 'net',
+        level: 'info',
+        message: 'm',
+        data: JSON.stringify({ blob: 'z'.repeat(4500) }),
+      })),
+    );
+    // A few small annotations that comfortably fit once breadcrumbs are gone.
+    for (let i = 0; i < 3; i++)
+      createAnnotation(db, { issueId: issue.id, body: `note ${i}` }, 1000 + i);
+
+    const bundle = await buildIssueBundle(db, issue.id);
+    // Order proof: context + breadcrumbs dropped, annotations untouched.
+    expect(bundle?.truncated).toEqual({ context: true, breadcrumbs: true, annotations: false });
+    expect(bundle?.annotations).toHaveLength(3);
+    expect(Buffer.byteLength(JSON.stringify(bundle))).toBeLessThanOrEqual(BUNDLE_MAX_BYTES);
+  });
+
+  it('drops annotations LAST and oldest-first, keeping the newest', async () => {
+    const release = newWebRelease();
+    await uploadMap(release.id, 'static/chunks/main.js');
+    const issue = seedIssue();
+    const frames = Array.from({ length: 8 }, () => frame(true));
+    const eventId = seedEvent(issue.id, release.id, frames);
+    insertBreadcrumbs(
+      db,
+      eventId,
+      Array.from({ length: 20 }, (_, i) => ({
+        ts: i,
+        category: 'net',
+        level: 'info',
+        message: 'm',
+        data: JSON.stringify({ blob: 'y'.repeat(2200) }),
+      })),
+    );
+    // 10 annotations of ~8KB each (~80KB) — still over the cap after context and
+    // breadcrumbs are gone, forcing annotation truncation.
+    for (let i = 0; i < 10; i++) {
+      createAnnotation(db, { issueId: issue.id, body: `A${i}:` + 'q'.repeat(8000) }, 1000 + i);
+    }
+
+    const bundle = await buildIssueBundle(db, issue.id);
+    expect(bundle?.truncated).toEqual({ context: true, breadcrumbs: true, annotations: true });
+    // Some (oldest) annotations were dropped, and the newest survived at index 0.
+    expect(bundle!.annotations.length).toBeGreaterThan(0);
+    expect(bundle!.annotations.length).toBeLessThan(10);
+    expect(bundle?.annotations[0]?.body.startsWith('A9:')).toBe(true);
     expect(Buffer.byteLength(JSON.stringify(bundle))).toBeLessThanOrEqual(BUNDLE_MAX_BYTES);
   });
 });

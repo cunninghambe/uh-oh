@@ -68,6 +68,35 @@ describe('upsertRelease', () => {
   });
 });
 
+// §23 — commit SHA persistence + last-write-wins update semantics.
+describe('upsertRelease — commitSha', () => {
+  const base = () => ({ projectId, version: '3.0.0', build: '7', platform: 'web' as const });
+
+  it('persists a commitSha on create and null when omitted', () => {
+    const withSha = upsertRelease(db, { ...base(), commitSha: 'abc1234' });
+    expect(withSha.commitSha).toBe('abc1234');
+    const bare = upsertRelease(db, { projectId, version: '3.0.0', build: '8', platform: 'web' });
+    expect(bare.commitSha).toBeNull();
+  });
+
+  it('re-upsert with a different commitSha updates the existing row (last write wins)', () => {
+    const first = upsertReleaseWithStatus(db, { ...base(), commitSha: 'aaaaaaa' });
+    expect(first.created).toBe(true);
+    const second = upsertReleaseWithStatus(db, { ...base(), commitSha: 'bbbbbbb' });
+    expect(second.created).toBe(false);
+    expect(second.release.id).toBe(first.release.id);
+    expect(second.release.commitSha).toBe('bbbbbbb');
+    expect(getReleaseById(db, first.release.id)?.commitSha).toBe('bbbbbbb');
+  });
+
+  it('re-upsert without a commitSha never clears a stored one', () => {
+    const first = upsertRelease(db, { ...base(), commitSha: 'ccccccc' });
+    const again = upsertRelease(db, base()); // no commitSha
+    expect(again.id).toBe(first.id);
+    expect(again.commitSha).toBe('ccccccc');
+  });
+});
+
 describe('upsertReleaseWithStatus', () => {
   it('reports created=true on first insert and created=false on a duplicate', () => {
     const input = { projectId, version: '1.0.0', build: '42', platform: 'web' as const };

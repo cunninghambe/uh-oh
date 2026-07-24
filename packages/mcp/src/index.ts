@@ -6,9 +6,10 @@ export * from './backend.js';
 export {
   registerUhOhTools,
   createUhOhMcpServer,
-  TOOL_READONLY,
+  TOOL_SCOPE,
   scopeError,
   type ToolScope,
+  type RequiredScope,
 } from './tools.js';
 export { HttpBackend, type HttpBackendConfig } from './http-backend.js';
 export { parseMetricsSubset, type MetricsSubset } from './metrics.js';

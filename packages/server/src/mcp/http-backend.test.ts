@@ -121,7 +121,7 @@ describe('HttpBackend against a live server', () => {
     const bundle = await backend.getIssueBundle({ issueId });
     expect(bundle?.issue.id).toBe(issueId);
     expect(bundle?.project.slug).toBe('my-app');
-    expect(bundle?.truncated).toEqual({ context: false, breadcrumbs: false });
+    expect(bundle?.truncated).toEqual({ context: false, breadcrumbs: false, annotations: false });
     expect(await backend.getIssueBundle({ issueId: 'missing' })).toBeNull();
   });
 
@@ -164,6 +164,103 @@ describe('HttpBackend against a live server', () => {
     expect(summary.days).toHaveLength(7);
     expect(summary.totals).toEqual({ pageviews: 1, visitors: 1, events: 0 });
     expect(summary.topReferrers[0]).toEqual({ referrer: 'google.com', pageviews: 1 });
+  });
+
+  describe('v0.8 agent-loop (§23)', () => {
+    it('creates an annotation and rejects the system kind (the server 400)', async () => {
+      const issueId = seedIssue();
+      const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+      const annotation = await backend.createAnnotation({
+        issueId,
+        body: 'root cause found',
+        kind: 'root_cause',
+      });
+      expect(annotation).toMatchObject({ issueId, kind: 'root_cause', body: 'root cause found' });
+
+      // The tool's zod schema already blocks 'system' before this backend is
+      // reached; bypass it here to prove the HTTP route rejects it too (400).
+      await expect(
+        backend.createAnnotation({
+          issueId,
+          body: 'nope',
+          kind: 'system' as unknown as never,
+        }),
+      ).rejects.toMatchObject({ status: 400 });
+    });
+
+    it('createAnnotation 404s for an unknown issue', async () => {
+      const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+      await expect(
+        backend.createAnnotation({ issueId: 'missing', body: 'x' }),
+      ).rejects.toMatchObject({ status: 404 });
+    });
+
+    it('upserts a fix attempt then transitions it to deployed, resolving the issue', async () => {
+      const issueId = seedIssue();
+      const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+      const filed = await backend.upsertFixAttempt({
+        issueId,
+        prUrl: 'https://github.com/org/repo/pull/1',
+      });
+      expect(filed).toMatchObject({
+        issueId,
+        prUrl: 'https://github.com/org/repo/pull/1',
+        state: 'filed',
+      });
+
+      const deployed = await backend.transitionFixAttempt({
+        fixAttemptId: filed.id,
+        state: 'deployed',
+      });
+      expect(deployed).toMatchObject({ id: filed.id, state: 'deployed' });
+      expect(deployed.deployedAt).not.toBeNull();
+
+      const issueBackend = await backend.getIssue({ issueId });
+      expect(issueBackend?.issue.status).toBe('resolved');
+    });
+
+    it('surfaces an invalid transition (the server 400) as a BackendError', async () => {
+      const issueId = seedIssue();
+      const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+      const filed = await backend.upsertFixAttempt({ issueId, prUrl: 'https://gh/pr/2' });
+      await backend.transitionFixAttempt({ fixAttemptId: filed.id, state: 'failed' });
+      // failed -> deployed is not an allowed transition.
+      await expect(
+        backend.transitionFixAttempt({ fixAttemptId: filed.id, state: 'deployed' }),
+      ).rejects.toMatchObject({ code: 'invalid_transition', status: 400 });
+    });
+
+    it('upsertFixAttempt 404s for an unknown issue', async () => {
+      const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+      await expect(
+        backend.upsertFixAttempt({ issueId: 'missing', prUrl: 'https://gh/pr/1' }),
+      ).rejects.toMatchObject({ status: 404 });
+    });
+
+    it('lists similar issues sharing the exception-type prefix, ranked by verified-fix and recency', async () => {
+      const issueId = seedIssue();
+      const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+      // A second event under a distinct fingerprint creates a second issue with
+      // the same exception-type prefix ('Error') in the same project — the
+      // title is `${type}: ${value} at ${where}`, so the prefix (text before
+      // the first ':') matches even though the message differs.
+      const rl = createRateLimiter({ capacity: 10, refillPerSec: 1 });
+      const second = ingest({ db, rateLimiter: rl }, project.publicKey, {
+        ...ENVELOPE,
+        fingerprint: ['distinct-issue'],
+        exception: { ...ENVELOPE.exception, value: 'a different message' },
+      });
+      if (second.kind !== 'stored') throw new Error(`seed failed: ${second.kind}`);
+
+      const similar = await backend.listSimilarIssues({ issueId });
+      expect(similar).not.toBeNull();
+      expect(similar?.some((s) => s.issue.id === second.issueId)).toBe(true);
+    });
+
+    it('listSimilarIssues resolves to null for an unknown issue', async () => {
+      const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+      expect(await backend.listSimilarIssues({ issueId: 'missing' })).toBeNull();
+    });
   });
 
   it('aborts a slow request via the AbortController timeout', async () => {

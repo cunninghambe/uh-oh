@@ -13,6 +13,7 @@ import { createRateLimiter } from '../ingest/rate-limit.js';
 import { buildServer } from '../server.js';
 import { mintTestToken, TEST_SECRET } from '../auth/test-utils.js';
 import { READ_TOKEN_HEADER } from '../auth/read-token.js';
+import { AGENT_TOKEN_HEADER } from '../auth/agent-token.js';
 
 const envelope: EventEnvelope = {
   sdk: { name: '@uh-oh/react-native', version: '0.1.0' },
@@ -104,17 +105,20 @@ describe('POST /mcp with a valid token (real MCP client)', () => {
     return client;
   };
 
-  it('lists all fourteen tools', async () => {
+  it('lists all seventeen tools', async () => {
     const client = await connect();
     try {
       const { tools } = await client.listTools();
-      expect(tools).toHaveLength(14);
+      expect(tools).toHaveLength(17);
       const names = tools.map((t) => t.name);
       expect(names).toContain('get_server_health');
       expect(names).toContain('get_issue_bundle');
       expect(names).toContain('list_top_issues');
       expect(names).toContain('list_monitors');
       expect(names).toContain('get_usage_summary');
+      expect(names).toContain('list_similar_issues');
+      expect(names).toContain('annotate_issue');
+      expect(names).toContain('record_fix_attempt');
     } finally {
       await client.close();
     }
@@ -247,6 +251,103 @@ describe('POST /mcp with the read token (readonly scope, §22)', () => {
       expect(write.isError).toBeFalsy();
       const issue = (JSON.parse(textOf(write)) as { issue: { status: string } }).issue;
       expect(issue.status).toBe('resolved');
+    } finally {
+      await client.close();
+    }
+  });
+});
+
+describe('POST /mcp with the agent token (agent scope, §23)', () => {
+  const AGENT_TOKEN = 'agent-debug-token-abcdefghijklmnop';
+  let tokenApp: ReturnType<typeof buildServer>;
+  let tokenUrl: string;
+
+  const textOf = (res: Awaited<ReturnType<Client['callTool']>>): string => {
+    const content = (res.content ?? []) as Array<{ type: string; text: string }>;
+    return content[0]?.text ?? '';
+  };
+
+  const connectWith = async (headers: Record<string, string>): Promise<Client> => {
+    const transport = new StreamableHTTPClientTransport(new URL(`${tokenUrl}/mcp`), {
+      requestInit: { headers },
+    });
+    const c = new Client({ name: 'agent-scope-test', version: '0.0.0' });
+    await c.connect(transport as Parameters<typeof c.connect>[0]);
+    return c;
+  };
+
+  beforeEach(async () => {
+    // Reuse the outer db (already seeded with a project + one ingested event).
+    tokenApp = buildServer({
+      db,
+      secret: TEST_SECRET,
+      password: 'test-password',
+      agentToken: AGENT_TOKEN,
+    });
+    await tokenApp.listen({ port: 0, host: '127.0.0.1' });
+    const addr = tokenApp.server.address() as AddressInfo;
+    tokenUrl = `http://127.0.0.1:${addr.port}`;
+  });
+
+  afterEach(async () => {
+    await tokenApp.close();
+  });
+
+  it('rejects a request with no auth at all (401)', async () => {
+    const res = await tokenApp.inject({
+      method: 'POST',
+      url: '/mcp',
+      headers: {
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+      },
+      payload: { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('read and agent tools work under the agent token; an admin tool returns the agent_scope error', async () => {
+    const client = await connectWith({ [AGENT_TOKEN_HEADER]: AGENT_TOKEN });
+    try {
+      // A read tool succeeds and returns the seeded issue.
+      const listed = await client.callTool({
+        name: 'list_issues',
+        arguments: { project: project.id },
+      });
+      expect(listed.isError).toBeFalsy();
+      const issues = (JSON.parse(textOf(listed)) as { issues: Array<{ id: string }> }).issues;
+      const issueId = issues[0]!.id;
+
+      // An agent-scoped tool (reclassified from admin in §23) succeeds.
+      const status = await client.callTool({
+        name: 'set_issue_status',
+        arguments: { issueId, status: 'resolved' },
+      });
+      expect(status.isError).toBeFalsy();
+
+      // A new agent-scoped write tool also succeeds.
+      const annotated = await client.callTool({
+        name: 'annotate_issue',
+        arguments: { issueId, body: 'investigated via the agent token' },
+      });
+      expect(annotated.isError).toBeFalsy();
+
+      // An admin tool returns the scope error naming the agent token, and
+      // changes nothing.
+      const create = await client.callTool({
+        name: 'create_project',
+        arguments: { name: 'should not be created' },
+      });
+      expect(create.isError).toBe(true);
+      const err = JSON.parse(textOf(create)) as { error: string; message: string };
+      expect(err.error).toBe('agent_scope');
+      expect(err.message).toContain('agent token');
+      expect(err.message).toContain('create_project');
+
+      const projects = await client.callTool({ name: 'list_projects', arguments: {} });
+      const names = (JSON.parse(textOf(projects)) as { projects: Array<{ name: string }> })
+        .projects;
+      expect(names.some((p) => p.name === 'should not be created')).toBe(false);
     } finally {
       await client.close();
     }

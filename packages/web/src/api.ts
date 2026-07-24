@@ -8,6 +8,10 @@ export type Project = {
   webhookUrl: string | null;
   alertDedupeMinutes: number;
   createdAt: number;
+  // v0.8 CONTRACT (SPEC §23 release<->commit): nullable, ≤512 chars, editable via PATCH. Optional
+  // (not just nullable) so this type stays forward-compatible with an older server build that
+  // omits the field entirely — mirrors the `platform?` field on Issue below (v0.4 CONTRACT P).
+  repoUrl?: string | null;
 };
 
 export type Release = {
@@ -18,6 +22,9 @@ export type Release = {
   platform: 'ios' | 'android' | 'web' | 'node';
   mappingUploadedAt: number | null;
   sourcemapUploadedAt: number | null;
+  // v0.8 CONTRACT (SPEC §23 release<->commit): nullable; optional for forward-compat with an
+  // older server build that omits it entirely (same convention as Project.repoUrl above).
+  commitSha?: string | null;
 };
 
 export type Issue = {
@@ -36,6 +43,12 @@ export type Issue = {
   // events, or one predating migration 0004, has none). Optional too so this type stays
   // forward-compatible if an older server build omits the field entirely.
   platform?: 'ios' | 'android' | 'web' | 'node' | null;
+  // v0.8 CONTRACT (SPEC §23 spike detection): set by the 5-min spike sweep while the issue is
+  // actively spiking; lastSpikeAt is the last time it entered that state (independent of whether
+  // it's still active). Both optional so this type stays forward-compatible with an older server
+  // build that omits them entirely (same convention as `platform?` above).
+  spikeActive?: boolean;
+  lastSpikeAt?: number | null;
 };
 
 export type EventRow = {
@@ -159,6 +172,33 @@ export type MonitorPatch = {
   graceMinutes?: number;
   // Only these two are valid PATCH targets — 'missed' is set by the server-side sweep only.
   status?: 'ok' | 'paused';
+};
+
+// v0.8 CONTRACT (SPEC §23 annotations): GET /api/issues/:id/annotations?limit=&offset=, newest
+// first — the issue's investigation log (agent notes, root causes, fix plans, verification
+// results, plus server-written 'system' audit rows on fix-attempt transitions). `kind` is a
+// closed enum server-side; components should still fall back gracefully for a `kind` string they
+// don't recognize (forward-compatible with a new kind), same spirit as Issue.utils.ts's
+// `statusLabel` fallback for frame statuses.
+export type IssueAnnotation = {
+  id: string;
+  author: string;
+  kind: 'note' | 'root_cause' | 'fix_plan' | 'verification' | 'system';
+  body: string;
+  createdAt: number;
+};
+
+// v0.8 CONTRACT (SPEC §23 fix attempts): part of the issue detail response (GET
+// /api/issues/:id), newest first. The dashboard only displays these (create/transition is
+// agent-token-only per §23) — see FixAttemptsPanel.tsx.
+export type FixAttempt = {
+  id: string;
+  prUrl: string;
+  commitSha?: string | null;
+  state: 'filed' | 'deployed' | 'verified' | 'failed';
+  createdAt: number;
+  deployedAt?: number | null;
+  updatedAt: number;
 };
 
 export class ApiError extends Error {
@@ -288,7 +328,7 @@ export const api = {
 
   updateProject: (
     id: string,
-    patch: Partial<Pick<Project, 'webhookUrl' | 'alertDedupeMinutes' | 'name'>>,
+    patch: Partial<Pick<Project, 'webhookUrl' | 'alertDedupeMinutes' | 'name' | 'repoUrl'>>,
   ) =>
     request<{ project: Project }>(`/api/projects/${id}`, {
       method: 'PATCH',
@@ -334,10 +374,18 @@ export const api = {
     );
   },
 
+  // v0.8 CONTRACT (SPEC §23 fix attempts): `fixAttempts` is optional on the response type (not
+  // just possibly-empty) so an older server build that hasn't landed migration 0007 yet — the
+  // field is simply absent from the JSON, not `[]` — is distinguishable from "zero fix attempts
+  // so far" at the type level. See Issue.tsx / FixAttemptsPanel.tsx for how the two are handled
+  // differently (undefined hides the whole panel, [] shows its empty state).
   getIssue: (id: string) =>
-    request<{ issue: Issue; latestEvent: EventRow | null; breadcrumbs: Breadcrumb[] }>(
-      `/api/issues/${id}`,
-    ),
+    request<{
+      issue: Issue;
+      latestEvent: EventRow | null;
+      breadcrumbs: Breadcrumb[];
+      fixAttempts?: FixAttempt[];
+    }>(`/api/issues/${id}`),
 
   // SPEC §9: GET /api/issues/:id/events?page=&limit= — page-based (1-indexed), unlike
   // listIssues which is offset-based (see the offset-vs-page note in api.ts's listIssues).
@@ -404,4 +452,26 @@ export const api = {
   // UsageSection.tsx), same degrade-gracefully pattern as listMonitors/getIssueImpact above.
   getUsageSummary: (projectId: string, days = 30) =>
     request<UsageSummary>(`/api/projects/${projectId}/usage/summary?days=${String(days)}`),
+
+  // v0.8 CONTRACT (SPEC §23 annotations) — server agent work landing concurrently, may 404 until
+  // it does. Callers must treat a failed request as "no annotations endpoint" and hide the whole
+  // timeline, same degrade-gracefully pattern as listMonitors/getUsageSummary above.
+  listIssueAnnotations: (issueId: string, opts: { limit?: number; offset?: number } = {}) => {
+    const params = new URLSearchParams();
+    if (opts.limit) params.set('limit', String(opts.limit));
+    if (opts.offset) params.set('offset', String(opts.offset));
+    const qs = params.toString();
+    return request<{ annotations: IssueAnnotation[]; total: number }>(
+      `/api/issues/${issueId}/annotations${qs ? `?${qs}` : ''}`,
+    );
+  },
+
+  addIssueAnnotation: (
+    issueId: string,
+    input: { body: string; kind?: IssueAnnotation['kind']; author?: string },
+  ) =>
+    request<{ annotation: IssueAnnotation }>(`/api/issues/${issueId}/annotations`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
 };

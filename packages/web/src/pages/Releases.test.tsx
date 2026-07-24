@@ -167,3 +167,46 @@ describe('Releases map counts (v0.4 item 2: GET /api/releases/:id/symbols)', () 
     expect(await screen.findByText('1 web map')).toBeInTheDocument();
   });
 });
+
+describe('Releases commit column (v0.8 CONTRACT — SPEC §23 release<->commit)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('links the short commit SHA when the release has one and the project repoUrl is https', async () => {
+    vi.spyOn(api, 'getProject').mockResolvedValue({
+      project: { ...sampleProject, repoUrl: 'https://github.com/org/repo' },
+    });
+    vi.spyOn(api, 'listReleases').mockResolvedValue({
+      releases: [{ ...sampleRelease, commitSha: 'abcdef0123456' }],
+    });
+    renderReleases();
+
+    const link = await screen.findByRole('link', { name: 'abcdef0' });
+    expect(link).toHaveAttribute('href', 'https://github.com/org/repo/commit/abcdef0123456');
+  });
+
+  it('shows the short commit SHA as plain text when the project repoUrl is not https', async () => {
+    vi.spyOn(api, 'getProject').mockResolvedValue({
+      project: { ...sampleProject, repoUrl: 'git@github.com:org/repo.git' },
+    });
+    vi.spyOn(api, 'listReleases').mockResolvedValue({
+      releases: [{ ...sampleRelease, commitSha: 'abcdef0123456' }],
+    });
+    renderReleases();
+
+    expect(await screen.findByText('abcdef0')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'abcdef0' })).not.toBeInTheDocument();
+  });
+
+  it('shows a dash when the release has no commitSha', async () => {
+    vi.spyOn(api, 'getProject').mockResolvedValue({ project: sampleProject });
+    vi.spyOn(api, 'listReleases').mockResolvedValue({ releases: [sampleRelease] });
+    renderReleases();
+
+    await screen.findByText('1.2.3+47');
+    // { selector: 'span' } targets the commit cell's dash specifically — formatTs also renders
+    // '—' (plain text, no wrapping span) for the two null upload timestamps on this same row.
+    expect(screen.getByText('—', { selector: 'span' })).toBeInTheDocument();
+  });
+});

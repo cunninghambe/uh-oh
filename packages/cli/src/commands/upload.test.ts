@@ -40,10 +40,16 @@ const makeCapturingFetch = (
 const baseProject = { id: 'proj-1', slug: 'my-app', name: 'My App' };
 const baseRelease = { id: 'rel-1', version: '1.0.0', build: '1', platform: 'android' };
 
+const noCommit = (): Promise<string | undefined> => Promise.resolve(undefined);
+
 const makeDeps = (
   cfg: Config | null,
   fetchResponses: Array<{ status: number; body: unknown }>,
-  opts?: { fileContent?: Buffer; statSize?: number },
+  opts?: {
+    fileContent?: Buffer;
+    statSize?: number;
+    resolveCommitSha?: (flagValue: string | undefined) => Promise<string | undefined>;
+  },
 ): UploadDeps & { logs: string[] } => {
   const logs: string[] = [];
   return {
@@ -52,6 +58,7 @@ const makeDeps = (
     log: (line) => logs.push(line),
     readFile: () => Promise.resolve(opts?.fileContent ?? Buffer.from('fake content')),
     statFile: () => Promise.resolve({ size: opts?.statSize ?? 1024 }),
+    resolveCommitSha: opts?.resolveCommitSha ?? noCommit,
     logs,
   };
 };
@@ -142,6 +149,7 @@ describe('upload command', () => {
         return Promise.resolve(Buffer.from('x'));
       },
       statFile: () => Promise.resolve({ size: 51 * 1024 * 1024 }),
+      resolveCommitSha: noCommit,
       logs,
     };
 
@@ -167,6 +175,7 @@ describe('upload command', () => {
       log: (line) => logs.push(line),
       readFile: () => Promise.resolve(Buffer.from('x')),
       statFile: () => Promise.reject(new Error('ENOENT')),
+      resolveCommitSha: noCommit,
       logs,
     };
 
@@ -197,6 +206,7 @@ describe('upload command', () => {
       log: (line) => logs.push(line),
       readFile: () => Promise.resolve(Buffer.from('R0 com.example -> a')),
       statFile: () => Promise.resolve({ size: 1024 }),
+      resolveCommitSha: noCommit,
       logs,
     };
 
@@ -229,6 +239,7 @@ describe('upload command', () => {
       log: (line) => logs.push(line),
       readFile: () => Promise.resolve(Buffer.from('R0 com.example -> a')),
       statFile: () => Promise.resolve({ size: 1024 }),
+      resolveCommitSha: noCommit,
       logs,
     };
 
@@ -261,6 +272,7 @@ describe('upload command', () => {
       log: (line) => logs.push(line),
       readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
       statFile: () => Promise.resolve({ size: 1024 }),
+      resolveCommitSha: noCommit,
       logs,
     };
 
@@ -297,6 +309,7 @@ describe('upload command', () => {
       log: (line) => logs.push(line),
       readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
       statFile: () => Promise.resolve({ size: 1024 }),
+      resolveCommitSha: noCommit,
       logs,
     };
 
@@ -335,6 +348,7 @@ describe('upload command', () => {
       log: (line) => logs.push(line),
       readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
       statFile: () => Promise.resolve({ size: 1024 }),
+      resolveCommitSha: noCommit,
       logs,
     };
 
@@ -361,6 +375,71 @@ describe('upload command', () => {
     expect(logs.some((l) => l === 'Created release 1.0.0+1 for platform node')).toBe(true);
     expect(calls[3]?.url).toBe('http://localhost:3300/api/releases/rel-node/symbols');
     expect(logs.at(-1)).toBe('Uploaded sourcemap for 1.0.0+1');
+  });
+
+  it('sourcemap --platform node with --commit passes the flag to resolveCommitSha and includes it on the upsert', async () => {
+    const calls: FetchCall[] = [];
+    const seenFlagValues: Array<string | undefined> = [];
+    const cfg: Config = { server: 'http://localhost:3300', token: 'tok' };
+    const nodeRelease = { id: 'rel-node', version: '1.0.0', build: '1', platform: 'node' };
+    const deps: UploadDeps & { logs: string[] } = {
+      config: { read: () => Promise.resolve(cfg) },
+      fetchFn: makeCapturingFetch(
+        [
+          { status: 200, body: { projects: [baseProject] } },
+          { status: 200, body: { releases: [baseRelease] } },
+          { status: 201, body: { release: nodeRelease } },
+          { status: 200, body: { release: nodeRelease } },
+        ],
+        calls,
+      ),
+      log: () => {},
+      readFile: () => Promise.resolve(Buffer.from('{"version":3}')),
+      statFile: () => Promise.resolve({ size: 1024 }),
+      resolveCommitSha: (flagValue) => {
+        seenFlagValues.push(flagValue);
+        return Promise.resolve('deadbee');
+      },
+      logs: [],
+    };
+
+    const code = await upload(deps, 'sourcemap', {
+      project: 'my-app',
+      release: '1.0.0+1',
+      file: 'server/pages/index.js.map',
+      platform: 'node',
+      bundlePath: 'server/pages/index.js',
+      commit: 'DEADBEE',
+    });
+
+    expect(code).toBe(0);
+    expect(seenFlagValues).toEqual(['DEADBEE']);
+    expect(JSON.parse(calls[2]?.init.body as string)).toMatchObject({ commitSha: 'deadbee' });
+  });
+
+  it('resolveCommitSha is never invoked for mapping uploads or when the release already exists (no upsert happens)', async () => {
+    let called = false;
+    const deps = makeDeps(
+      { server: 'http://localhost:3300', token: 'tok' },
+      [
+        { status: 200, body: { projects: [baseProject] } },
+        { status: 200, body: { releases: [baseRelease] } },
+        { status: 200, body: { release: baseRelease } },
+      ],
+      {
+        resolveCommitSha: () => {
+          called = true;
+          return Promise.resolve(undefined);
+        },
+      },
+    );
+    const code = await upload(deps, 'mapping', {
+      project: 'my-app',
+      release: '1.0.0+1',
+      file: 'mapping.txt',
+    });
+    expect(code).toBe(0);
+    expect(called).toBe(false);
   });
 
   it('sourcemap --platform node with a failing upsert returns 2', async () => {

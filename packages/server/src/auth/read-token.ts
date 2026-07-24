@@ -20,6 +20,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 
 import type { Db } from '../db/index.js';
 import { buildAuthMiddleware, type AuthRequest } from './middleware.js';
+import { AGENT_TOKEN_HEADER, agentTokenMatches, isAgentTokenAuth } from './agent-token.js';
 
 /** Minimum length for `UH_OH_READ_TOKEN`. A shorter token fails boot. */
 export const MIN_READ_TOKEN_LENGTH = 16;
@@ -31,13 +32,29 @@ export const MIN_READ_TOKEN_LENGTH = 16;
 export const READ_TOKEN_HEADER = 'x-uh-oh-read-token';
 
 /** A request authorized via the read token carries this marker instead of a jti. */
-export type ReadAuthRequest = FastifyRequest & { auth?: { jti: string } | { via: 'read-token' } };
+export type ReadAuthRequest = FastifyRequest & {
+  auth?: { jti: string } | { via: 'read-token' } | { via: 'agent-token' };
+};
 
 /** True when the request was authorized via the read token (not a JWT). The
  *  /mcp route reads this to select the `readonly` tool scope. */
 export const isReadTokenAuth = (req: FastifyRequest): boolean => {
   const auth = (req as ReadAuthRequest).auth;
   return auth !== undefined && 'via' in auth && auth.via === 'read-token';
+};
+
+/** The three tool/request scopes (§22 read, §23 agent, JWT/stdio full). */
+export type AuthScope = 'readonly' | 'agent' | 'full';
+
+/**
+ * The scope a request was authorized with, for the MCP route to gate tools:
+ * `readonly` (read token), `agent` (agent token), or `full` (JWT / stdio). A
+ * JWT-authorized request has a jti marker and maps to `full`.
+ */
+export const requestScope = (req: FastifyRequest): AuthScope => {
+  if (isReadTokenAuth(req)) return 'readonly';
+  if (isAgentTokenAuth(req)) return 'agent';
+  return 'full';
 };
 
 /**
@@ -81,6 +98,12 @@ export const buildReadAuthMiddleware = (deps: {
   db: Db;
   secret: Uint8Array;
   readToken?: string | undefined;
+  /**
+   * Scoped agent token (§23). The agent token authorizes everything the read
+   * token authorizes, so read routes accept it too (marking the request `agent`
+   * scope). Passing it here is what widens the read allowlist for agents.
+   */
+  agentToken?: string | undefined;
   fallback?: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
   now?: () => number;
 }) => {
@@ -92,6 +115,7 @@ export const buildReadAuthMiddleware = (deps: {
   const fallback =
     deps.fallback ?? (jwtAuth as (req: FastifyRequest, reply: FastifyReply) => Promise<void>);
   const token = deps.readToken;
+  const agentToken = deps.agentToken;
 
   return async (req: FastifyRequest, reply: FastifyReply): Promise<void> => {
     if (token !== undefined) {
@@ -105,7 +129,18 @@ export const buildReadAuthMiddleware = (deps: {
         return;
       }
     }
-    // No valid read token (or feature off) → defer to the fallback auth.
+    if (agentToken !== undefined) {
+      const provided = req.headers[AGENT_TOKEN_HEADER];
+      if (
+        typeof provided === 'string' &&
+        provided.length > 0 &&
+        agentTokenMatches(provided, agentToken)
+      ) {
+        (req as ReadAuthRequest).auth = { via: 'agent-token' };
+        return;
+      }
+    }
+    // No valid read/agent token (or feature off) → defer to the fallback auth.
     await fallback(req as AuthRequest, reply);
   };
 };

@@ -7,6 +7,8 @@ import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
 import { createMonitor } from '../db/repos/monitors.js';
 import { insertUsageEvent } from '../db/repos/usage.js';
+import { upsertIssue } from '../db/repos/issues.js';
+import { upsertFixAttempt as repoUpsertFixAttempt } from '../db/repos/fix-attempts.js';
 import type { ProjectRow } from '../db/schema.js';
 import { ingest } from '../ingest/ingest.js';
 import { createRateLimiter } from '../ingest/rate-limit.js';
@@ -217,7 +219,7 @@ describe('InProcessBackend over MCP (InMemoryTransport)', () => {
     expect((data['project'] as Record<string, unknown>)['slug']).toBe('my-app');
     expect((data['latestEvent'] as Record<string, unknown>)['id']).toBe(seeded.eventId);
     expect(data).toHaveProperty('impact');
-    expect(data['truncated']).toEqual({ context: false, breadcrumbs: false });
+    expect(data['truncated']).toEqual({ context: false, breadcrumbs: false, annotations: false });
   });
 
   it('get_issue_bundle reports not_found for a missing issue', async () => {
@@ -288,5 +290,125 @@ describe('InProcessBackend over MCP (InMemoryTransport)', () => {
     expect((data['days'] as unknown[]).length).toBe(30);
     const referrers = data['topReferrers'] as Array<{ referrer: string }>;
     expect(referrers[0]?.referrer).toBe('google.com');
+  });
+
+  describe('v0.8 agent-loop tools (§23)', () => {
+    it('list_similar_issues finds a fleet-wide issue sharing the exception-type prefix', async () => {
+      const { issue: other } = upsertIssue(db, {
+        projectId: project.id,
+        fingerprint: 'other-fp',
+        title: 'TypeError: a different message',
+        ts: Date.now(),
+        platform: 'android',
+      });
+      repoUpsertFixAttempt(db, { issueId: other.id, prUrl: 'https://gh/pr/9' }, Date.now());
+
+      const { isError, data } = await call(client, 'list_similar_issues', {
+        issueId: seeded.issueId,
+      });
+      expect(isError).toBe(false);
+      const similar = data['similar'] as Record<string, unknown>[];
+      expect(similar).toHaveLength(1);
+      expect((similar[0] as Record<string, unknown>)['issue']).toMatchObject({
+        id: other.id,
+        projectSlug: 'my-app',
+      });
+      const fixAttempts = (similar[0] as Record<string, unknown>)['fixAttempts'] as unknown[];
+      expect(fixAttempts).toHaveLength(1);
+    });
+
+    it('list_similar_issues is a not_found tool error for an unknown issue', async () => {
+      const { isError, text } = await call(client, 'list_similar_issues', { issueId: 'ghost' });
+      expect(isError).toBe(true);
+      expect(text).toContain('not_found');
+    });
+
+    it('annotate_issue creates a note and rejects the system kind at the schema level', async () => {
+      const { isError, data } = await call(client, 'annotate_issue', {
+        issueId: seeded.issueId,
+        body: 'looked into it',
+        kind: 'root_cause',
+      });
+      expect(isError).toBe(false);
+      expect(data['annotation']).toMatchObject({
+        issueId: seeded.issueId,
+        kind: 'root_cause',
+        author: 'agent',
+        body: 'looked into it',
+      });
+
+      const rejected = await call(client, 'annotate_issue', {
+        issueId: seeded.issueId,
+        body: 'nope',
+        kind: 'system',
+      });
+      expect(rejected.isError).toBe(true);
+      expect(rejected.text).toContain('Invalid arguments');
+    });
+
+    it('annotate_issue on an unknown issue is a not_found tool error', async () => {
+      const { isError, text } = await call(client, 'annotate_issue', {
+        issueId: 'ghost',
+        body: 'x',
+      });
+      expect(isError).toBe(true);
+      expect(text).toContain('not_found');
+    });
+
+    it('record_fix_attempt upserts then transitions to deployed, resolving the issue', async () => {
+      const filed = await call(client, 'record_fix_attempt', {
+        issueId: seeded.issueId,
+        prUrl: 'https://gh/pr/1',
+      });
+      expect(filed.isError).toBe(false);
+      expect(filed.data['fixAttempt']).toMatchObject({ state: 'filed' });
+
+      const deployed = await call(client, 'record_fix_attempt', {
+        issueId: seeded.issueId,
+        prUrl: 'https://gh/pr/1',
+        state: 'deployed',
+      });
+      expect(deployed.isError).toBe(false);
+      expect(deployed.data['fixAttempt']).toMatchObject({ state: 'deployed' });
+
+      // Marking deployed resolved the issue (re-arming §18 regression detection).
+      const issue = await call(client, 'get_issue', { issueId: seeded.issueId });
+      expect((issue.data['issue'] as Record<string, unknown>)['status']).toBe('resolved');
+    });
+
+    it('record_fix_attempt surfaces an invalid transition as a tool error', async () => {
+      await call(client, 'record_fix_attempt', {
+        issueId: seeded.issueId,
+        prUrl: 'https://gh/pr/2',
+        state: 'failed',
+      });
+      // failed -> deployed is not an allowed client transition.
+      const { isError, text } = await call(client, 'record_fix_attempt', {
+        issueId: seeded.issueId,
+        prUrl: 'https://gh/pr/2',
+        state: 'deployed',
+      });
+      expect(isError).toBe(true);
+      expect(text).toContain('invalid_transition');
+    });
+
+    it("record_fix_attempt rejects state 'verified' at the schema level", async () => {
+      const { isError, text } = await call(client, 'record_fix_attempt', {
+        issueId: seeded.issueId,
+        prUrl: 'https://gh/pr/3',
+        state: 'verified',
+      });
+      expect(isError).toBe(true);
+      expect(text).toContain('Invalid arguments');
+    });
+
+    it('record_fix_attempt on an unknown issue is a not_found tool error', async () => {
+      const { isError, text } = await call(client, 'record_fix_attempt', {
+        issueId: 'ghost',
+        prUrl: 'https://gh/pr/1',
+      });
+      expect(isError).toBe(true);
+      expect(text).toContain('not_found');
+    });
   });
 });

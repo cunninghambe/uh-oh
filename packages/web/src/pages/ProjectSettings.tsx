@@ -17,6 +17,7 @@ export const ProjectSettings = () => {
 
   const [name, setName] = useState('');
   const [webhookUrl, setWebhookUrl] = useState('');
+  const [repoUrl, setRepoUrl] = useState('');
   const [alertDedupeMinutes, setAlertDedupeMinutes] = useState(30);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [rotatedKey, setRotatedKey] = useState<string | null>(null);
@@ -26,6 +27,7 @@ export const ProjectSettings = () => {
     if (project) {
       setName(project.name);
       setWebhookUrl(project.webhookUrl ?? '');
+      setRepoUrl(project.repoUrl ?? '');
       setAlertDedupeMinutes(project.alertDedupeMinutes);
     }
   }, [project]);
@@ -35,6 +37,9 @@ export const ProjectSettings = () => {
       api.updateProject(projectId, {
         name: name.trim(),
         webhookUrl: webhookUrl.trim() || null,
+        // v0.8 CONTRACT (SPEC §23 release<->commit): ≤512 chars, clearable — empty input clears
+        // it to null, same convention as webhookUrl above.
+        repoUrl: repoUrl.trim() || null,
         alertDedupeMinutes,
       }),
     onSuccess: (data) => {
@@ -42,6 +47,7 @@ export const ProjectSettings = () => {
       void qc.invalidateQueries({ queryKey: ['projects'] });
       setName(data.project.name);
       setWebhookUrl(data.project.webhookUrl ?? '');
+      setRepoUrl(data.project.repoUrl ?? '');
       setAlertDedupeMinutes(data.project.alertDedupeMinutes);
       setSaveSuccess(true);
       setTimeout(() => {
@@ -117,6 +123,25 @@ export const ProjectSettings = () => {
               placeholder="https://…"
               className="w-full rounded bg-zinc-800 border border-zinc-700 px-3 py-2 text-sm focus:outline-none focus:border-amber-500"
             />
+          </div>
+          <div className="space-y-1">
+            <label htmlFor="repo-url" className="block text-xs text-zinc-400">
+              Repo URL <span className="text-zinc-600">(optional)</span>
+            </label>
+            <input
+              id="repo-url"
+              type="url"
+              value={repoUrl}
+              onChange={(e: React.ChangeEvent<HTMLInputElement>) => {
+                setRepoUrl(e.target.value);
+              }}
+              maxLength={512}
+              placeholder="https://github.com/org/repo"
+              className="w-full rounded bg-zinc-800 border border-zinc-700 px-3 py-2 text-sm focus:outline-none focus:border-amber-500"
+            />
+            <p className="text-xs text-zinc-600">
+              Used to link commit SHAs on releases and fix attempts.
+            </p>
           </div>
           <div className="space-y-1">
             <label htmlFor="dedupe-minutes" className="block text-xs text-zinc-400">

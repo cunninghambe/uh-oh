@@ -7,6 +7,12 @@ import { upload } from './commands/upload.js';
 import { uploadNextSourcemaps } from './commands/next-sourcemaps.js';
 import { projectList, projectCreate, projectDsn } from './commands/project.js';
 import { listFilesRecursive } from './fsWalk.js';
+import { resolveCommitSha } from './commitSha.js';
+
+// Bound to the real log/process.env/process.cwd()/git spawn - the one
+// resolveCommitSha implementation every command wires into its deps.
+const resolveCommit = (flagValue: string | undefined): Promise<string | undefined> =>
+  resolveCommitSha(flagValue, { log: (line) => process.stdout.write(line + '\n') });
 
 const program = new Command();
 program.name('uh-oh').description('CLI for uh-oh crash reporting').version('0.0.1');
@@ -85,6 +91,7 @@ uploadCmd
         readFile: (p) => fs.readFile(p),
         statFile: (p) => fs.stat(p),
         log: (line) => process.stdout.write(line + '\n'),
+        resolveCommitSha: resolveCommit,
       },
       'mapping',
       opts,
@@ -108,6 +115,10 @@ uploadCmd
     '--bundle-path <path>',
     'Bundle path relative to the app build (forward slashes, e.g. static/chunks/123.js)',
   )
+  .option(
+    '--commit <sha>',
+    'Commit SHA to record on the release (falls back to UH_OH_COMMIT_SHA, then `git rev-parse HEAD`)',
+  )
   .action(
     async (opts: {
       project: string;
@@ -115,6 +126,7 @@ uploadCmd
       file: string;
       platform?: 'web' | 'node';
       bundlePath?: string;
+      commit?: string;
     }) => {
       const code = await upload(
         {
@@ -122,6 +134,7 @@ uploadCmd
           readFile: (p) => fs.readFile(p),
           statFile: (p) => fs.stat(p),
           log: (line) => process.stdout.write(line + '\n'),
+          resolveCommitSha: resolveCommit,
         },
         'sourcemap',
         opts,
@@ -137,19 +150,32 @@ uploadCmd
   .requiredOption('--release <version+build>', 'Release string (e.g. 1.0.0+42)')
   .requiredOption('--dir <path>', 'Path to the .next build directory')
   .option('--dry-run', 'Print what would be uploaded without making any network calls')
-  .action(async (opts: { project: string; release: string; dir: string; dryRun?: boolean }) => {
-    const code = await uploadNextSourcemaps(
-      {
-        config: { read: readConfig },
-        readFile: (p) => fs.readFile(p),
-        statFile: (p) => fs.stat(p),
-        listFiles: listFilesRecursive,
-        log: (line) => process.stdout.write(line + '\n'),
-      },
-      opts,
-    );
-    process.exit(code);
-  });
+  .option(
+    '--commit <sha>',
+    'Commit SHA to record on the release (falls back to UH_OH_COMMIT_SHA, then `git rev-parse HEAD`)',
+  )
+  .action(
+    async (opts: {
+      project: string;
+      release: string;
+      dir: string;
+      dryRun?: boolean;
+      commit?: string;
+    }) => {
+      const code = await uploadNextSourcemaps(
+        {
+          config: { read: readConfig },
+          readFile: (p) => fs.readFile(p),
+          statFile: (p) => fs.stat(p),
+          listFiles: listFilesRecursive,
+          log: (line) => process.stdout.write(line + '\n'),
+          resolveCommitSha: resolveCommit,
+        },
+        opts,
+      );
+      process.exit(code);
+    },
+  );
 
 program.parseAsync(process.argv).catch((err: unknown) => {
   const msg = err instanceof Error ? err.message : String(err);

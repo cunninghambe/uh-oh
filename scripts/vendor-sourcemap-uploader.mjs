@@ -68,13 +68,20 @@ export const UPLOADER_TEMPLATE = String.raw`// uh-oh source map uploader (self-c
 //   UH_OH_SERVER_URL    Base URL of the uh-oh server, e.g. https://uh-oh.example.com
 //   UH_OH_SYMBOL_TOKEN  Symbol upload token (sent as the X-Uh-Oh-Symbol-Token header).
 //   UH_OH_PROJECT       Project slug.
+//   UH_OH_COMMIT_SHA    Optional commit SHA recorded on the release. Falls back to
+//                       running git rev-parse HEAD (guarded - any failure just omits
+//                       it) when unset. Invalid values are also omitted, with a log line.
 
 import { readdirSync, statSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, basename } from 'node:path';
 import process from 'node:process';
+import { spawn } from 'node:child_process';
 
 const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // 50 MB, mirrors the server cap.
 const TOKEN_HEADER = 'X-Uh-Oh-Symbol-Token';
+// Mirrors the server's releases.commit_sha column constraint: 7-40 hex chars,
+// case-insensitive; sent lowercase.
+const COMMIT_SHA_RE = /^[0-9a-f]{7,40}$/i;
 
 function errMsg(e) {
   return e instanceof Error ? e.message : String(e);
@@ -159,18 +166,79 @@ async function apiGetJson(url, token) {
   return res.json();
 }
 
+// Guarded "git rev-parse HEAD" in cwd. ANY failure - git missing from PATH,
+// cwd not inside a repo, a non-zero exit - resolves to undefined instead of
+// rejecting; resolveCommitSha treats that identically to "nothing to
+// resolve" and is the one that logs, so this stays silent either way.
+function gitRevParseHead(cwd) {
+  return new Promise(function (resolvePromise) {
+    let child;
+    try {
+      child = spawn('git', ['rev-parse', 'HEAD'], { cwd: cwd, stdio: ['ignore', 'pipe', 'ignore'] });
+    } catch {
+      resolvePromise(undefined);
+      return;
+    }
+    let out = '';
+    child.stdout.on('data', function (chunk) {
+      out += chunk.toString('utf8');
+    });
+    child.on('error', function () {
+      resolvePromise(undefined);
+    });
+    child.on('close', function (code) {
+      resolvePromise(code === 0 ? out.trim() : undefined);
+    });
+  });
+}
+
+// Resolves the commitSha sent with the release upsert (SPEC 23): the
+// UH_OH_COMMIT_SHA env var first, then a guarded "git rev-parse HEAD" in the
+// current working directory. Whichever source answers is validated against
+// COMMIT_SHA_RE and lowercased - it does not fall through to git just
+// because an env value was invalid. Anything that isn't a usable, valid SHA
+// omits commitSha and writes exactly one informational line; success is silent.
+async function resolveCommitSha() {
+  const envValue = process.env.UH_OH_COMMIT_SHA;
+  let candidate;
+  let viaGit = false;
+  if (envValue) {
+    candidate = envValue;
+  } else {
+    candidate = await gitRevParseHead(process.cwd());
+    viaGit = true;
+  }
+
+  if (candidate && COMMIT_SHA_RE.test(candidate)) {
+    return candidate.toLowerCase();
+  }
+
+  if (viaGit) {
+    process.stdout.write(
+      'uh-oh: no commit SHA resolved (set UH_OH_COMMIT_SHA, or run inside a git repo) - omitting commitSha\n',
+    );
+  } else {
+    process.stdout.write(
+      'uh-oh: ignoring invalid UH_OH_COMMIT_SHA "' + candidate + '" - omitting commitSha\n',
+    );
+  }
+  return undefined;
+}
+
 // Idempotent release upsert (POST /api/projects/:id/releases). Deploy
 // pipelines run BEFORE the first crash event, so a release row may not exist
 // yet; this creates (201) or resolves (200) it, either way returning the row.
-async function upsertRelease(serverBase, token, projectId, version, build, platform) {
+async function upsertRelease(serverBase, token, projectId, version, build, platform, commitSha) {
   const headers = {};
   headers[TOKEN_HEADER] = token;
   headers['content-type'] = 'application/json';
   const url = serverBase + '/api/projects/' + projectId + '/releases';
+  const payload = { version: version, build: build, platform: platform };
+  if (commitSha) payload.commitSha = commitSha;
   const res = await fetch(url, {
     method: 'POST',
     headers: headers,
-    body: JSON.stringify({ version: version, build: build, platform: platform }),
+    body: JSON.stringify(payload),
   });
   if (!res.ok) throw new Error('POST ' + url + ' returned ' + res.status);
   const data = await res.json();
@@ -309,6 +377,19 @@ async function main() {
   let nodeReleaseId = nodeMaps.length > 0 ? releaseIdFor('node') : undefined;
 
   let failed = 0;
+  // Resolved lazily (at most once, cached) right before it's first needed -
+  // most deploys re-run against an already-registered release, so this
+  // avoids an unnecessary git spawn when neither platform needs an upsert.
+  let commitSha;
+  let commitShaResolved = false;
+  const ensureCommitSha = async () => {
+    if (!commitShaResolved) {
+      commitSha = await resolveCommitSha();
+      commitShaResolved = true;
+    }
+    return commitSha;
+  };
+
   // Uploads usually run before the first crash event of a release, so a
   // missing row is the normal case: create it via the idempotent upsert and
   // proceed. Only an upsert FAILURE fails that platform's maps.
@@ -321,6 +402,7 @@ async function main() {
         parsed.version,
         parsed.build,
         'web',
+        await ensureCommitSha(),
       );
       process.stdout.write('uh-oh: created release ' + args.release + ' for platform web\n');
     } catch (e) {
@@ -339,6 +421,7 @@ async function main() {
         parsed.version,
         parsed.build,
         'node',
+        await ensureCommitSha(),
       );
       process.stdout.write('uh-oh: created release ' + args.release + ' for platform node\n');
     } catch (e) {

@@ -6,11 +6,13 @@ import { pipeline } from 'node:stream/promises';
 import multipart from '@fastify/multipart';
 import type { MultipartFile } from '@fastify/multipart';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
+import { z } from 'zod';
 import { PlatformSchema, ReleaseInfoSchema } from '@uh-oh/types';
 
 import type { Db } from '../db/index.js';
 import { buildUploadAuthMiddleware } from '../auth/symbol-token.js';
 import { buildReadAuthMiddleware } from '../auth/read-token.js';
+import { COMMIT_SHA_RE } from '../db/repos/fix-attempts.js';
 import {
   getReleaseById,
   listReleasesForProject,
@@ -34,8 +36,12 @@ const DEFAULT_MAX_SYMBOL_BYTES = 50 * 1024 * 1024; // 50 MB
 const MAX_WEB_MAPS_PER_RELEASE = 500;
 
 // Release-upsert body — same version/build length rules ingest applies
-// (ReleaseInfoSchema: 1..64 chars) plus the platform enum.
-const ReleaseUpsertSchema = ReleaseInfoSchema.extend({ platform: PlatformSchema });
+// (ReleaseInfoSchema: 1..64 chars) plus the platform enum and an optional commit
+// SHA (§23; /^[0-9a-f]{7,40}$/i, stored lower-case at the route).
+const ReleaseUpsertSchema = ReleaseInfoSchema.extend({
+  platform: PlatformSchema,
+  commitSha: z.string().regex(COMMIT_SHA_RE).optional(),
+});
 
 const fieldValue = (data: MultipartFile, name: string): string | undefined => {
   const field = data.fields[name];
@@ -84,6 +90,7 @@ export const registerSymbolizationRoutes = (
   maxSymbolBytes: number = DEFAULT_MAX_SYMBOL_BYTES,
   symbolToken?: string,
   readToken?: string,
+  agentToken?: string,
 ): void => {
   app.register(multipart, { limits: { fileSize: maxSymbolBytes } });
 
@@ -93,13 +100,15 @@ export const registerSymbolizationRoutes = (
   // this behaves exactly like the JWT-only middleware.
   const auth = buildUploadAuthMiddleware({ db, secret, symbolToken });
   const preHandler = auth as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
-  // CONTRACT R (§22): the release LIST is also on the read allowlist, so it
-  // accepts the read token, the symbol token, OR a JWT. The POST upsert and the
-  // symbols list/upload routes stay on the upload/JWT `preHandler` only.
+  // CONTRACT R (§22) + A (§23): the release LIST is on the read allowlist, so it
+  // accepts the read token, the agent token, the symbol token, OR a JWT. The POST
+  // upsert and the symbols list/upload routes stay on the upload/JWT `preHandler`
+  // only (the agent token is NOT authorized for the release upsert).
   const readPreHandler = buildReadAuthMiddleware({
     db,
     secret,
     readToken,
+    agentToken,
     fallback: preHandler,
   }) as (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
 
@@ -134,6 +143,8 @@ export const registerSymbolizationRoutes = (
         version: parsed.data.version,
         build: parsed.data.build,
         platform: parsed.data.platform,
+        // Stored lower-case; provided-and-different updates the existing row.
+        ...(parsed.data.commitSha ? { commitSha: parsed.data.commitSha.toLowerCase() } : {}),
       });
       return reply.code(created ? 201 : 200).send({ release });
     },

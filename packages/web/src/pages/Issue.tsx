@@ -3,11 +3,14 @@ import { Link, useParams } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 
 import { api, type Breadcrumb, type Issue as IssueT, type ResolvedFrame } from '../api.js';
+import { AnnotationTimeline } from '../components/AnnotationTimeline.js';
 import { CodeContext } from '../components/CodeContext.js';
+import { FixAttemptsPanel } from '../components/FixAttemptsPanel.js';
 import { ImpactPanel } from '../components/ImpactPanel.js';
 import { PlatformBadge } from '../components/PlatformBadge.js';
 import { RegressedBadge } from '../components/RegressedBadge.js';
 import { Sparkline } from '../components/Sparkline.js';
+import { SpikeBadge } from '../components/SpikeBadge.js';
 import {
   hasSymbolIssue,
   resolvedPlatform,
@@ -151,6 +154,16 @@ export const Issue = () => {
     retry: false,
   });
 
+  // v0.8 CONTRACT (SPEC §23 fix attempts): only needed for the project's repoUrl, to build the
+  // Fix attempts panel's commit links (CommitLink.tsx). Fetched separately from getIssue because
+  // the issue detail response doesn't embed the project object, only its id.
+  const projectId = issueQ.data?.issue.projectId;
+  const projectQ = useQuery({
+    queryKey: ['project', projectId],
+    queryFn: () => api.getProject(projectId!),
+    enabled: projectId !== undefined,
+  });
+
   const statusM = useMutation({
     mutationFn: (status: IssueT['status']) => api.setIssueStatus(issueId, status),
     onSuccess: () => {
@@ -163,7 +176,7 @@ export const Issue = () => {
   if (issueQ.isError || !issueQ.data)
     return <div className="text-red-400 text-sm">Failed to load issue.</div>;
 
-  const { issue, latestEvent, breadcrumbs } = issueQ.data;
+  const { issue, latestEvent, breadcrumbs, fixAttempts } = issueQ.data;
 
   // Prefer the freshly-fetched (symbolicated) event for whichever event is active. While that
   // fetch is in flight/failed and we're still looking at the latest event, fall back to the
@@ -200,6 +213,7 @@ export const Issue = () => {
             <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-xl font-semibold break-words">{issue.title}</h1>
               {issue.status === 'regressed' && <RegressedBadge />}
+              {issue.spikeActive && <SpikeBadge />}
               <PlatformBadge platform={resolvedPlatform(issue, latestEvent)} />
             </div>
             <div className="font-mono text-xs text-zinc-500 mt-1 break-all">
@@ -400,6 +414,19 @@ export const Issue = () => {
           </pre>
         </section>
       )}
+
+      {/* v0.8 CONTRACT (SPEC §23 fix attempts): `fixAttempts` is only mounted once the field is
+          actually present on the response (undefined means an older server hasn't landed
+          migration 0007 yet) — present-but-empty still renders the panel with its own empty
+          state, so the two are visibly different. */}
+      {fixAttempts !== undefined && (
+        <FixAttemptsPanel fixAttempts={fixAttempts} repoUrl={projectQ.data?.project.repoUrl} />
+      )}
+
+      {/* v0.8 CONTRACT (SPEC §23 annotations): renders nothing itself if GET .../annotations
+          404s (endpoint not yet available on the server this build is talking to) — see
+          AnnotationTimeline.tsx. */}
+      <AnnotationTimeline issueId={issueId} />
     </div>
   );
 };

@@ -7,6 +7,11 @@ import { upsertIssue, markIssueAlerted } from '../db/repos/issues.js';
 import { getProjectByPublicKey } from '../db/repos/projects.js';
 import { upsertRelease } from '../db/repos/releases.js';
 import { enqueueDispatch } from '../db/repos/webhook-dispatches.js';
+import { writeSystemAnnotation } from '../db/repos/annotations.js';
+import {
+  applyFixAttemptTransition,
+  mostRecentlyDeployedAttempt,
+} from '../db/repos/fix-attempts.js';
 import type { ProjectRow } from '../db/schema.js';
 
 import { computeFingerprint, computeTitle } from './fingerprint.js';
@@ -40,6 +45,10 @@ export const ingest = (
   const now = deps.now?.() ?? Date.now();
   const fingerprint = computeFingerprint(envelope);
   const title = computeTitle(envelope);
+
+  // Set inside the tx when a regression fails a deployed fix attempt; the metric
+  // is incremented only after the tx commits (same discipline as the others).
+  let failedFixAttempt = false;
 
   const result = deps.db.transaction((tx): IngestResult => {
     const { issue, isNew, regressed } = upsertIssue(tx, {
@@ -92,6 +101,24 @@ export const ingest = (
       );
     }
 
+    // A regression means the most-recently-deployed fix attempt did not hold:
+    // flip it to 'failed' and leave the audit-trail annotation. Independent of
+    // the webhook (a state change, not a notification); the issue.regressed
+    // payload picks the same attempt up at dispatch time.
+    if (regressed) {
+      const attempt = mostRecentlyDeployedAttempt(tx, issue.id, now);
+      if (attempt && attempt.state === 'deployed') {
+        applyFixAttemptTransition(tx, attempt, 'failed', now);
+        writeSystemAnnotation(
+          tx,
+          issue.id,
+          `fix attempt failed: issue regressed after deploy (${attempt.prUrl}) (deployed -> failed)`,
+          now,
+        );
+        failedFixAttempt = true;
+      }
+    }
+
     if (project.webhookUrl) {
       if (regressed) {
         // The resolved -> regressed transition dispatches immediately, bypassing
@@ -141,6 +168,7 @@ export const ingest = (
     metrics.eventsIngested.inc({ outcome: 'stored' });
     if (result.isNewIssue) metrics.issuesNew.inc();
     if (result.regressed) metrics.issuesRegressed.inc();
+    if (failedFixAttempt) metrics.fixFailed.inc();
   }
 
   return result;

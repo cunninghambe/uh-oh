@@ -9,6 +9,8 @@ export type ReleaseInsert = {
   version: string;
   build: string;
   platform: 'ios' | 'android' | 'web' | 'node';
+  /** Optional commit SHA (v0.8 §23); already validated + lower-cased by callers. */
+  commitSha?: string | null;
 };
 
 /**
@@ -16,6 +18,10 @@ export type ReleaseInsert = {
  * project+version+build+platform unique index) when present, otherwise inserts
  * and returns a new one. `created` distinguishes the two so callers (e.g. the
  * release-upsert route) can return 201 vs 200.
+ *
+ * A `commitSha` provided-and-different from what an existing row already carries
+ * updates it in place (last write wins, §23); an omitted commitSha never clears
+ * a stored one.
  */
 export const upsertReleaseWithStatus = (
   db: DbOrTx,
@@ -34,7 +40,16 @@ export const upsertReleaseWithStatus = (
     )
     .get();
 
-  if (existing) return { release: existing, created: false };
+  if (existing) {
+    if (input.commitSha != null && input.commitSha !== existing.commitSha) {
+      db.update(releases)
+        .set({ commitSha: input.commitSha })
+        .where(eq(releases.id, existing.id))
+        .run();
+      return { release: { ...existing, commitSha: input.commitSha }, created: false };
+    }
+    return { release: existing, created: false };
+  }
 
   const row: ReleaseRow = {
     id: newId(),
@@ -44,6 +59,7 @@ export const upsertReleaseWithStatus = (
     platform: input.platform,
     mappingUploadedAt: null,
     sourcemapUploadedAt: null,
+    commitSha: input.commitSha ?? null,
   };
   db.insert(releases).values(row).run();
   return { release: row, created: true };

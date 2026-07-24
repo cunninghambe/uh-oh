@@ -7,6 +7,7 @@ import { MonitorsSection } from '../components/MonitorsSection.js';
 import { PlatformBadge } from '../components/PlatformBadge.js';
 import { RegressedBadge } from '../components/RegressedBadge.js';
 import { Sparkline } from '../components/Sparkline.js';
+import { SpikeBadge } from '../components/SpikeBadge.js';
 import { UsageSection } from '../components/UsageSection.js';
 import { relativeTime } from '../format.js';
 import {
@@ -188,6 +189,7 @@ export const Project = () => {
                     >
                       <div className="flex items-center gap-2">
                         <div className="font-medium truncate min-w-0">{i.title}</div>
+                        {i.spikeActive && <SpikeBadge />}
                         <PlatformBadge platform={i.platform} />
                       </div>
                       <div className="text-xs text-zinc-500 font-mono truncate">
