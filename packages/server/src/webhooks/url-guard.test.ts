@@ -70,6 +70,40 @@ describe('validateWebhookUrl', () => {
     expect(validateWebhookUrl('https://192.168.1.1/hook').ok).toBe(false);
   });
 
+  it('rejects 100.64.0.0/10 CGNAT (RFC 6598)', () => {
+    const r = validateWebhookUrl('http://100.64.0.1/hook');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('blocked_ip');
+    expect(validateWebhookUrl('http://100.127.255.255/hook').ok).toBe(false);
+  });
+
+  it('accepts 100.63.x.x and 100.128.x.x (just outside CGNAT)', () => {
+    expect(validateWebhookUrl('http://100.63.0.1/hook').ok).toBe(true);
+    expect(validateWebhookUrl('http://100.128.0.1/hook').ok).toBe(true);
+  });
+
+  it('rejects 192.0.0.0/24 (IETF protocol assignments)', () => {
+    expect(validateWebhookUrl('http://192.0.0.8/hook').ok).toBe(false);
+    // 192.0.2.0/24 (TEST-NET-1) is outside the /24 and stays allowed.
+    expect(validateWebhookUrl('http://192.0.2.1/hook').ok).toBe(true);
+  });
+
+  it('rejects 198.18.0.0/15 (benchmarking)', () => {
+    expect(validateWebhookUrl('http://198.18.0.1/hook').ok).toBe(false);
+    expect(validateWebhookUrl('http://198.19.255.255/hook').ok).toBe(false);
+    expect(validateWebhookUrl('http://198.17.0.1/hook').ok).toBe(true);
+    expect(validateWebhookUrl('http://198.20.0.1/hook').ok).toBe(true);
+  });
+
+  it('rejects 224.0.0.0/4 multicast and 240.0.0.0/4 reserved incl. broadcast', () => {
+    expect(validateWebhookUrl('http://224.0.0.1/hook').ok).toBe(false);
+    expect(validateWebhookUrl('http://239.255.255.250/hook').ok).toBe(false);
+    expect(validateWebhookUrl('http://240.0.0.1/hook').ok).toBe(false);
+    expect(validateWebhookUrl('http://255.255.255.255/hook').ok).toBe(false);
+    // 223.x is the last public /8 below multicast.
+    expect(validateWebhookUrl('http://223.255.255.1/hook').ok).toBe(true);
+  });
+
   it('rejects IPv6 loopback (::1)', () => {
     expect(validateWebhookUrl('http://[::1]:9000/hook').ok).toBe(false);
   });
@@ -83,12 +117,47 @@ describe('validateWebhookUrl', () => {
     expect(validateWebhookUrl('http://[fe80::1]/hook').ok).toBe(false);
   });
 
+  it('rejects IPv6 site-local (fec0::/10)', () => {
+    expect(validateWebhookUrl('http://[fec0::1]/hook').ok).toBe(false);
+    expect(validateWebhookUrl('http://[feff:1234::1]/hook').ok).toBe(false);
+  });
+
   it('rejects IPv4-mapped IPv6 loopback (::ffff:127.0.0.1)', () => {
     expect(validateWebhookUrl('http://[::ffff:127.0.0.1]/hook').ok).toBe(false);
   });
 
+  it('rejects the whole ::/96 IPv4-compatible range, dotted and hex forms', () => {
+    // The confirmed bypass: the URL parser normalizes ::127.0.0.1 to ::7f00:1,
+    // which the old dotted-quad-only check never saw.
+    const r = validateWebhookUrl('http://[::7f00:1]/hook');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('blocked_ip');
+    expect(validateWebhookUrl('http://[::127.0.0.1]/hook').ok).toBe(false);
+    // Not only the members embedding a blocked IPv4: the whole /96 is blocked.
+    expect(validateWebhookUrl('http://[::8.8.8.8]/hook').ok).toBe(false);
+    expect(validateWebhookUrl('http://[::a00:1]/hook').ok).toBe(false);
+    expect(validateWebhookUrl('http://[::ffff]/hook').ok).toBe(false);
+  });
+
   it('accepts a public IPv6 address', () => {
     expect(validateWebhookUrl('http://[2606:4700:4700::1111]/hook').ok).toBe(true);
+  });
+
+  it('does not over-block: ::/96 check leaves ordinary compressed IPv6 alone', () => {
+    // More than two hextets after '::' is outside the /96.
+    expect(validateWebhookUrl('http://[::1:2:3]/hook').ok).toBe(true);
+    expect(validateWebhookUrl('http://[2001:db8::1]/hook').ok).toBe(true);
+  });
+
+  it('rejects a URL carrying userinfo credentials', () => {
+    const r = validateWebhookUrl('http://user:s3cret@example.com/hook');
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe('credentials_in_url');
+    // Username alone, and password alone, are both rejected.
+    expect(validateWebhookUrl('https://user@example.com/hook').ok).toBe(false);
+    expect(validateWebhookUrl('https://:pw@example.com/hook').ok).toBe(false);
+    // The same host without credentials stays fine.
+    expect(validateWebhookUrl('https://example.com/hook').ok).toBe(true);
   });
 
   it('isWebhookUrlSafe mirrors validateWebhookUrl', () => {
@@ -107,11 +176,24 @@ describe('isBlockedIp (resolved-address check, shared with the DNS re-check)', (
     expect(isBlockedIp('0.0.0.0')).toBe(true);
   });
 
-  it('blocks loopback / ULA / link-local / mapped IPv6', () => {
+  it('blocks CGNAT / protocol-assignment / benchmarking / multicast / reserved IPv4', () => {
+    expect(isBlockedIp('100.64.0.1')).toBe(true);
+    expect(isBlockedIp('192.0.0.8')).toBe(true);
+    expect(isBlockedIp('198.18.5.5')).toBe(true);
+    expect(isBlockedIp('224.0.0.251')).toBe(true);
+    expect(isBlockedIp('240.1.2.3')).toBe(true);
+    expect(isBlockedIp('255.255.255.255')).toBe(true);
+  });
+
+  it('blocks loopback / ULA / link-local / site-local / mapped / compatible IPv6', () => {
     expect(isBlockedIp('::1')).toBe(true);
     expect(isBlockedIp('fd00::1')).toBe(true);
     expect(isBlockedIp('fe80::1')).toBe(true);
+    expect(isBlockedIp('fec0::1')).toBe(true);
     expect(isBlockedIp('::ffff:127.0.0.1')).toBe(true);
+    // ::/96 IPv4-compatible, as a resolved DNS answer too.
+    expect(isBlockedIp('::7f00:1')).toBe(true);
+    expect(isBlockedIp('::a00:1')).toBe(true);
   });
 
   it('allows public IPv4 and IPv6 addresses', () => {

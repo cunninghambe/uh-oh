@@ -50,12 +50,16 @@ import { symbolicateEvent } from '../symbolication/symbolicate.js';
 import { validateWebhookUrl } from '../webhooks/url-guard.js';
 import { parseMetricsSubset } from '@uh-oh/mcp';
 import {
+  MAX_ANNOTATIONS_PER_ISSUE,
+  MAX_ANNOTATION_AUTHOR,
   MAX_ANNOTATION_BODY,
+  countAnnotations,
   createAnnotation,
   writeSystemAnnotation,
   toAnnotationView,
 } from '../db/repos/annotations.js';
 import {
+  PR_URL_SCHEME_RE,
   applyFixAttemptTransition,
   getFixAttempt,
   isAllowedClientTransition,
@@ -233,6 +237,24 @@ export class InProcessBackend implements UhOhBackend {
         status: 413,
       });
     }
+    // Same reasoning for the author cap, which the route also enforces by bytes.
+    if (
+      input.author !== undefined &&
+      Buffer.byteLength(input.author, 'utf8') > MAX_ANNOTATION_AUTHOR
+    ) {
+      throw new BackendError('annotation author too long', {
+        code: 'invalid_author',
+        status: 400,
+      });
+    }
+    // Per-issue cap, identical to the route's (409). Both entry points enforce
+    // it so an agent cannot dodge it by choosing MCP over REST.
+    if (countAnnotations(this.db, input.issueId) >= MAX_ANNOTATIONS_PER_ISSUE) {
+      throw new BackendError(
+        `issue already has the maximum ${String(MAX_ANNOTATIONS_PER_ISSUE)} annotations`,
+        { code: 'annotation_limit', status: 409 },
+      );
+    }
     const row = createAnnotation(
       this.db,
       {
@@ -254,6 +276,15 @@ export class InProcessBackend implements UhOhBackend {
     // Mirrors POST /api/issues/:id/fix-attempts, which 404s on an unknown issue.
     if (!getIssue(this.db, input.issueId)) {
       throw new BackendError('issue not found', { code: 'not_found', status: 404 });
+    }
+    // The route requires an http(s) prUrl (the dashboard renders it as an
+    // <a href>). Re-check here so the MCP path cannot store a `javascript:` URL
+    // even if the tool schema ever loosens.
+    if (!PR_URL_SCHEME_RE.test(input.prUrl)) {
+      throw new BackendError('prUrl must be an http(s) URL', {
+        code: 'invalid_prUrl',
+        status: 400,
+      });
     }
     const { attempt } = upsertFixAttempt(
       this.db,

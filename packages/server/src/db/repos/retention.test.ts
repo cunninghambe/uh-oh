@@ -9,7 +9,17 @@ import { insertEvent } from './events.js';
 import { insertBreadcrumbs, listBreadcrumbs } from './breadcrumbs.js';
 import { enqueueDispatch, markDispatchAttempt } from './webhook-dispatches.js';
 import { insertUsageEvent } from './usage.js';
-import { events, symbolications, usageEvents, usageSalts, webhookDispatches } from '../schema.js';
+import { createAnnotation } from './annotations.js';
+import { upsertFixAttempt } from './fix-attempts.js';
+import {
+  events,
+  fixAttempts,
+  issueAnnotations,
+  symbolications,
+  usageEvents,
+  usageSalts,
+  webhookDispatches,
+} from '../schema.js';
 import { pruneOldData, resolveRetentionDays } from './retention.js';
 
 const DAY = 86_400_000;
@@ -172,6 +182,106 @@ describe('pruneOldData', () => {
     const res = pruneOldData(db, { now: NOW, retentionDays: 0 });
     expect(res.usageEventsDeleted).toBe(0);
     expect(db.select().from(usageEvents).all()).toHaveLength(1);
+  });
+
+  // §23 agent-loop tables. They are agent-writable and were previously never
+  // pruned at all, so they grew forever; they are the institutional memory the
+  // agent loop exists to build, so they only die WITH their issue.
+  describe('issue_annotations + fix_attempts (dead issues only)', () => {
+    let liveIssueId: string;
+
+    const seedAgentRows = (issue: string, tag: string): void => {
+      createAnnotation(db, { issueId: issue, body: `note ${tag}` }, NOW - 50 * DAY);
+      upsertFixAttempt(db, { issueId: issue, prUrl: `https://gh/pr/${tag}` }, NOW - 50 * DAY);
+    };
+
+    const seedLiveEvent = (): string =>
+      insertEvent(db, {
+        projectId,
+        issueId: liveIssueId,
+        releaseId: null,
+        fingerprint: 'fp-live',
+        level: 'error',
+        platform: 'android',
+        payload: '{}',
+        receivedAt: NOW - 1 * DAY,
+        deviceInfo: '{}',
+        userInfo: null,
+      }).id;
+
+    beforeEach(() => {
+      // A second issue that always keeps a young event, so it is LIVE in every
+      // case below. `issueId` (from the outer beforeEach) is the variable one.
+      liveIssueId = upsertIssue(db, {
+        projectId,
+        fingerprint: 'fp-live',
+        title: 'live',
+        ts: NOW,
+      }).issue.id;
+      seedAgentRows(issueId, 'dead');
+      seedAgentRows(liveIssueId, 'live');
+    });
+
+    const annotationIssueIds = (): string[] =>
+      db
+        .select()
+        .from(issueAnnotations)
+        .all()
+        .map((r) => r.issueId);
+    const fixAttemptIssueIds = (): string[] =>
+      db
+        .select()
+        .from(fixAttempts)
+        .all()
+        .map((r) => r.issueId);
+
+    it('drops annotations and fix attempts for issues left with no events, keeps live ones', () => {
+      seedEvent(NOW - 100 * DAY); // the other issue's only event: pruned
+      const youngEvent = seedLiveEvent();
+
+      const res = pruneOldData(db, { now: NOW, retentionDays: 90 });
+
+      expect(res.annotationsDeleted).toBe(1);
+      expect(res.fixAttemptsDeleted).toBe(1);
+      expect(annotationIssueIds()).toEqual([liveIssueId]);
+      expect(fixAttemptIssueIds()).toEqual([liveIssueId]);
+      expect(eventExists(youngEvent)).toBe(true);
+      // The issue rows themselves are still never pruned.
+      expect(getIssue(db, issueId)).not.toBeNull();
+    });
+
+    it('keeps annotations for an issue whose events are all still inside the window', () => {
+      seedEvent(NOW - 1 * DAY); // young, so this issue survives the prune too
+      seedLiveEvent();
+
+      const res = pruneOldData(db, { now: NOW, retentionDays: 90 });
+
+      expect(res.annotationsDeleted).toBe(0);
+      expect(res.fixAttemptsDeleted).toBe(0);
+      expect(annotationIssueIds().sort()).toEqual([issueId, liveIssueId].sort());
+      expect(fixAttemptIssueIds().sort()).toEqual([issueId, liveIssueId].sort());
+    });
+
+    it('keeps annotations when only SOME events of an issue age out', () => {
+      seedEvent(NOW - 100 * DAY); // pruned
+      seedEvent(NOW - 2 * DAY); // survives, so the issue stays live
+      seedLiveEvent();
+
+      const res = pruneOldData(db, { now: NOW, retentionDays: 90 });
+
+      expect(res.eventsDeleted).toBe(1);
+      expect(res.annotationsDeleted).toBe(0);
+      expect(annotationIssueIds().sort()).toEqual([issueId, liveIssueId].sort());
+    });
+
+    it('retentionDays = 0 disables agent-table pruning entirely', () => {
+      // No events at all, so both issues look dead, but pruning is off.
+      const res = pruneOldData(db, { now: NOW, retentionDays: 0 });
+      expect(res.annotationsDeleted).toBe(0);
+      expect(res.fixAttemptsDeleted).toBe(0);
+      expect(db.select().from(issueAnnotations).all()).toHaveLength(2);
+      expect(db.select().from(fixAttempts).all()).toHaveLength(2);
+    });
   });
 });
 

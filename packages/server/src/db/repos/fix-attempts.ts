@@ -17,6 +17,14 @@ export type FixAttemptState = 'filed' | 'deployed' | 'verified' | 'failed';
 export const COMMIT_SHA_RE = /^[0-9a-f]{7,40}$/i;
 /** Max PR URL length. */
 export const MAX_PR_URL = 512;
+/**
+ * A pr_url must be http(s). The dashboard renders it as an `<a href>`, so any
+ * other scheme (`javascript:`, `data:`, ...) would be a stored-XSS primitive
+ * reachable by an agent-token holder, and the dashboard JWT lives in
+ * localStorage, so an XSS there is full admin compromise. Enforced at every
+ * write entry point (the REST route and the MCP tool), not at render time only.
+ */
+export const PR_URL_SCHEME_RE = /^https?:\/\//i;
 
 /**
  * Client-permitted state transitions. `verified` is system-set only, so it is

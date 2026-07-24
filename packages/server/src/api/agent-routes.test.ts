@@ -8,8 +8,16 @@ import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
 import { getIssue, upsertIssue } from '../db/repos/issues.js';
-import { createAnnotation } from '../db/repos/annotations.js';
-import { applyFixAttemptTransition, upsertFixAttempt } from '../db/repos/fix-attempts.js';
+import {
+  MAX_ANNOTATIONS_PER_ISSUE,
+  countAnnotations,
+  createAnnotation,
+} from '../db/repos/annotations.js';
+import {
+  applyFixAttemptTransition,
+  listFixAttempts,
+  upsertFixAttempt,
+} from '../db/repos/fix-attempts.js';
 import { buildServer } from '../server.js';
 import { mintTestToken, TEST_SECRET } from '../auth/test-utils.js';
 
@@ -120,6 +128,87 @@ describe('annotations', () => {
     ).toBe(400);
   });
 
+  it('caps an author by BYTES, not characters (§23 "≤128")', async () => {
+    const a = app();
+    // 65 three-byte characters = 195 bytes but only 65 chars: accepted by the
+    // old char-length check, rejected now.
+    const multiByte = '中'.repeat(65);
+    expect(multiByte.length).toBeLessThanOrEqual(128);
+    expect(Buffer.byteLength(multiByte, 'utf8')).toBeGreaterThan(128);
+    const res = await a.inject({
+      method: 'POST',
+      url: `/api/issues/${issueId}/annotations`,
+      headers: auth(),
+      payload: { body: 'x', author: multiByte },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: string }>().error).toBe('invalid_author');
+
+    // Exactly 128 bytes of multi-byte text still fits.
+    const fits = 'é'.repeat(64); // 2 bytes each = 128
+    expect(Buffer.byteLength(fits, 'utf8')).toBe(128);
+    expect(
+      (
+        await a.inject({
+          method: 'POST',
+          url: `/api/issues/${issueId}/annotations`,
+          headers: auth(),
+          payload: { body: 'x', author: fits },
+        })
+      ).statusCode,
+    ).toBe(201);
+  });
+
+  it('caps an issue at 500 client annotations, 409ing the 501st', async () => {
+    const a = app();
+    // Seed the cap directly (the route path is exercised by the 501st below).
+    for (let i = 0; i < MAX_ANNOTATIONS_PER_ISSUE; i += 1) {
+      createAnnotation(db, { issueId, body: `n${String(i)}` }, 1000 + i);
+    }
+    const res = await a.inject({
+      method: 'POST',
+      url: `/api/issues/${issueId}/annotations`,
+      headers: auth(),
+      payload: { body: 'one too many' },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json<{ error: string }>().error).toBe('annotation_limit');
+    expect(countAnnotations(db, issueId)).toBe(MAX_ANNOTATIONS_PER_ISSUE);
+
+    // The server's own audit trail is exempt: a fix-attempt transition still
+    // records its kind:'system' row on a capped issue.
+    const { attempt } = upsertFixAttempt(db, { issueId, prUrl: 'https://gh/pr/cap' }, 1000);
+    expect(
+      (
+        await a.inject({
+          method: 'PATCH',
+          url: `/api/fix-attempts/${attempt.id}`,
+          headers: auth(),
+          payload: { state: 'deployed' },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(countAnnotations(db, issueId)).toBe(MAX_ANNOTATIONS_PER_ISSUE + 1);
+
+    // A different issue is unaffected by the first issue's cap.
+    const other = upsertIssue(db, {
+      projectId,
+      fingerprint: 'fp2',
+      title: 'Error: other',
+      ts: 1000,
+    }).issue;
+    expect(
+      (
+        await a.inject({
+          method: 'POST',
+          url: `/api/issues/${other.id}/annotations`,
+          headers: auth(),
+          payload: { body: 'fine' },
+        })
+      ).statusCode,
+    ).toBe(201);
+  });
+
   it('404s on an unknown issue', async () => {
     const a = app();
     expect(
@@ -186,6 +275,45 @@ describe('fix attempts', () => {
         })
       ).statusCode,
     ).toBe(400);
+  });
+
+  it('rejects a non-http(s) prUrl (400) because the dashboard renders it as an <a href>', async () => {
+    const a = app();
+    for (const prUrl of [
+      'javascript:alert(1)',
+      'JavaScript:alert(1)',
+      'data:text/html,<script>alert(1)</script>',
+      'vbscript:msgbox(1)',
+      'file:///etc/passwd',
+      '/relative/pr/1',
+      'gh/pr/1',
+    ]) {
+      const res = await a.inject({
+        method: 'POST',
+        url: `/api/issues/${issueId}/fix-attempts`,
+        headers: auth(),
+        payload: { prUrl },
+      });
+      expect(res.statusCode, prUrl).toBe(400);
+      expect(res.json<{ error: string }>().error).toBe('invalid_prUrl');
+    }
+    // Nothing was stored.
+    expect(listFixAttempts(db, issueId)).toHaveLength(0);
+
+    // http and https both stay valid.
+    for (const prUrl of ['https://github.com/o/r/pull/1', 'http://gh.internal.example/pr/2']) {
+      expect(
+        (
+          await a.inject({
+            method: 'POST',
+            url: `/api/issues/${issueId}/fix-attempts`,
+            headers: auth(),
+            payload: { prUrl },
+          })
+        ).statusCode,
+        prUrl,
+      ).toBe(201);
+    }
   });
 
   it('marking deployed resolves an open issue and stamps deployed_at + a system annotation', async () => {

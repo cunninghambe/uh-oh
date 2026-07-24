@@ -19,10 +19,18 @@ export const CLIENT_ANNOTATION_KINDS: readonly AnnotationKind[] = [
   'verification',
 ];
 
-/** Max body size (bytes ≈ chars; enforced by the route as a 413). */
+/** Max body size in bytes (enforced by the route as a 413). */
 export const MAX_ANNOTATION_BODY = 16 * 1024;
-/** Max author length. */
+/** Max author size in bytes (enforced by the route as a 400). */
 export const MAX_ANNOTATION_AUTHOR = 128;
+/**
+ * Max annotations one issue may accumulate from clients (enforced at every
+ * write entry point as a 409). Annotations are agent-writable and were never
+ * pruned while the issue is alive, so without a cap an agent-token holder could
+ * fill the disk 16KB at a time. Server-written kind:'system' audit rows bypass
+ * the cap: the audit trail must never be droppable by flooding.
+ */
+export const MAX_ANNOTATIONS_PER_ISSUE = 500;
 
 export const createAnnotation = (
   db: DbOrTx,
