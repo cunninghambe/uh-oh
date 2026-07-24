@@ -1,5 +1,11 @@
 packages:
   - 'packages/*'
+# Build-script allowlist, in BOTH forms so every environment reads its own:
+# pnpm 11 (dev machines) reads the allowBuilds map; pnpm 10 (the box) reads
+# onlyBuiltDependencies and ignores allowBuilds. Keep the two lists in sync.
 allowBuilds:
   better-sqlite3: true
   esbuild: true
+onlyBuiltDependencies:
+  - better-sqlite3
+  - esbuild
