@@ -22,6 +22,7 @@ import {
   type Monitor,
   type Project,
   type Release,
+  type ReleaseHealth,
   type ResolvedFrame,
   type SimilarIssue,
   type TopIssue,
@@ -114,6 +115,7 @@ const RELEASE: Release = {
   version: '1.2.3',
   build: '45',
   platform: 'android',
+  commitSha: 'abc1234def5678900000000000000000abcdef12',
   mappingUploadedAt: 1_700_000_000_000,
   sourcemapUploadedAt: null,
 };
@@ -247,6 +249,69 @@ const MONITOR: Monitor = {
   lastCheckInAt: 1_700_000_000_000,
   createdAt: 1_699_000_000_000,
   overdue: false,
+  kind: 'checkin',
+  url: null,
+  lastProbeAt: null,
+  lastProbeStatus: null,
+};
+
+// v0.9 §24 uptime probe monitor — never checked in, driven by active probes.
+const HTTP_MONITOR: Monitor = {
+  id: 'm2',
+  projectId: 'p1',
+  projectSlug: 'my-app',
+  slug: 'ops',
+  name: 'Ops health',
+  intervalMinutes: 5,
+  graceMinutes: 5,
+  status: 'ok',
+  lastCheckInAt: null,
+  createdAt: 1_699_000_000_000,
+  overdue: false,
+  kind: 'http',
+  url: 'https://example.com/health',
+  lastProbeAt: 1_700_000_050_000,
+  lastProbeStatus: 200,
+};
+
+const RELEASE_HEALTH: ReleaseHealth = {
+  releases: [
+    {
+      id: 'r1',
+      version: '1.2.3',
+      build: '45',
+      platform: 'android',
+      commitSha: 'abc1234',
+      events: 12,
+      fatalEvents: 3,
+      distinctIssues: 2,
+      firstEventAt: 1_700_000_000_000,
+      lastEventAt: 1_700_000_100_000,
+      pageviews: 40,
+      crashesPer1kPageviews: 300,
+    },
+    {
+      id: 'r2',
+      version: '1.2.2',
+      build: '44',
+      platform: 'android',
+      commitSha: null,
+      events: 4,
+      fatalEvents: 0,
+      distinctIssues: 1,
+      firstEventAt: 1_699_999_000_000,
+      lastEventAt: 1_699_999_500_000,
+      pageviews: 0,
+      crashesPer1kPageviews: null,
+    },
+  ],
+  totals: {
+    events: 16,
+    fatalEvents: 3,
+    distinctIssues: 3,
+    pageviews: 40,
+    crashesPer1kPageviews: 400,
+  },
 };
 
 // ── Fake backend ──────────────────────────────────────────────────────────────
@@ -263,11 +328,15 @@ const ALLOWED_FIX_TRANSITIONS: Record<FixAttemptState, readonly FixAttemptState[
 
 class FakeBackend implements UhOhBackend {
   projects: Project[] = [{ ...PROJECT }];
-  // Widened to the surfaced Issue status so tests can exercise 'regressed'
-  // (system-set) flowing through list_issues / get_issue.
+  // Widened to the surfaced Issue status so tests can exercise 'regressed' and
+  // 'merged' (both system-set) flowing through list_issues / get_issue.
   issueStatus: Issue['status'] = 'open';
+  // get_issue's mergedInto (v0.9 §24) — null unless a test opts in.
+  mergedIntoValue: string | null = null;
   // Tracks the one seeded fix attempt (fa1) across upsert/transition calls.
   fixState: FixAttemptState = 'filed';
+  // Swappable so tests can exercise an http monitor's shape.
+  monitorsList: Monitor[] = [{ ...MONITOR }];
   calls: Array<{ method: string; input?: unknown }> = [];
 
   private rec(method: string, input?: unknown): void {
@@ -328,6 +397,7 @@ class FakeBackend implements UhOhBackend {
       latestEvent: { ...EVENT },
       frames: RESOLVED,
       breadcrumbs: BREADCRUMBS,
+      mergedInto: this.mergedIntoValue,
     });
   }
 
@@ -389,7 +459,7 @@ class FakeBackend implements UhOhBackend {
 
   listMonitors(input: ListMonitorsInput): Promise<Monitor[]> {
     this.rec('listMonitors', input);
-    return Promise.resolve([{ ...MONITOR }]);
+    return Promise.resolve(this.monitorsList.map((m) => ({ ...m })));
   }
 
   getUsageSummary(input: { projectId: string; days: number }): Promise<UsageSummary> {
@@ -400,6 +470,14 @@ class FakeBackend implements UhOhBackend {
       topReferrers: [{ referrer: 'google.com', pageviews: 2 }],
       topEvents: [{ name: 'signup', count: 1 }],
       totals: { pageviews: 3, visitors: 2, events: 1 },
+    });
+  }
+
+  getReleaseHealth(input: { projectId: string; days: number }): Promise<ReleaseHealth> {
+    this.rec('getReleaseHealth', input);
+    return Promise.resolve({
+      releases: RELEASE_HEALTH.releases.map((r) => ({ ...r })),
+      totals: { ...RELEASE_HEALTH.totals },
     });
   }
 
@@ -511,6 +589,7 @@ const ALL_TOOL_NAMES = [
   'get_event',
   'get_issue',
   'get_issue_bundle',
+  'get_release_health',
   'get_server_health',
   'get_usage_summary',
   'list_issue_events',
@@ -527,7 +606,7 @@ const ALL_TOOL_NAMES = [
 ].sort();
 
 describe('tool registry', () => {
-  it('registers all seventeen tools exactly once', async () => {
+  it('registers all eighteen tools exactly once', async () => {
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(ALL_TOOL_NAMES);
@@ -571,6 +650,7 @@ describe('scope model (v0.7 §22, generalized in v0.8 §23)', () => {
     list_top_issues: 'read',
     list_monitors: 'read',
     get_usage_summary: 'read',
+    get_release_health: 'read',
     list_similar_issues: 'read',
     annotate_issue: 'agent',
     record_fix_attempt: 'agent',
@@ -895,6 +975,51 @@ describe('regressed status (§CONTRACT M)', () => {
   });
 });
 
+describe('merged status (v0.9 §24)', () => {
+  it('surfaces a merged issue status through list_issues and get_issue', async () => {
+    backend.issueStatus = 'merged';
+    const list = await call(client, 'list_issues', { project: 'p1' });
+    expect(list.isError).toBe(false);
+    expect((list.data['issues'] as Record<string, unknown>[])[0]?.['status']).toBe('merged');
+
+    const detail = await call(client, 'get_issue', { issueId: 'i1' });
+    expect(detail.isError).toBe(false);
+    expect((detail.data['issue'] as Record<string, unknown>)['status']).toBe('merged');
+  });
+
+  it('list_issues accepts and forwards a merged status filter', async () => {
+    const { isError } = await call(client, 'list_issues', { project: 'p1', status: 'merged' });
+    expect(isError).toBe(false);
+    expect((backend.last('listIssues') as ListIssuesInput).status).toBe('merged');
+  });
+
+  it('set_issue_status REJECTS merged (system-set, not user-settable)', async () => {
+    const { isError } = await call(client, 'set_issue_status', {
+      issueId: 'i1',
+      status: 'merged',
+    });
+    expect(isError).toBe(true);
+  });
+
+  it('get_issue surfaces mergedInto when the backend provides it, and drops it otherwise', async () => {
+    backend.mergedIntoValue = 'i9';
+    const merged = await call(client, 'get_issue', { issueId: 'i1' });
+    expect(merged.isError).toBe(false);
+    expect(merged.data['mergedInto']).toBe('i9');
+
+    backend.mergedIntoValue = null;
+    const notMerged = await call(client, 'get_issue', { issueId: 'i1' });
+    expect(notMerged.isError).toBe(false);
+    expect(notMerged.data).not.toHaveProperty('mergedInto');
+  });
+
+  it('list_issues tool description advertises the merged filter option', async () => {
+    const { tools } = await client.listTools();
+    const t = tools.find((x) => x.name === 'list_issues');
+    expect(t?.description).toMatch(/merged/);
+  });
+});
+
 describe('events', () => {
   it('list_issue_events paginates and summarizes', async () => {
     const { isError, data } = await call(client, 'list_issue_events', {
@@ -1030,8 +1155,33 @@ describe('bundle / top-issues / monitors (v0.5)', () => {
     expect(isError).toBe(false);
     expect(backend.last('listMonitors')).toEqual({ projectId: 'p1' });
     const monitors = data['monitors'] as Record<string, unknown>[];
-    expect(monitors[0]).toMatchObject({ slug: 'nightly', projectSlug: 'my-app', overdue: false });
+    expect(monitors[0]).toMatchObject({
+      slug: 'nightly',
+      projectSlug: 'my-app',
+      overdue: false,
+      kind: 'checkin',
+    });
     expect(monitors[0]?.['lastCheckInAt']).toBe('2023-11-14T22:13:20.000Z');
+    // A check-in monitor is never probed, so these are dropped, not null.
+    expect(monitors[0]).not.toHaveProperty('url');
+    expect(monitors[0]).not.toHaveProperty('lastProbeAt');
+    expect(monitors[0]).not.toHaveProperty('lastProbeStatus');
+  });
+
+  it('list_monitors surfaces kind/url/lastProbeStatus/lastProbeAt for an http monitor (v0.9 §24)', async () => {
+    backend.monitorsList = [{ ...HTTP_MONITOR }];
+    const { isError, data } = await call(client, 'list_monitors');
+    expect(isError).toBe(false);
+    const monitors = data['monitors'] as Record<string, unknown>[];
+    expect(monitors[0]).toMatchObject({
+      kind: 'http',
+      url: 'https://example.com/health',
+      lastProbeStatus: 200,
+      overdue: false,
+    });
+    expect(monitors[0]?.['lastProbeAt']).toBe('2023-11-14T22:14:10.000Z');
+    // Never checked in — dropped, not null.
+    expect(monitors[0]).not.toHaveProperty('lastCheckInAt');
   });
 
   it('list_monitors with no project lists across all projects', async () => {
@@ -1076,6 +1226,73 @@ describe('usage summary (v0.6)', () => {
   it('get_usage_summary is annotated read-only', async () => {
     const { tools } = await client.listTools();
     const t = tools.find((x) => x.name === 'get_usage_summary');
+    expect(t?.annotations?.readOnlyHint).toBe(true);
+  });
+});
+
+describe('release health (v0.9 §24)', () => {
+  it('resolves a slug to the project id, forwards days, and renders ISO timestamps', async () => {
+    const { isError, data } = await call(client, 'get_release_health', {
+      project: 'my-app',
+      days: 7,
+    });
+    expect(isError).toBe(false);
+    expect(backend.last('getReleaseHealth')).toEqual({ projectId: 'p1', days: 7 });
+    const releases = data['releases'] as Record<string, unknown>[];
+    expect(releases).toHaveLength(2);
+    expect(releases[0]).toMatchObject({
+      id: 'r1',
+      version: '1.2.3',
+      build: '45',
+      commitSha: 'abc1234',
+      events: 12,
+      fatalEvents: 3,
+      distinctIssues: 2,
+      pageviews: 40,
+      crashesPer1kPageviews: 300,
+    });
+    expect(releases[0]?.['firstEventAt']).toBe('2023-11-14T22:13:20.000Z');
+    expect(releases[0]?.['lastEventAt']).toBe('2023-11-14T22:15:00.000Z');
+  });
+
+  it('drops a null commitSha and a null crashesPer1kPageviews (no attributed pageviews)', async () => {
+    const { data } = await call(client, 'get_release_health', { project: 'p1' });
+    const releases = data['releases'] as Record<string, unknown>[];
+    expect(releases[1]?.['pageviews']).toBe(0);
+    expect(releases[1]).not.toHaveProperty('commitSha');
+    expect(releases[1]).not.toHaveProperty('crashesPer1kPageviews');
+  });
+
+  it('renders totals, dropping a null ratio the same way', async () => {
+    const { data } = await call(client, 'get_release_health', { project: 'p1' });
+    expect(data['totals']).toEqual({
+      events: 16,
+      fatalEvents: 3,
+      distinctIssues: 3,
+      pageviews: 40,
+      crashesPer1kPageviews: 400,
+    });
+  });
+
+  it('defaults days to 30', async () => {
+    await call(client, 'get_release_health', { project: 'p1' });
+    expect((backend.last('getReleaseHealth') as { days: number }).days).toBe(30);
+  });
+
+  it('rejects a days value over the 90 cap', async () => {
+    const { isError } = await call(client, 'get_release_health', { project: 'p1', days: 91 });
+    expect(isError).toBe(true);
+  });
+
+  it('on an unknown project ref is a tool error', async () => {
+    const { isError, text } = await call(client, 'get_release_health', { project: 'nope' });
+    expect(isError).toBe(true);
+    expect(text).toContain('project_not_found');
+  });
+
+  it('is annotated read-only', async () => {
+    const { tools } = await client.listTools();
+    const t = tools.find((x) => x.name === 'get_release_health');
     expect(t?.annotations?.readOnlyHint).toBe(true);
   });
 });

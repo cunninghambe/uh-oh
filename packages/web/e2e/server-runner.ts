@@ -29,7 +29,25 @@ const host = process.env['UH_OH_HOST'] ?? '127.0.0.1';
 const { db, close: closeDb } = openDb(dbPath);
 applyMigrations(db);
 
-const app = buildServer({ db, logger: false, secret, password });
+const app = buildServer({
+  db,
+  logger: false,
+  secret,
+  password,
+  // v0.9 CONTRACT (SPEC §24 E2E catch-up): server.ts's ipLimiter is a single global per-IP
+  // token bucket (default 600/min, burst 100 — see packages/server/src/index.ts's
+  // UH_OH_IP_RATE_PER_MIN/UH_OH_IP_RATE_BURST env defaults, sized for one real human browsing
+  // session). Every request this whole suite makes — 15 sequential tests, several React-Query
+  // GETs per page visit plus every POST — funnels through vite preview's proxy as a single
+  // client IP, sharing that one bucket for the entire run. The production default is exhausted
+  // partway through a full serial run (observed: a mid-suite check-in POST 429s with
+  // rate_limit_exceeded even though its own per-(publicKey,slug) check-in bucket is nowhere near
+  // its limit). This is a throwaway e2e server instance, never a real deployment, so generous
+  // values here don't weaken anything real — they just stop the test harness's own request
+  // volume from tripping a limiter sized for production traffic.
+  ipRatePerMinute: 6000,
+  ipRateBurst: 1000,
+});
 
 let shuttingDown = false;
 const shutdown = (): void => {

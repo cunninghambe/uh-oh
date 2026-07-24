@@ -58,6 +58,18 @@ export const metrics = {
     registers: [registry],
   }),
 
+  uptimeProbeFailures: new Counter({
+    name: 'uh_oh_uptime_probe_failures_total',
+    help: 'Total failed http uptime probes (each non-2xx/3xx, timeout, or blocked target)',
+    registers: [registry],
+  }),
+
+  issuesMerged: new Counter({
+    name: 'uh_oh_issues_merged_total',
+    help: 'Total issues merged into another (source -> merged transitions)',
+    registers: [registry],
+  }),
+
   requestDuration: new Histogram({
     name: 'uh_oh_request_duration_seconds',
     help: 'HTTP request duration',

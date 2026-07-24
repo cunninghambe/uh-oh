@@ -27,6 +27,7 @@ import {
   type Monitor,
   type Project,
   type Release,
+  type ReleaseHealth,
   type ResolvedFrame,
   type SimilarIssue,
   type TopIssue,
@@ -221,6 +222,8 @@ export class HttpBackend implements UhOhBackend {
       issue: Issue;
       latestEvent: EventRecord | null;
       breadcrumbs: BreadcrumbRecord[];
+      // v0.9 §24: present on the route's response, null unless the issue is merged.
+      mergedInto?: string | null;
     } | null;
     if (!body) return null;
 
@@ -234,6 +237,7 @@ export class HttpBackend implements UhOhBackend {
       latestEvent: body.latestEvent,
       frames,
       breadcrumbs: body.breadcrumbs,
+      mergedInto: body.mergedInto ?? null,
     };
   }
 
@@ -325,6 +329,14 @@ export class HttpBackend implements UhOhBackend {
       'GET',
       `/api/projects/${encodeURIComponent(input.projectId)}/usage/summary?${qs.toString()}`,
     )) as UsageSummary;
+  }
+
+  async getReleaseHealth(input: { projectId: string; days: number }): Promise<ReleaseHealth> {
+    const qs = new URLSearchParams({ days: String(input.days) });
+    return (await this.api(
+      'GET',
+      `/api/projects/${encodeURIComponent(input.projectId)}/release-health?${qs.toString()}`,
+    )) as ReleaseHealth;
   }
 
   // ── v0.8 agent-loop (§23) ───────────────────────────────────────────────────

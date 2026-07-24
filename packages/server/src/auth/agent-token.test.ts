@@ -142,6 +142,14 @@ describe('CONTRACT A — agent token route matrix (integration)', () => {
         }),
         'GET monitors',
       );
+      ok(
+        await app.inject({
+          method: 'GET',
+          url: `/api/projects/${project.id}/release-health`,
+          headers: agent(),
+        }),
+        'GET release-health',
+      );
 
       // The four writes.
       ok(
@@ -212,6 +220,9 @@ describe('CONTRACT A — agent token route matrix (integration)', () => {
         build: '99',
         platform: 'web',
       }); // release upsert is NOT agent-granted
+      // §24: issue merge is JWT-only, deliberately NOT agent-scoped (rejected at
+      // the auth layer before the id is ever looked up).
+      await reject('POST', '/api/issues/any-issue/merge', { into: 'whatever' });
     } finally {
       close();
     }

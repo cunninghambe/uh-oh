@@ -302,3 +302,37 @@ describe('privacy: no raw IP or User-Agent is ever stored', () => {
     expect(byPath.get('/4')).not.toBe(byPath.get('/1'));
   });
 });
+
+// ── Release attribution (§24) ─────────────────────────────────────────────────
+describe('usage release attribution', () => {
+  it('stores a valid per-event release on the row', async () => {
+    const res = await postUsage(app(), {
+      payload: { events: [{ type: 'pageview', path: '/', release: '2.1.0' }] },
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual({ accepted: 1, dropped: 0 });
+    expect(allUsage()[0]?.release).toBe('2.1.0');
+  });
+
+  it('leaves release null when the event omits it', async () => {
+    await postUsage(app(), { payload: { events: [{ type: 'event', name: 'signup' }] } });
+    expect(allUsage()[0]?.release).toBeNull();
+  });
+
+  it('drops an event whose release exceeds 128 chars WITHOUT failing the batch', async () => {
+    const res = await postUsage(app(), {
+      payload: {
+        events: [
+          { type: 'pageview', path: '/ok', release: '1.0.0' }, // valid
+          { type: 'pageview', path: '/bad', release: 'x'.repeat(129) }, // invalid: release too long
+        ],
+      },
+    });
+    expect(res.statusCode).toBe(202);
+    expect(res.json()).toEqual({ accepted: 1, dropped: 1 });
+    const rows = allUsage();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.path).toBe('/ok');
+    expect(rows[0]?.release).toBe('1.0.0');
+  });
+});

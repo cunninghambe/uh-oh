@@ -26,6 +26,7 @@ interface UsagePayload {
     referrer?: string;
     name?: string;
     props?: Record<string, unknown>;
+    release?: string;
   }>;
 }
 
@@ -519,6 +520,75 @@ describe('lossy: no retry, no spool on a failed analytics send', () => {
     await tick();
     expect(f.calls).toHaveLength(1);
     expect(c.analyticsSize()).toBe(0);
+    c.close();
+  });
+});
+
+describe('usage release attribution', () => {
+  it('stamps the init release on trackEvent, trackPageview, and auto pageviews alike', async () => {
+    const f = mockRawFetch();
+    const timers = fakeTimers();
+    const c = new Client(
+      { dsn: DSN, release: '2.3.1+9', runtime: 'browser', analytics: { auto: true } },
+      {
+        fetchFn: f.fn,
+        win: fakeWindow().win,
+        doc: { visibilityState: 'visible', referrer: '' },
+        navigator: fakeNavigator().nav,
+        location: fakeLocation('/home').loc,
+        history: fakeHistory().history,
+        setTimeoutFn: timers.setTimeoutFn,
+        clearTimeoutFn: timers.clearTimeoutFn,
+      },
+    );
+    c.install(); // fires the initial auto pageview
+    c.trackEvent('signup');
+    c.trackPageview('/manual');
+    timers.fireAll();
+    await tick();
+    const body = usageBody(f.calls[0]?.init.body);
+    expect(body.events).toHaveLength(3);
+    expect(body.events.every((e) => e.release === '2.3.1+9')).toBe(true);
+    c.close();
+  });
+
+  it('stamps the CANONICAL release "version+build" (a buildless release gains "+0") so the server can attribute pageviews by version+build (CONTRACT RH-STAMP)', async () => {
+    const f = mockRawFetch();
+    const timers = fakeTimers();
+    const c = new Client(
+      { dsn: DSN, release: '9.9.9', runtime: 'node' },
+      { fetchFn: f.fn, setTimeoutFn: timers.setTimeoutFn, clearTimeoutFn: timers.clearTimeoutFn },
+    );
+    c.trackEvent('server_started');
+    timers.fireAll();
+    await tick();
+    expect(usageBody(f.calls[0]?.init.body).events[0]?.release).toBe('9.9.9+0');
+    c.close();
+  });
+
+  it('canonicalizes an overlong init release exactly like the crash envelope (64-char version + build)', async () => {
+    const f = mockRawFetch();
+    const timers = fakeTimers();
+    const longRelease = '9'.repeat(140);
+    const c = new Client(
+      { dsn: DSN, release: longRelease, runtime: 'browser' },
+      {
+        fetchFn: f.fn,
+        win: fakeWindow().win,
+        doc: { visibilityState: 'visible', referrer: '' },
+        navigator: fakeNavigator().nav,
+        location: fakeLocation('/').loc,
+        setTimeoutFn: timers.setTimeoutFn,
+        clearTimeoutFn: timers.clearTimeoutFn,
+      },
+    );
+    c.trackEvent('e');
+    timers.fireAll();
+    await tick();
+    // parseRelease caps version at 64 chars and a missing build becomes '0', so
+    // the canonical stamp matches what the envelope (and thus the release row)
+    // will carry - NOT the raw 140-char string.
+    expect(usageBody(f.calls[0]?.init.body).events[0]?.release).toBe('9'.repeat(64) + '+0');
     c.close();
   });
 });

@@ -36,8 +36,11 @@ export type Issue = {
   lastSeen: number;
   eventCount: number;
   // 'regressed' is system-set when a resolved issue recurs (v0.3 CONTRACT B); users can still
-  // PATCH the other three values but never set 'regressed' directly.
-  status: 'open' | 'resolved' | 'ignored' | 'regressed';
+  // PATCH the other three values but never set 'regressed' directly. 'merged' (v0.9 CONTRACT —
+  // SPEC §24 issue merge) is likewise system-set only, the terminal state a source issue flips to
+  // after `POST /api/issues/:id/merge` — PATCH rejects it too, so it's never a toggle target
+  // either (see Issue.utils.ts's statusToggleOptions, which returns no options for it).
+  status: 'open' | 'resolved' | 'ignored' | 'regressed' | 'merged';
   lastAlertedAt: number | null;
   // v0.4 CONTRACT P: server-set from the issue's latest event, nullable (an issue with no
   // events, or one predating migration 0004, has none). Optional too so this type stays
@@ -132,8 +135,10 @@ export type ImpactSummary = {
   platforms: { platform: string; events: number }[];
 };
 
-// v0.5 CONTRACT M: monitors are a dead-man's-switch, not something the UI creates — a row only
-// exists once the owner's fleet has POSTed one check-in for it (see MonitorsSection.tsx).
+// v0.5 CONTRACT M: monitors are a dead-man's-switch for the 'checkin' kind — a row only exists
+// once the owner's fleet has POSTed one check-in for it. v0.9 CONTRACT (SPEC §24 uptime probes)
+// adds the 'http' kind, which *is* created from the dashboard (see MonitorsSection.tsx's create
+// form) since nothing external pings it into existence the way a check-in does.
 export type Monitor = {
   id: string;
   projectId: string;
@@ -147,6 +152,19 @@ export type Monitor = {
   // Server-computed: true when `now` is already past the miss threshold even if the 60s sweep
   // hasn't flipped `status` to 'missed' yet — see MonitorsSection.tsx's early-warning chip.
   overdue: boolean;
+  // v0.9 CONTRACT (SPEC §24 uptime probes): defaults to 'checkin' server-side; optional here for
+  // forward-compat with an older server build that omits it entirely (same convention as
+  // `Issue.platform?` above) — callers must treat undefined the same as 'checkin' (see
+  // MonitorsSection.utils.ts's `monitorKind`). Immutable after create.
+  kind?: 'checkin' | 'http';
+  // Only present for kind 'http'; SSRF-validated at save and probe time server-side.
+  url?: string | null;
+  timeoutMs?: number | null;
+  lastProbeAt?: number | null;
+  // Raw HTTP status of the last probe (200–399 = success); null when never probed or the last
+  // probe failed before getting a status line (DNS/connect/timeout error).
+  lastProbeStatus?: number | null;
+  consecutiveFailures?: number;
 };
 
 // v0.6 CONTRACT U-API: GET /api/projects/:id/usage/summary?days=. `days` ascending, zero-filled
@@ -172,6 +190,23 @@ export type MonitorPatch = {
   graceMinutes?: number;
   // Only these two are valid PATCH targets — 'missed' is set by the server-side sweep only.
   status?: 'ok' | 'paused';
+  // v0.9 CONTRACT (SPEC §24 uptime probes): kind-'http' settings, editable post-create — unlike
+  // `kind` itself, which is immutable and therefore never a PATCH field (see
+  // MonitorsSection.tsx's edit form, which only renders these two for an http-kind row).
+  url?: string;
+  timeoutMs?: number;
+};
+
+// v0.9 CONTRACT (SPEC §24 uptime probes): `POST /api/projects/:id/monitors` — the one monitor
+// kind the dashboard actually creates (see the `Monitor` type comment above for why 'checkin'
+// still has no create form). Field list matches the brief exactly: slug, url, intervalMinutes
+// required; timeoutMs optional (server defaults 10000ms, caps 30000ms).
+export type CreateMonitorInput = {
+  kind: 'http';
+  slug: string;
+  url: string;
+  intervalMinutes: number;
+  timeoutMs?: number;
 };
 
 // v0.8 CONTRACT (SPEC §23 annotations): GET /api/issues/:id/annotations?limit=&offset=, newest
@@ -199,6 +234,59 @@ export type FixAttempt = {
   createdAt: number;
   deployedAt?: number | null;
   updatedAt: number;
+};
+
+// v0.9 CONTRACT (SPEC §24 release health): GET /api/projects/:id/release-health?days= — server
+// agent work landing concurrently, may 404 until it does. `crashesPer1kPageviews` is `null` (not
+// 0) when `pageviews` is 0 for that release (analytics off, non-web platform, or unattributed) —
+// callers must hide/dash the ratio rather than show "0" for it, same rule as
+// ImpactSummary.distinctUsers above. See ReleaseHealthSection.tsx.
+export type ReleaseHealthRelease = {
+  id: string;
+  version: string;
+  build: string;
+  platform: 'ios' | 'android' | 'web' | 'node';
+  commitSha: string | null;
+  events: number;
+  fatalEvents: number;
+  distinctIssues: number;
+  firstEventAt: number;
+  lastEventAt: number;
+  pageviews: number;
+  crashesPer1kPageviews: number | null;
+};
+
+export type ReleaseHealthTotals = {
+  events: number;
+  fatalEvents: number;
+  distinctIssues: number;
+  pageviews: number;
+  crashesPer1kPageviews: number | null;
+};
+
+export type ReleaseHealth = {
+  releases: ReleaseHealthRelease[];
+  totals: ReleaseHealthTotals;
+};
+
+// v0.9 CONTRACT (SPEC §24 issue merge): GET /api/issues/:id/similar — ≤10 fleet-wide issues
+// (excluding self) sharing the exception-type prefix, ranked has-verified-fix desc / annotation
+// count desc / last_seen desc (server concern, not recomputed here — same "trust server
+// ordering" rule as UsageSection.utils.ts's usageBarLists). Rendered as one-click merge targets
+// in MergeIssueModal.tsx.
+export type SimilarIssue = {
+  issue: {
+    id: string;
+    projectId: string;
+    projectSlug: string;
+    title: string;
+    status: Issue['status'];
+    platform: EventRow['platform'] | null;
+    lastSeen: number;
+    eventCount: number;
+  };
+  fixAttempts: FixAttempt[];
+  annotationCount: number;
 };
 
 export class ApiError extends Error {
@@ -379,12 +467,17 @@ export const api = {
   // field is simply absent from the JSON, not `[]` — is distinguishable from "zero fix attempts
   // so far" at the type level. See Issue.tsx / FixAttemptsPanel.tsx for how the two are handled
   // differently (undefined hides the whole panel, [] shows its empty state).
+  // v0.9 CONTRACT (SPEC §24 issue merge): `mergedInto` is a SIBLING of `issue`, not a field on
+  // it — the server derives it from the fingerprint_aliases table at read time (see
+  // routes.ts / the MCP IssueDetail shape), it is not a stored issue column. Present and
+  // non-null only when the issue's status is 'merged'.
   getIssue: (id: string) =>
     request<{
       issue: Issue;
       latestEvent: EventRow | null;
       breadcrumbs: Breadcrumb[];
       fixAttempts?: FixAttempt[];
+      mergedInto?: string | null;
     }>(`/api/issues/${id}`),
 
   // SPEC §9: GET /api/issues/:id/events?page=&limit= — page-based (1-indexed), unlike
@@ -447,6 +540,16 @@ export const api = {
 
   deleteMonitor: (id: string) => request<void>(`/api/monitors/${id}`, { method: 'DELETE' }),
 
+  // v0.9 CONTRACT (SPEC §24 uptime probes) — server agent work landing concurrently, may 404
+  // until it does. Unlike the read paths above, a failure here surfaces as a form error (see
+  // MonitorsSection.tsx's create form) rather than hiding anything — creating a monitor is an
+  // explicit user action, not a passive section render.
+  createMonitor: (projectId: string, input: CreateMonitorInput) =>
+    request<{ monitor: Monitor }>(`/api/projects/${projectId}/monitors`, {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
   // v0.6 CONTRACT U-API — server agent work landing concurrently, may 404 until it does. Callers
   // must treat any failure as "no usage endpoint" and hide the whole section (see
   // UsageSection.tsx), same degrade-gracefully pattern as listMonitors/getIssueImpact above.
@@ -473,5 +576,29 @@ export const api = {
     request<{ annotation: IssueAnnotation }>(`/api/issues/${issueId}/annotations`, {
       method: 'POST',
       body: JSON.stringify(input),
+    }),
+
+  // v0.9 CONTRACT (SPEC §24 release health) — server agent work landing concurrently, may 404
+  // until it does. Callers must treat any failure as "no release health endpoint" and hide the
+  // whole section (see ReleaseHealthSection.tsx), same degrade-gracefully pattern as
+  // getUsageSummary/listMonitors above.
+  getReleaseHealth: (projectId: string, days = 30) =>
+    request<ReleaseHealth>(`/api/projects/${projectId}/release-health?days=${String(days)}`),
+
+  // v0.9 CONTRACT (SPEC §24 issue merge) — server agent work landing concurrently, may 404 until
+  // it does. Unlike most `list*`/`get*` calls here, this backs a modal a user just opened (see
+  // MergeIssueModal.tsx), so a failure surfaces as "no suggested targets" inside the modal rather
+  // than hiding the Merge action entirely — the free issue-id field still works either way.
+  getSimilarIssues: (issueId: string) =>
+    request<{ similar: SimilarIssue[] }>(`/api/issues/${issueId}/similar`),
+
+  // v0.9 CONTRACT (SPEC §24 issue merge): JWT-only, deliberately not exposed to the agent token
+  // (see SPEC §24 — "deliberately not agent-scoped"). 400 on target===source, cross-project,
+  // unknown target, or a target that's itself already merged — MergeIssueModal.tsx surfaces the
+  // ApiError message as visible text rather than swallowing it.
+  mergeIssue: (issueId: string, into: string) =>
+    request<{ merged: boolean; mergedInto: string }>(`/api/issues/${issueId}/merge`, {
+      method: 'POST',
+      body: JSON.stringify({ into }),
     }),
 };

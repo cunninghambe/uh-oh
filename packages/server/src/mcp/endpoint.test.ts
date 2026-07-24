@@ -105,17 +105,18 @@ describe('POST /mcp with a valid token (real MCP client)', () => {
     return client;
   };
 
-  it('lists all seventeen tools', async () => {
+  it('lists all eighteen tools', async () => {
     const client = await connect();
     try {
       const { tools } = await client.listTools();
-      expect(tools).toHaveLength(17);
+      expect(tools).toHaveLength(18);
       const names = tools.map((t) => t.name);
       expect(names).toContain('get_server_health');
       expect(names).toContain('get_issue_bundle');
       expect(names).toContain('list_top_issues');
       expect(names).toContain('list_monitors');
       expect(names).toContain('get_usage_summary');
+      expect(names).toContain('get_release_health');
       expect(names).toContain('list_similar_issues');
       expect(names).toContain('annotate_issue');
       expect(names).toContain('record_fix_attempt');

@@ -93,6 +93,7 @@ describe('insertUsageEvent', () => {
         'props',
         'receivedAt',
         'referrerDomain',
+        'release',
         'type',
         'visitor',
       ].sort(),

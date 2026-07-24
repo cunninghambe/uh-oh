@@ -24,7 +24,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO = join(__dirname, '..');
 
 export const CLIENT_SOURCE = join(REPO, 'packages', 'js', 'src', 'uh-oh-client.ts');
-export const CLIENT_VERSION = '0.5.0';
+export const CLIENT_VERSION = '0.6.0';
 export const GENERATED_MARKER = 'GENERATED FILE - vendored from uh-oh';
 
 /**

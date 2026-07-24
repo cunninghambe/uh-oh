@@ -141,3 +141,177 @@ describe('DELETE /api/monitors/:id', () => {
     expect(res.statusCode).toBe(404);
   });
 });
+
+describe('POST /api/projects/:id/monitors (http)', () => {
+  const create = (payload: Record<string, unknown>, id = project.id) =>
+    app().inject({
+      method: 'POST',
+      url: `/api/projects/${id}/monitors`,
+      headers: auth(),
+      payload,
+    });
+
+  it('requires auth', async () => {
+    const res = await app().inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/monitors`,
+      payload: { kind: 'http', slug: 'ops', url: 'https://err.example', intervalMinutes: 5 },
+    });
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('creates an http monitor and surfaces kind/url/lastProbeStatus', async () => {
+    const res = await create({
+      kind: 'http',
+      slug: 'ops',
+      url: 'https://err.example/health',
+      intervalMinutes: 5,
+      timeoutMs: 8000,
+    });
+    expect(res.statusCode).toBe(201);
+    const { monitor } = res.json<{ monitor: Monitor & { kind: string; url: string } }>();
+    expect(monitor).toMatchObject({
+      slug: 'ops',
+      kind: 'http',
+      url: 'https://err.example/health',
+      status: 'ok',
+      overdue: false,
+    });
+    // It shows up in the list with the http fields.
+    const list = await app().inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}/monitors`,
+      headers: auth(),
+    });
+    const row = list
+      .json<{
+        monitors: (Monitor & { kind: string; url: string; lastProbeStatus: number | null })[];
+      }>()
+      .monitors.find((m) => m.slug === 'ops');
+    expect(row).toMatchObject({
+      kind: 'http',
+      url: 'https://err.example/health',
+      lastProbeStatus: null,
+    });
+  });
+
+  it('caps an over-large timeout at 30000', async () => {
+    const res = await create({
+      kind: 'http',
+      slug: 'slow',
+      url: 'https://err.example',
+      intervalMinutes: 5,
+      timeoutMs: 999999,
+    });
+    expect(res.statusCode).toBe(201);
+    expect(res.json<{ monitor: { timeoutMs: number } }>().monitor.timeoutMs).toBe(30000);
+  });
+
+  it('rejects a non-http kind (check-in monitors auto-create via ping)', async () => {
+    const res = await create({ kind: 'checkin', slug: 'cron', intervalMinutes: 5 });
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: string }>().error).toBe('invalid_kind');
+  });
+
+  it('rejects an SSRF-prone url at save time', async () => {
+    for (const url of [
+      'http://127.0.0.1/x',
+      'http://localhost/x',
+      'https://10.0.0.1',
+      'ftp://x/y',
+    ]) {
+      const res = await create({ kind: 'http', slug: 'ssrf', url, intervalMinutes: 5 });
+      expect(res.statusCode, url).toBe(400);
+      expect(res.json<{ error: string }>().error).toBe('invalid_url');
+    }
+  });
+
+  it('rejects a bad slug and 409s a duplicate slug', async () => {
+    expect(
+      (
+        await create({
+          kind: 'http',
+          slug: 'Bad Slug',
+          url: 'https://e.example',
+          intervalMinutes: 5,
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(
+      (await create({ kind: 'http', slug: 'dup', url: 'https://e.example', intervalMinutes: 5 }))
+        .statusCode,
+    ).toBe(201);
+    const again = await create({
+      kind: 'http',
+      slug: 'dup',
+      url: 'https://e.example',
+      intervalMinutes: 5,
+    });
+    expect(again.statusCode).toBe(409);
+    expect(again.json<{ error: string }>().error).toBe('slug_exists');
+  });
+
+  it('404s on an unknown project', async () => {
+    const res = await create(
+      { kind: 'http', slug: 'ops', url: 'https://e.example', intervalMinutes: 5 },
+      'nope',
+    );
+    expect(res.statusCode).toBe(404);
+  });
+});
+
+describe('PATCH /api/monitors/:id — kind immutability + http fields', () => {
+  const createHttp = async (slug: string) => {
+    const res = await app().inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/monitors`,
+      headers: auth(),
+      payload: { kind: 'http', slug, url: 'https://err.example/a', intervalMinutes: 5 },
+    });
+    return res.json<{ monitor: MonitorRowLike }>().monitor;
+  };
+  type MonitorRowLike = { id: string; kind: string };
+
+  it('rejects changing kind', async () => {
+    const m = await createHttp('ops');
+    const res = await app().inject({
+      method: 'PATCH',
+      url: `/api/monitors/${m.id}`,
+      headers: auth(),
+      payload: { kind: 'checkin' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: string }>().error).toBe('kind_immutable');
+  });
+
+  it('updates the url of an http monitor (re-validating SSRF)', async () => {
+    const m = await createHttp('ops2');
+    const good = await app().inject({
+      method: 'PATCH',
+      url: `/api/monitors/${m.id}`,
+      headers: auth(),
+      payload: { url: 'https://err.example/b' },
+    });
+    expect(good.statusCode).toBe(200);
+    expect(getMonitor(db, m.id)?.url).toBe('https://err.example/b');
+    const bad = await app().inject({
+      method: 'PATCH',
+      url: `/api/monitors/${m.id}`,
+      headers: auth(),
+      payload: { url: 'http://127.0.0.1' },
+    });
+    expect(bad.statusCode).toBe(400);
+  });
+
+  it('rejects url on a check-in monitor', async () => {
+    const m = seedMonitor('cron');
+    const res = await app().inject({
+      method: 'PATCH',
+      url: `/api/monitors/${m.id}`,
+      headers: auth(),
+      payload: { url: 'https://err.example' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: string }>().error).toBe('url_not_applicable');
+  });
+});

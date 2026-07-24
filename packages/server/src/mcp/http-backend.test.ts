@@ -8,8 +8,12 @@ import type { EventEnvelope } from '@uh-oh/types';
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
-import { createMonitor } from '../db/repos/monitors.js';
+import { applyProbeOutcome, createMonitor } from '../db/repos/monitors.js';
 import { insertUsageEvent } from '../db/repos/usage.js';
+import { insertEvent } from '../db/repos/events.js';
+import { getIssue, upsertIssue } from '../db/repos/issues.js';
+import { mergeIssueInto } from '../db/repos/merge.js';
+import { upsertRelease } from '../db/repos/releases.js';
 import { cleanupExpiredSessions } from '../db/repos/sessions.js';
 import { ingest } from '../ingest/ingest.js';
 import { createRateLimiter } from '../ingest/rate-limit.js';
@@ -148,6 +152,30 @@ describe('HttpBackend against a live server', () => {
     expect(scoped).toHaveLength(1);
   });
 
+  it('surfaces kind/url/lastProbeStatus/lastProbeAt for an http monitor (v0.9 §24)', async () => {
+    const monitor = createMonitor(db, {
+      projectId: project.id,
+      slug: 'ops',
+      kind: 'http',
+      url: 'https://example.com/health',
+      timeoutMs: 5000,
+      intervalMinutes: 5,
+      graceMinutes: 5,
+      now: Date.now(),
+    });
+    applyProbeOutcome(db, monitor.id, { ok: true, status: 200 }, Date.now());
+
+    const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+    const monitors = await backend.listMonitors({ projectId: project.id });
+    expect(monitors).toHaveLength(1);
+    expect(monitors[0]).toMatchObject({
+      kind: 'http',
+      url: 'https://example.com/health',
+      lastProbeStatus: 200,
+    });
+    expect(monitors[0]?.lastProbeAt).not.toBeNull();
+  });
+
   it('fetches the usage summary over the API route', async () => {
     insertUsageEvent(db, {
       projectId: project.id,
@@ -164,6 +192,73 @@ describe('HttpBackend against a live server', () => {
     expect(summary.days).toHaveLength(7);
     expect(summary.totals).toEqual({ pageviews: 1, visitors: 1, events: 0 });
     expect(summary.topReferrers[0]).toEqual({ referrer: 'google.com', pageviews: 1 });
+  });
+
+  it('fetches release health over the API route (v0.9 §24)', async () => {
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '9.9.9',
+      build: '1',
+      platform: 'web',
+    });
+    insertEvent(db, {
+      projectId: project.id,
+      issueId: seedIssue(),
+      releaseId: release.id,
+      fingerprint: 'fp-release-health',
+      level: 'fatal',
+      platform: 'web',
+      payload: '{}',
+      receivedAt: Date.now(),
+      deviceInfo: '{}',
+      userInfo: null,
+    });
+    insertUsageEvent(db, {
+      projectId: project.id,
+      type: 'pageview',
+      name: null,
+      path: '/',
+      referrerDomain: null,
+      visitor: 'v1',
+      props: null,
+      release: '9.9.9+1',
+      receivedAt: Date.now(),
+    });
+
+    const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+    const health = await backend.getReleaseHealth({ projectId: project.id, days: 7 });
+    const row = health.releases.find((r) => r.version === '9.9.9');
+    expect(row).toMatchObject({
+      version: '9.9.9',
+      build: '1',
+      platform: 'web',
+      events: 1,
+      fatalEvents: 1,
+      pageviews: 1,
+      crashesPer1kPageviews: 1000,
+    });
+    expect(health.totals.events).toBeGreaterThanOrEqual(1);
+  });
+
+  it('exposes mergedInto on a merged issue via getIssue (v0.9 §24)', async () => {
+    const issueId = seedIssue();
+    const { issue: target } = upsertIssue(db, {
+      projectId: project.id,
+      fingerprint: 'fp-merge-target',
+      title: 'Target',
+      ts: Date.now(),
+      platform: 'android',
+    });
+    const source = getIssue(db, issueId);
+    if (!source) throw new Error('missing source issue');
+    db.transaction((tx) => {
+      mergeIssueInto(tx, source, target, Date.now());
+    });
+
+    const backend = new HttpBackend({ serverUrl: baseUrl, adminPassword: PASSWORD });
+    const detail = await backend.getIssue({ issueId });
+    expect(detail?.issue.status).toBe('merged');
+    expect(detail?.mergedInto).toBe(target.id);
   });
 
   describe('v0.8 agent-loop (§23)', () => {

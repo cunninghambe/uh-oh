@@ -26,6 +26,9 @@ import type { RateLimiter } from './rate-limit.js';
 // invalid events inside a within-cap batch are dropped, not fatal.
 const MAX_BATCH = 50;
 const MAX_STR = 512;
+// Release attribution string cap (§24). An over-long release drops the event
+// (not the batch), exactly like any other per-event validation failure.
+const MAX_RELEASE = 128;
 
 // Per-event wire schema. A failure here drops just that event (not the batch).
 const PropValue = z.union([z.string().max(256), z.number(), z.boolean()]);
@@ -39,6 +42,9 @@ const UsageEventSchema = z
       .string()
       .regex(/^[a-zA-Z0-9_-]{1,64}$/)
       .optional(),
+    // The client's init release, stamped on every usage event (§24). ≤128 chars;
+    // an over-long value drops just this event.
+    release: z.string().max(MAX_RELEASE).optional(),
     props: z
       .record(z.string().max(64), PropValue)
       .refine((o) => Object.keys(o).length <= 10, { message: 'at most 10 prop keys' })
@@ -177,6 +183,7 @@ export const registerUsageIngestRoute = (
               e.referrer !== undefined ? referrerToDomain(e.referrer, siteHost) : null,
             visitor,
             props: e.props !== undefined ? JSON.stringify(e.props) : null,
+            release: e.release !== undefined && e.release.length > 0 ? e.release : null,
             receivedAt: now,
           });
           accepted++;

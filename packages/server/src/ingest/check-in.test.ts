@@ -3,7 +3,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject, updateProject } from '../db/repos/projects.js';
-import { getMonitor, getMonitorBySlug, setMonitorStatus } from '../db/repos/monitors.js';
+import {
+  createMonitor,
+  getMonitor,
+  getMonitorBySlug,
+  setMonitorStatus,
+} from '../db/repos/monitors.js';
 import { takeDueDispatches } from '../db/repos/webhook-dispatches.js';
 import type { ProjectRow } from '../db/schema.js';
 import { buildServer } from '../server.js';
@@ -38,6 +43,23 @@ describe('POST /ingest/:publicKey/check-in/:slug', () => {
     const res = await checkIn(app(), 'Bad_Slug', project.publicKey, '?intervalMinutes=10');
     expect(res.statusCode).toBe(400);
     expect(res.json<{ error: string }>().error).toBe('invalid_slug');
+  });
+
+  it('409s a check-in ping against an http monitor (§24)', async () => {
+    createMonitor(db, {
+      projectId: project.id,
+      slug: 'ops',
+      intervalMinutes: 5,
+      graceMinutes: 5,
+      kind: 'http',
+      url: 'https://err.example/health',
+      now: Date.now(),
+    });
+    const res = await checkIn(app(), 'ops', project.publicKey, '?intervalMinutes=5');
+    expect(res.statusCode).toBe(409);
+    expect(res.json<{ error: string }>().error).toBe('not_a_checkin_monitor');
+    // The http monitor is untouched — no check-in recorded.
+    expect(getMonitorBySlug(db, project.id, 'ops')?.lastCheckInAt).toBeNull();
   });
 
   it('auto-creates on the first ping and requires intervalMinutes', async () => {

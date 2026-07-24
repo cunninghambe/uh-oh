@@ -10,7 +10,7 @@ import {
   createRoute,
   createRouter,
 } from '@tanstack/react-router';
-import { render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -303,5 +303,100 @@ describe('Issue page — v0.8 CONTRACT (SPEC §23 fix attempts panel wiring)', (
 
     const link = await screen.findByRole('link', { name: 'abcdef0' });
     expect(link).toHaveAttribute('href', 'https://github.com/org/repo/commit/abcdef0123456');
+  });
+});
+
+describe('Issue page — v0.9 CONTRACT (SPEC §24 issue merge)', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  const mockCommonQueries = (): void => {
+    vi.spyOn(api, 'listIssueEvents').mockResolvedValue({ events: [], total: 0 });
+    vi.spyOn(api, 'getIssueImpact').mockRejectedValue(new ApiError(404, 'not found'));
+    vi.spyOn(api, 'getEvent').mockResolvedValue({ event: baseEvent, breadcrumbs, frames: [] });
+    vi.spyOn(api, 'getProject').mockRejectedValue(new ApiError(404, 'not found'));
+    vi.spyOn(api, 'listIssueAnnotations').mockRejectedValue(new ApiError(404, 'not found'));
+  };
+
+  it('shows a Merged badge and a link to the target issue for a merged issue, and no status toggle', async () => {
+    vi.spyOn(api, 'getIssue').mockResolvedValue({
+      issue: { ...baseIssue, status: 'merged' },
+      latestEvent: baseEvent,
+      breadcrumbs,
+      // mergedInto is a SIBLING of `issue` on the real detail response (derived
+      // from fingerprint_aliases server-side), not an issue column.
+      mergedInto: 'i9',
+    });
+    mockCommonQueries();
+
+    renderIssue();
+
+    expect(await screen.findByText('Merged')).toBeInTheDocument();
+    const link = screen.getByRole('link', { name: 'i9' });
+    expect(link).toHaveAttribute('href', '/issues/i9');
+    // A merged issue is terminal — no open/resolved/ignored toggle and no Merge button.
+    expect(screen.queryByRole('button', { name: 'open' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Merge' })).not.toBeInTheDocument();
+  });
+
+  it('renders no Merged banner for a non-merged issue', async () => {
+    vi.spyOn(api, 'getIssue').mockResolvedValue({
+      issue: baseIssue,
+      latestEvent: baseEvent,
+      breadcrumbs,
+    });
+    mockCommonQueries();
+
+    renderIssue();
+
+    await screen.findByText('Boom');
+    expect(screen.queryByText('Merged')).not.toBeInTheDocument();
+  });
+
+  it('a non-merged issue shows a Merge button that opens the merge modal', async () => {
+    vi.spyOn(api, 'getIssue').mockResolvedValue({
+      issue: baseIssue,
+      latestEvent: baseEvent,
+      breadcrumbs,
+    });
+    mockCommonQueries();
+    vi.spyOn(api, 'getSimilarIssues').mockResolvedValue({ similar: [] });
+
+    renderIssue();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Merge' }));
+
+    expect(await screen.findByRole('dialog', { name: 'Merge issue' })).toBeInTheDocument();
+  });
+
+  it('a successful merge navigates to the target issue', async () => {
+    vi.spyOn(api, 'getIssue').mockImplementation((id: string) =>
+      Promise.resolve(
+        id === 'i9'
+          ? {
+              issue: { ...baseIssue, id: 'i9', title: 'Target issue' },
+              latestEvent: baseEvent,
+              breadcrumbs,
+            }
+          : { issue: baseIssue, latestEvent: baseEvent, breadcrumbs },
+      ),
+    );
+    mockCommonQueries();
+    vi.spyOn(api, 'getSimilarIssues').mockResolvedValue({ similar: [] });
+    vi.spyOn(api, 'mergeIssue').mockResolvedValue({ merged: true, mergedInto: 'i9' });
+
+    renderIssue();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Merge' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Merge issue' });
+    await within(dialog).findByText('No similar issues found.');
+
+    fireEvent.change(within(dialog).getByLabelText('Target issue id'), {
+      target: { value: 'i9' },
+    });
+    fireEvent.click(within(dialog).getByRole('button', { name: 'Merge' }));
+
+    expect(await screen.findByText('Target issue')).toBeInTheDocument();
   });
 });
