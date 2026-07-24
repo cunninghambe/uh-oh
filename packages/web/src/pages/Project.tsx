@@ -6,6 +6,7 @@ import { api } from '../api.js';
 import { MonitorsSection } from '../components/MonitorsSection.js';
 import { PlatformBadge } from '../components/PlatformBadge.js';
 import { RegressedBadge } from '../components/RegressedBadge.js';
+import { ReleaseHealthSection } from '../components/ReleaseHealthSection.js';
 import { Sparkline } from '../components/Sparkline.js';
 import { SpikeBadge } from '../components/SpikeBadge.js';
 import { UsageSection } from '../components/UsageSection.js';
@@ -250,6 +251,12 @@ export const Project = () => {
           </div>
         </div>
       )}
+
+      {/* v0.9 CONTRACT (SPEC §24 release health): renders nothing itself if GET
+          .../release-health 404s (endpoint not yet available on the server this build is talking
+          to) — see ReleaseHealthSection.tsx, same degrade-gracefully pattern as
+          MonitorsSection.tsx/UsageSection.tsx below. */}
+      <ReleaseHealthSection projectId={projectId} repoUrl={project?.repoUrl} />
 
       {/* v0.5 CONTRACT M: renders nothing itself if GET .../monitors 404s (endpoint not yet
           available on the server this build is talking to) — see MonitorsSection.tsx. */}

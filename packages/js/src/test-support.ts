@@ -296,6 +296,44 @@ export function fakeHistory(
   };
 }
 
+export type FakeConsoleMethod = 'debug' | 'log' | 'info' | 'warn' | 'error';
+
+export interface FakeConsoleCall {
+  method: FakeConsoleMethod;
+  args: unknown[];
+  thisArg: unknown;
+}
+
+export interface FakeConsole {
+  con: Record<FakeConsoleMethod, (...args: unknown[]) => void>;
+  calls: FakeConsoleCall[];
+}
+
+/**
+ * A fake console recording every call (method, args, and `this`) so tests can
+ * assert the console-breadcrumbs wrapper always invokes the original with
+ * unchanged arguments and `this`. `throwOn` makes one method throw, to
+ * exercise the "still call through, then rethrow" path.
+ */
+export function fakeConsole(opts: { throwOn?: FakeConsoleMethod } = {}): FakeConsole {
+  const calls: FakeConsoleCall[] = [];
+  const make = (method: FakeConsoleMethod) =>
+    function (this: unknown, ...args: unknown[]): void {
+      calls.push({ method, args, thisArg: this });
+      if (opts.throwOn === method) throw new Error(`${method} boom`);
+    };
+  return {
+    calls,
+    con: {
+      debug: make('debug'),
+      log: make('log'),
+      info: make('info'),
+      warn: make('warn'),
+      error: make('error'),
+    },
+  };
+}
+
 export interface FakeTimers {
   setTimeoutFn: (cb: () => void, ms: number) => unknown;
   clearTimeoutFn: (handle: unknown) => void;

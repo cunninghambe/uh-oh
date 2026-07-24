@@ -14,6 +14,9 @@ import {
 import { computeImpact } from '../db/repos/impact.js';
 import { topIssues } from '../db/repos/top-issues.js';
 import { listFixAttempts, toFixAttemptView } from '../db/repos/fix-attempts.js';
+import { getAliasTarget } from '../db/repos/fingerprint-aliases.js';
+import { mergeIssueInto } from '../db/repos/merge.js';
+import { clampReleaseHealthDays, releaseHealth } from '../db/repos/release-health.js';
 import type { Db } from '../db/index.js';
 import { buildAuthMiddleware } from '../auth/middleware.js';
 import { buildUploadAuthMiddleware } from '../auth/symbol-token.js';
@@ -24,6 +27,7 @@ import { buildIssueBundle } from './bundle.js';
 import { validateWebhookUrl } from '../webhooks/url-guard.js';
 import { clampDays, issueStats, projectStats } from '../db/repos/stats.js';
 import { clampUsageDays, usageSummary } from '../db/repos/usage-summary.js';
+import { metrics } from '../metrics/registry.js';
 
 // list_top_issues bounds (mirrored by the MCP tool schema).
 const MAX_TOP_ISSUES = 25;
@@ -41,10 +45,11 @@ const isPatchStatus = (s: unknown): s is PatchStatusInput =>
   s === 'open' || s === 'resolved' || s === 'ignored';
 
 // The issues list `status` filter additionally accepts the system-set
-// 'regressed' status.
-type FilterStatusInput = PatchStatusInput | 'regressed';
+// 'regressed' status, and (v0.9 §24) the terminal 'merged' status — the ONLY way
+// to surface merged issues, which the default listing hides.
+type FilterStatusInput = PatchStatusInput | 'regressed' | 'merged';
 const isFilterStatus = (s: unknown): s is FilterStatusInput =>
-  isPatchStatus(s) || s === 'regressed';
+  isPatchStatus(s) || s === 'regressed' || s === 'merged';
 
 const VALID_SORTS = new Set<IssueSort>(['lastSeen', 'eventCount', 'firstSeen']);
 const isSort = (s: unknown): s is IssueSort =>
@@ -242,6 +247,18 @@ export const registerApiRoutes = (
     },
   );
 
+  // §24 — per-release crash health vs. attributed usage pageviews (days clamped
+  // 1..90, default 30). Same read allowlist as the other project reads.
+  app.get<{ Params: { id: string }; Querystring: { days?: string } }>(
+    '/api/projects/:id/release-health',
+    { preHandler: readPreHandler },
+    (req, reply) => {
+      const project = getProjectById(db, req.params.id);
+      if (!project) return reply.code(404).send({ error: 'project_not_found' });
+      return releaseHealth(db, project.id, clampReleaseHealthDays(req.query.days));
+    },
+  );
+
   app.get<{ Params: { id: string } }>(
     '/api/issues/:id',
     { preHandler: readPreHandler },
@@ -253,7 +270,11 @@ export const registerApiRoutes = (
       // §23: expose fix attempts (newest first) on the detail. spikeActive /
       // lastSpikeAt ride along on the `issue` row itself.
       const fixAttempts = listFixAttempts(db, issue.id).map(toFixAttemptView);
-      return { issue, latestEvent: latest, breadcrumbs, fixAttempts };
+      // §24: a merged issue points the dashboard at its target. The pointer is the
+      // target of the alias for the issue's own fingerprint (null otherwise).
+      const mergedInto =
+        issue.status === 'merged' ? getAliasTarget(db, issue.projectId, issue.fingerprint) : null;
+      return { issue, latestEvent: latest, breadcrumbs, fixAttempts, mergedInto };
     },
   );
 
@@ -267,9 +288,56 @@ export const registerApiRoutes = (
       // Only open|resolved|ignored are user-settable; PATCHing a regressed issue
       // to resolved re-arms detection (a later event re-triggers regressed).
       if (!isPatchStatus(status)) return reply.code(400).send({ error: 'invalid_status' });
+      const existing = getIssue(db, req.params.id);
+      if (!existing) return reply.code(404).send({ error: 'not_found' });
+      // §24: 'merged' is a terminal status — a merged issue cannot be re-opened.
+      if (existing.status === 'merged') return reply.code(409).send({ error: 'issue_merged' });
       const updated = setIssueStatus(db, req.params.id, status);
       if (!updated) return reply.code(404).send({ error: 'not_found' });
       return { issue: updated };
+    },
+  );
+
+  // §24: merge this issue into another (JWT only — deliberately not agent-scoped).
+  // In one transaction the source's events/annotations/fix-attempts move to the
+  // target, the target's counts recompute, the source's fingerprint (and its
+  // existing aliases) become aliases of the target, and the source flips to the
+  // terminal 'merged' status. Ingest then routes the source's fingerprint here.
+  app.post<{ Params: { id: string }; Body: unknown }>(
+    '/api/issues/:id/merge',
+    { preHandler },
+    (req, reply) => {
+      const source = getIssue(db, req.params.id);
+      if (!source) return reply.code(404).send({ error: 'not_found' });
+      const body = req.body;
+      if (typeof body !== 'object' || body === null) {
+        return reply.code(400).send({ error: 'invalid_body' });
+      }
+      const into = (body as { into?: unknown }).into;
+      if (typeof into !== 'string' || into.length === 0) {
+        return reply.code(400).send({ error: 'invalid_into' });
+      }
+      const target = getIssue(db, into);
+      if (!target) return reply.code(404).send({ error: 'target_not_found' });
+      if (target.id === source.id) {
+        return reply.code(400).send({ error: 'cannot_merge_into_self' });
+      }
+      if (target.projectId !== source.projectId) {
+        return reply.code(400).send({ error: 'cross_project_merge' });
+      }
+      // A merged issue is terminal: it can be neither a source nor a target again.
+      if (source.status === 'merged') {
+        return reply.code(400).send({ error: 'source_already_merged' });
+      }
+      if (target.status === 'merged') {
+        return reply.code(400).send({ error: 'target_merged' });
+      }
+      db.transaction((tx) => {
+        mergeIssueInto(tx, source, target, Date.now());
+      });
+      metrics.issuesMerged.inc();
+      const updatedTarget = getIssue(db, target.id);
+      return { merged: true, issue: updatedTarget, mergedInto: target.id };
     },
   );
 

@@ -59,7 +59,13 @@ export const issues = sqliteTable(
     firstSeen: integer('first_seen').notNull(),
     lastSeen: integer('last_seen').notNull(),
     eventCount: integer('event_count').notNull().default(1),
-    status: text('status', { enum: ['open', 'resolved', 'ignored', 'regressed'] })
+    // 'merged' (v0.9 §24) is a system-set terminal status: an issue merged into
+    // another. It is excluded from every default list/filter (only visible via an
+    // explicit status=merged), rejects PATCH, and its detail links to the target
+    // via the fingerprint_aliases row for its own fingerprint. The column stays
+    // plain TEXT (no SQL CHECK), so this widening is a TS-only change — no
+    // migration DDL for the status column.
+    status: text('status', { enum: ['open', 'resolved', 'ignored', 'regressed', 'merged'] })
       .notNull()
       .default('open'),
     lastAlertedAt: integer('last_alerted_at'),
@@ -137,9 +143,12 @@ export const sessions = sqliteTable('sessions', {
   expiresAt: integer('expires_at').notNull(),
 });
 
-// Check-in monitors (dead-man's-switch, §CONTRACT M). A monitor is "ok" while it
-// keeps pinging within interval+grace; a 60s sweep flips overdue monitors to
-// "missed" (dispatching once); the next ping recovers it. "paused" opts out.
+// Monitors (§CONTRACT M + v0.9 §24). A `checkin` monitor is a dead-man's-switch:
+// it is "ok" while it keeps pinging within interval+grace; a 60s sweep flips
+// overdue monitors to "missed" (dispatching once); the next ping recovers it.
+// An `http` monitor (v0.9) is the inverse: the same sweep actively GETs `url` on
+// its interval and flips ok->missed after two consecutive failed probes,
+// recovering on the first success. "paused" opts either kind out.
 export const monitors = sqliteTable(
   'monitors',
   {
@@ -157,6 +166,21 @@ export const monitors = sqliteTable(
       .default('ok'),
     lastCheckInAt: integer('last_check_in_at'),
     createdAt: integer('created_at').notNull(),
+    // Monitor kind (v0.9 §24). Immutable after create; defaults to 'checkin' so
+    // migration 0008 backfills every existing row as a check-in monitor.
+    kind: text('kind', { enum: ['checkin', 'http'] })
+      .notNull()
+      .default('checkin'),
+    // http monitors only: the target URL (SSRF-validated at save and probe time),
+    // the per-probe timeout (ms), and the probe bookkeeping the sweep maintains.
+    url: text('url'),
+    timeoutMs: integer('timeout_ms'),
+    lastProbeAt: integer('last_probe_at'),
+    // The last probe's HTTP status code, or null when the probe got no response
+    // (network error / timeout / blocked target).
+    lastProbeStatus: integer('last_probe_status'),
+    // Consecutive failed probes; two in a row flip ok->missed, a success resets it.
+    consecutiveFailures: integer('consecutive_failures').notNull().default(0),
   },
   (t) => [uniqueIndex('monitors_project_slug_uniq').on(t.projectId, t.slug)],
 );
@@ -236,6 +260,10 @@ export const usageEvents = sqliteTable(
     visitor: text('visitor').notNull(),
     // Small JSON blob (<=10 keys), or null.
     props: text('props'),
+    // Release attribution (v0.9 §24), nullable. The client stamps its init
+    // release on every usage event; release health attributes pageviews to a
+    // release by this string (≤128 chars, validated at ingest).
+    release: text('release'),
     receivedAt: integer('received_at').notNull(),
   },
   (t) => [index('usage_events_project_received_idx').on(t.projectId, t.receivedAt)],
@@ -303,6 +331,32 @@ export const fixAttempts = sqliteTable(
   ],
 );
 
+// ── Issue merge (v0.9, §24) ───────────────────────────────────────────────────
+// When an issue is merged into another, its fingerprint (and any aliases that
+// already pointed at it) become aliases of the target. Ingest consults this table
+// BEFORE issues.fingerprint, so an event whose fingerprint matches an alias is
+// routed to the target issue with normal count/regression semantics. A merged
+// issue's detail derives its target pointer from the alias for its own
+// fingerprint. UNIQUE(project_id, fingerprint) ⇒ one target per fingerprint.
+export const fingerprintAliases = sqliteTable(
+  'fingerprint_aliases',
+  {
+    projectId: text('project_id')
+      .notNull()
+      .references(() => projects.id, { onDelete: 'cascade' }),
+    fingerprint: text('fingerprint').notNull(),
+    issueId: text('issue_id')
+      .notNull()
+      .references(() => issues.id, { onDelete: 'cascade' }),
+    createdAt: integer('created_at').notNull(),
+  },
+  (t) => [
+    uniqueIndex('fingerprint_aliases_project_fp_uniq').on(t.projectId, t.fingerprint),
+    // The merge re-points every alias of the source to the target by issue.
+    index('fingerprint_aliases_issue_idx').on(t.issueId),
+  ],
+);
+
 export type ProjectRow = typeof projects.$inferSelect;
 export type ProjectInsert = typeof projects.$inferInsert;
 export type IssueRow = typeof issues.$inferSelect;
@@ -325,3 +379,5 @@ export type IssueAnnotationRow = typeof issueAnnotations.$inferSelect;
 export type IssueAnnotationInsert = typeof issueAnnotations.$inferInsert;
 export type FixAttemptRow = typeof fixAttempts.$inferSelect;
 export type FixAttemptInsert = typeof fixAttempts.$inferInsert;
+export type FingerprintAliasRow = typeof fingerprintAliases.$inferSelect;
+export type FingerprintAliasInsert = typeof fingerprintAliases.$inferInsert;

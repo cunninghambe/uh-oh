@@ -5,10 +5,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
-import { createMonitor } from '../db/repos/monitors.js';
+import { applyProbeOutcome, createMonitor } from '../db/repos/monitors.js';
 import { insertUsageEvent } from '../db/repos/usage.js';
-import { upsertIssue } from '../db/repos/issues.js';
+import { getIssue, upsertIssue } from '../db/repos/issues.js';
 import { upsertFixAttempt as repoUpsertFixAttempt } from '../db/repos/fix-attempts.js';
+import { mergeIssueInto } from '../db/repos/merge.js';
+import { insertEvent } from '../db/repos/events.js';
+import { upsertRelease } from '../db/repos/releases.js';
 import type { ProjectRow } from '../db/schema.js';
 import { ingest } from '../ingest/ingest.js';
 import { createRateLimiter } from '../ingest/rate-limit.js';
@@ -261,6 +264,33 @@ describe('InProcessBackend over MCP (InMemoryTransport)', () => {
     expect(missing.text).toContain('project_not_found');
   });
 
+  it('list_monitors surfaces kind/url/lastProbeStatus/lastProbeAt for an http monitor (v0.9 §24)', async () => {
+    const monitor = createMonitor(db, {
+      projectId: project.id,
+      slug: 'ops',
+      kind: 'http',
+      url: 'https://example.com/health',
+      timeoutMs: 5000,
+      intervalMinutes: 5,
+      graceMinutes: 5,
+      now: Date.now(),
+    });
+    applyProbeOutcome(db, monitor.id, { ok: true, status: 200 }, Date.now());
+
+    const { isError, data } = await call(client, 'list_monitors', { project: 'my-app' });
+    expect(isError).toBe(false);
+    const monitors = data['monitors'] as Record<string, unknown>[];
+    const row = monitors.find((m) => m['slug'] === 'ops');
+    expect(row).toMatchObject({
+      kind: 'http',
+      url: 'https://example.com/health',
+      lastProbeStatus: 200,
+      overdue: false,
+    });
+    expect(typeof row?.['lastProbeAt']).toBe('string'); // ISO, never checked in
+    expect(row).not.toHaveProperty('lastCheckInAt');
+  });
+
   it('exposes the fix_crash prompt pointing at get_issue_bundle', async () => {
     const { prompts } = await client.listPrompts();
     expect(prompts.map((p) => p.name)).toContain('fix_crash');
@@ -290,6 +320,74 @@ describe('InProcessBackend over MCP (InMemoryTransport)', () => {
     expect((data['days'] as unknown[]).length).toBe(30);
     const referrers = data['topReferrers'] as Array<{ referrer: string }>;
     expect(referrers[0]?.referrer).toBe('google.com');
+  });
+
+  it('get_release_health returns deterministic per-release rows and project-wide totals (v0.9 §24)', async () => {
+    const release = upsertRelease(db, {
+      projectId: project.id,
+      version: '9.9.9',
+      build: '1',
+      platform: 'web',
+    });
+    insertEvent(db, {
+      projectId: project.id,
+      issueId: seeded.issueId,
+      releaseId: release.id,
+      fingerprint: 'fp-release-health',
+      level: 'fatal',
+      platform: 'web',
+      payload: '{}',
+      receivedAt: Date.now(),
+      deviceInfo: '{}',
+      userInfo: null,
+    });
+    insertUsageEvent(db, {
+      projectId: project.id,
+      type: 'pageview',
+      name: null,
+      path: '/',
+      referrerDomain: null,
+      visitor: 'v1',
+      props: null,
+      release: '9.9.9+1',
+      receivedAt: Date.now(),
+    });
+
+    const { isError, data } = await call(client, 'get_release_health', {
+      project: 'my-app',
+      days: 7,
+    });
+    expect(isError).toBe(false);
+    // The seeded beforeEach ingest also created a release (1.2.3/45, android)
+    // with one in-window event, so both releases appear here.
+    const releases = data['releases'] as Record<string, unknown>[];
+    expect(releases).toHaveLength(2);
+    const row = releases.find((r) => r['version'] === '9.9.9');
+    expect(row).toMatchObject({
+      version: '9.9.9',
+      build: '1',
+      platform: 'web',
+      events: 1,
+      fatalEvents: 1,
+      distinctIssues: 1,
+      pageviews: 1,
+      crashesPer1kPageviews: 1000,
+    });
+    expect(row).not.toHaveProperty('commitSha');
+    // The seeded beforeEach event (android, level error) plus this fatal one.
+    expect(data['totals']).toEqual({
+      events: 2,
+      fatalEvents: 1,
+      distinctIssues: 1,
+      pageviews: 1,
+      crashesPer1kPageviews: 2000,
+    });
+  });
+
+  it('get_release_health on an unknown project ref is a tool error', async () => {
+    const { isError, text } = await call(client, 'get_release_health', { project: 'nope' });
+    expect(isError).toBe(true);
+    expect(text).toContain('project_not_found');
   });
 
   describe('v0.8 agent-loop tools (§23)', () => {
@@ -409,6 +507,57 @@ describe('InProcessBackend over MCP (InMemoryTransport)', () => {
       });
       expect(isError).toBe(true);
       expect(text).toContain('not_found');
+    });
+  });
+
+  describe('issue merge (v0.9 §24)', () => {
+    it('get_issue exposes mergedInto and the terminal status; list_issues hides it by default but surfaces it via status=merged', async () => {
+      const { issue: target } = upsertIssue(db, {
+        projectId: project.id,
+        fingerprint: 'fp-merge-target',
+        title: 'The merge target',
+        ts: Date.now(),
+        platform: 'android',
+      });
+      const source = getIssue(db, seeded.issueId);
+      if (!source) throw new Error('missing seeded source issue');
+      db.transaction((tx) => {
+        mergeIssueInto(tx, source, target, Date.now());
+      });
+
+      const detail = await call(client, 'get_issue', { issueId: seeded.issueId });
+      expect(detail.isError).toBe(false);
+      expect((detail.data['issue'] as Record<string, unknown>)['status']).toBe('merged');
+      expect(detail.data['mergedInto']).toBe(target.id);
+
+      // The target's own get_issue carries no mergedInto (it isn't merged).
+      const targetDetail = await call(client, 'get_issue', { issueId: target.id });
+      expect(targetDetail.data).not.toHaveProperty('mergedInto');
+
+      // Default listing hides the merged source; only the target remains.
+      const defaultList = await call(client, 'list_issues', { project: 'my-app' });
+      const defaultIds = (defaultList.data['issues'] as Record<string, unknown>[]).map(
+        (i) => i['id'],
+      );
+      expect(defaultIds).toEqual([target.id]);
+
+      // status=merged is the only way to see the source again.
+      const mergedList = await call(client, 'list_issues', {
+        project: 'my-app',
+        status: 'merged',
+      });
+      const mergedIds = (mergedList.data['issues'] as Record<string, unknown>[]).map(
+        (i) => i['id'],
+      );
+      expect(mergedIds).toEqual([seeded.issueId]);
+    });
+
+    it('set_issue_status rejects the system-set merged status', async () => {
+      const { isError } = await call(client, 'set_issue_status', {
+        issueId: seeded.issueId,
+        status: 'merged',
+      });
+      expect(isError).toBe(true);
     });
   });
 });

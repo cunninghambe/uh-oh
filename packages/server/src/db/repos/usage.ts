@@ -53,9 +53,14 @@ export const computeVisitorHash = (input: {
 
 export const insertUsageEvent = (
   db: DbOrTx,
-  input: Omit<UsageEventRow, 'id'> & { id?: string },
+  // `release` (§24) is a nullable column, so callers may omit it (defaults null).
+  input: Omit<UsageEventRow, 'id' | 'release'> & { id?: string; release?: string | null },
 ): UsageEventRow => {
-  const row: UsageEventRow = { ...input, id: input.id ?? newId() };
+  const row: UsageEventRow = {
+    ...input,
+    id: input.id ?? newId(),
+    release: input.release ?? null,
+  };
   db.insert(usageEvents).values(row).run();
   return row;
 };

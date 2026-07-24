@@ -1,6 +1,14 @@
 import { expect, test } from '@playwright/test';
 
-import { checkIn, createProject, loginAndLandOnProjects, unique } from './helpers.js';
+import { seedMonitorProbe } from './db.js';
+import {
+  checkIn,
+  createProject,
+  currentProjectId,
+  getAdminToken,
+  loginAndLandOnProjects,
+  unique,
+} from './helpers.js';
 
 /**
  * v0.5 CONTRACT M: monitors are a dead-man's-switch — created by the fleet's first check-in,
@@ -39,5 +47,51 @@ test.describe('monitors', () => {
     await page.reload();
     await expect(page.getByText('nightly-backup')).toBeVisible();
     await expect(page.getByText('ok', { exact: true })).toBeVisible();
+  });
+
+  /**
+   * v0.9 CONTRACT (SPEC §24 uptime probes / E2E catch-up item 6): unlike the check-in kind above,
+   * an http monitor IS created from the dashboard (nothing external pings it into existence) —
+   * the "+ Add HTTP monitor" form on this same section. `last_probe_at`/`last_probe_status` are
+   * only ever written by the real probe sweep, so this seeds them directly (db.ts, per the SPEC's
+   * own E2E guidance) rather than waiting on that timer — a public-looking https hostname is used
+   * throughout since the SSRF guard rejects literal/loopback IPs and `localhost` at save time.
+   */
+  test('creating an HTTP monitor through the UI shows its kind, URL, and probe status', async ({
+    page,
+    request,
+  }) => {
+    await loginAndLandOnProjects(page);
+    const project = await createProject(page, unique('e2e-http-monitor-project'));
+    await page.getByRole('link', { name: project.name }).click();
+    const projectId = currentProjectId(page);
+
+    await page.getByRole('button', { name: '+ Add HTTP monitor' }).click();
+    const slug = unique('http-probe');
+    const url = 'https://example.com/health';
+    await page.getByLabel('Slug').fill(slug);
+    await page.getByLabel('URL').fill(url);
+    await page.getByRole('button', { name: 'Create', exact: true }).click();
+
+    await expect(page.getByText(slug, { exact: true })).toBeVisible();
+    await expect(page.getByText('HTTP', { exact: true })).toBeVisible();
+    await expect(page.getByText(url, { exact: true })).toBeVisible();
+    await expect(page.getByText(/last probe: never/)).toBeVisible();
+
+    const token = await getAdminToken(page);
+    const listRes = await request.get(`/api/projects/${projectId}/monitors`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!listRes.ok()) {
+      throw new Error(`monitor list failed: ${String(listRes.status())} ${await listRes.text()}`);
+    }
+    const { monitors } = (await listRes.json()) as { monitors: { id: string; slug: string }[] };
+    const monitor = monitors.find((m) => m.slug === slug);
+    if (!monitor) throw new Error(`monitor ${slug} not found in the list after creation`);
+
+    seedMonitorProbe(monitor.id, 200);
+    await page.reload();
+
+    await expect(page.getByText(/last probe: 200/)).toBeVisible();
   });
 });

@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { Link, useParams } from '@tanstack/react-router';
+import { Link, useNavigate, useParams } from '@tanstack/react-router';
 import { useEffect, useState } from 'react';
 
 import { api, type Breadcrumb, type Issue as IssueT, type ResolvedFrame } from '../api.js';
@@ -7,6 +7,8 @@ import { AnnotationTimeline } from '../components/AnnotationTimeline.js';
 import { CodeContext } from '../components/CodeContext.js';
 import { FixAttemptsPanel } from '../components/FixAttemptsPanel.js';
 import { ImpactPanel } from '../components/ImpactPanel.js';
+import { MergedBadge } from '../components/MergedBadge.js';
+import { MergeIssueModal } from '../components/MergeIssueModal.js';
 import { PlatformBadge } from '../components/PlatformBadge.js';
 import { RegressedBadge } from '../components/RegressedBadge.js';
 import { Sparkline } from '../components/Sparkline.js';
@@ -106,6 +108,7 @@ const renderRawFrame = (frame: StackFrame, idx: number) => {
 export const Issue = () => {
   const { issueId } = useParams({ from: '/issues/$issueId' });
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const issueQ = useQuery({
     queryKey: ['issue', issueId],
     queryFn: () => api.getIssue(issueId),
@@ -115,6 +118,11 @@ export const Issue = () => {
   // its details here; null means "show the latest event" (the pre-existing default view).
   const [selectedEventId, setSelectedEventId] = useState<string | null>(null);
   const [eventsPage, setEventsPage] = useState(1);
+
+  // v0.9 CONTRACT (SPEC §24 issue merge): the Merge modal's open/closed state, declared here
+  // (unconditionally, alongside every other hook) so it survives the early loading/error returns
+  // below without a hooks-order violation — same rule the other hooks on this page already follow.
+  const [mergeModalOpen, setMergeModalOpen] = useState(false);
 
   // Reset event selection/pagination when navigating to a different issue.
   useEffect(() => {
@@ -176,7 +184,7 @@ export const Issue = () => {
   if (issueQ.isError || !issueQ.data)
     return <div className="text-red-400 text-sm">Failed to load issue.</div>;
 
-  const { issue, latestEvent, breadcrumbs, fixAttempts } = issueQ.data;
+  const { issue, latestEvent, breadcrumbs, fixAttempts, mergedInto } = issueQ.data;
 
   // Prefer the freshly-fetched (symbolicated) event for whichever event is active. While that
   // fetch is in flight/failed and we're still looking at the latest event, fall back to the
@@ -213,6 +221,7 @@ export const Issue = () => {
             <div className="flex items-center gap-2 flex-wrap">
               <h1 className="text-xl font-semibold break-words">{issue.title}</h1>
               {issue.status === 'regressed' && <RegressedBadge />}
+              {issue.status === 'merged' && <MergedBadge />}
               {issue.spikeActive && <SpikeBadge />}
               <PlatformBadge platform={resolvedPlatform(issue, latestEvent)} />
             </div>
@@ -247,6 +256,19 @@ export const Issue = () => {
                 {label}
               </button>
             ))}
+            {/* v0.9 CONTRACT (SPEC §24 issue merge): a merged issue can't be merged again — no
+                Merge button once it's already terminal. */}
+            {issue.status !== 'merged' && (
+              <button
+                type="button"
+                onClick={() => {
+                  setMergeModalOpen(true);
+                }}
+                className="text-xs px-2 py-1 rounded border border-zinc-700 text-zinc-400 hover:border-zinc-500"
+              >
+                Merge
+              </button>
+            )}
           </div>
         </div>
         <div className="mt-3 text-xs text-zinc-500 flex gap-4">
@@ -264,6 +286,37 @@ export const Issue = () => {
           )}
         </div>
       </div>
+
+      {/* v0.9 CONTRACT (SPEC §24 issue merge): a merged issue's own detail page shows its merged
+          state and links to the target via `mergedInto` — a SIBLING of `issue` on the detail
+          response (derived from fingerprint_aliases, not a stored issue column). Only meaningful
+          once the issue actually is merged, so this renders nothing for every other status. */}
+      {issue.status === 'merged' && mergedInto && (
+        <div className="rounded border border-violet-800 bg-violet-950 px-4 py-3 text-xs text-violet-300">
+          This issue was merged into{' '}
+          <Link
+            to="/issues/$issueId"
+            params={{ issueId: mergedInto }}
+            className="underline hover:text-violet-100"
+          >
+            {mergedInto}
+          </Link>
+          .
+        </div>
+      )}
+
+      {mergeModalOpen && (
+        <MergeIssueModal
+          issueId={issueId}
+          onClose={() => {
+            setMergeModalOpen(false);
+          }}
+          onMerged={(targetId) => {
+            setMergeModalOpen(false);
+            void navigate({ to: '/issues/$issueId', params: { issueId: targetId } });
+          }}
+        />
+      )}
 
       {/* v0.5 CONTRACT I: renders nothing itself (impactQ.data undefined, or an empty payload)
           if the impact endpoint 404s or the issue genuinely has no impact data yet. */}

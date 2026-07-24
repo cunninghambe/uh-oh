@@ -2,7 +2,7 @@
 // check-in upsert, the sweep's overdue detection, and the computed-`overdue`
 // listing shared by the API route and the MCP list_monitors tool.
 
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, eq, isNull, ne, or, sql } from 'drizzle-orm';
 
 import type { Monitor } from '@uh-oh/mcp';
 
@@ -11,6 +11,17 @@ import { newId } from '../ids.js';
 import { monitors, projects, type MonitorRow } from '../schema.js';
 
 export type MonitorStatus = 'ok' | 'missed' | 'paused';
+export type MonitorKind = 'checkin' | 'http';
+
+/** Default per-probe timeout (ms) for an http monitor, and the hard cap. */
+export const DEFAULT_PROBE_TIMEOUT_MS = 10_000;
+export const MAX_PROBE_TIMEOUT_MS = 30_000;
+
+/** Max http probes started per sweep tick; the remainder waits for the next tick. */
+export const MAX_PROBES_PER_TICK = 5;
+
+/** Consecutive failed probes that flip an http monitor ok -> missed. */
+export const PROBE_FAILURE_THRESHOLD = 2;
 
 /** Monitor slug shape: lowercase alnum + dashes, 1..64 chars. */
 export const MONITOR_SLUG_RE = /^[a-z0-9-]{1,64}$/;
@@ -41,6 +52,11 @@ export const createMonitor = (
     intervalMinutes: number;
     graceMinutes: number;
     now: number;
+    // v0.9: an http monitor carries kind:'http', a url, and an optional timeout.
+    // A check-in monitor (the default) leaves these null.
+    kind?: MonitorKind;
+    url?: string | null;
+    timeoutMs?: number | null;
   },
 ): MonitorRow => {
   const row: MonitorRow = {
@@ -53,6 +69,12 @@ export const createMonitor = (
     status: 'ok',
     lastCheckInAt: null,
     createdAt: input.now,
+    kind: input.kind ?? 'checkin',
+    url: input.url ?? null,
+    timeoutMs: input.timeoutMs ?? null,
+    lastProbeAt: null,
+    lastProbeStatus: null,
+    consecutiveFailures: 0,
   };
   db.insert(monitors).values(row).run();
   return row;
@@ -76,14 +98,24 @@ export const listMonitorsForProject = (db: DbOrTx, projectId: string): MonitorRo
     .orderBy(asc(monitors.createdAt), asc(monitors.slug))
     .all();
 
-/** Non-paused monitors currently in 'ok' — the sweep's candidate set. */
+/**
+ * Non-paused CHECK-IN monitors currently in 'ok' — the dead-man's-switch sweep's
+ * candidate set. http monitors are excluded: they are driven by active probes,
+ * not check-in deadlines, so the overdue sweep must never touch them.
+ */
 export const listOkMonitors = (db: DbOrTx): MonitorRow[] =>
-  db.select().from(monitors).where(eq(monitors.status, 'ok')).all();
+  db
+    .select()
+    .from(monitors)
+    .where(and(eq(monitors.status, 'ok'), eq(monitors.kind, 'checkin')))
+    .all();
 
 export const updateMonitor = (
   db: DbOrTx,
   id: string,
-  patch: Partial<Pick<MonitorRow, 'name' | 'intervalMinutes' | 'graceMinutes' | 'status'>>,
+  patch: Partial<
+    Pick<MonitorRow, 'name' | 'intervalMinutes' | 'graceMinutes' | 'status' | 'url' | 'timeoutMs'>
+  >,
 ): MonitorRow | null => {
   const existing = getMonitor(db, id);
   if (!existing) return null;
@@ -91,6 +123,72 @@ export const updateMonitor = (
     db.update(monitors).set(patch).where(eq(monitors.id, id)).run();
   }
   return getMonitor(db, id);
+};
+
+/**
+ * http monitors due for a probe at `now`: never-probed rows first, then those
+ * whose last probe is older than their interval, capped at `limit` per tick.
+ * Paused monitors are skipped; a 'missed' monitor keeps being probed so it can
+ * recover. NULL last_probe_at sorts first under SQLite ASC ordering.
+ */
+export const listDueHttpProbes = (db: DbOrTx, now: number, limit: number): MonitorRow[] =>
+  db
+    .select()
+    .from(monitors)
+    .where(
+      and(
+        eq(monitors.kind, 'http'),
+        ne(monitors.status, 'paused'),
+        or(
+          isNull(monitors.lastProbeAt),
+          sql`${monitors.lastProbeAt} + ${monitors.intervalMinutes} * 60000 <= ${now}`,
+        ),
+      ),
+    )
+    .orderBy(asc(monitors.lastProbeAt), asc(monitors.id))
+    .limit(limit)
+    .all();
+
+export type ProbeOutcome = { ok: boolean; status: number | null };
+
+/**
+ * Record one probe result on an http monitor and report any status transition.
+ * A success resets the failure streak and recovers a 'missed' monitor on the
+ * first success; a failure grows the streak and flips ok -> missed once it
+ * reaches {@link PROBE_FAILURE_THRESHOLD}. The status transition is the dedupe,
+ * so a webhook fires exactly once per episode (like check-in monitors).
+ */
+export const applyProbeOutcome = (
+  db: DbOrTx,
+  monitorId: string,
+  outcome: ProbeOutcome,
+  now: number,
+): { transition: 'missed' | 'recovered' | null } => {
+  const m = getMonitor(db, monitorId);
+  if (!m) return { transition: null };
+
+  if (outcome.ok) {
+    const patch: Partial<MonitorRow> = {
+      lastProbeAt: now,
+      lastProbeStatus: outcome.status,
+      consecutiveFailures: 0,
+    };
+    const recovered = m.status === 'missed';
+    if (recovered) patch.status = 'ok';
+    db.update(monitors).set(patch).where(eq(monitors.id, monitorId)).run();
+    return { transition: recovered ? 'recovered' : null };
+  }
+
+  const consecutiveFailures = m.consecutiveFailures + 1;
+  const patch: Partial<MonitorRow> = {
+    lastProbeAt: now,
+    lastProbeStatus: outcome.status,
+    consecutiveFailures,
+  };
+  const missed = consecutiveFailures >= PROBE_FAILURE_THRESHOLD && m.status === 'ok';
+  if (missed) patch.status = 'missed';
+  db.update(monitors).set(patch).where(eq(monitors.id, monitorId)).run();
+  return { transition: missed ? 'missed' : null };
 };
 
 export const setMonitorStatus = (db: DbOrTx, id: string, status: MonitorStatus): void => {
@@ -124,13 +222,30 @@ export const recordCheckIn = (
 };
 
 /**
+ * A monitor with its computed `overdue` flag, plus the v0.9 http fields. This
+ * widens the MCP `Monitor` shape with `kind`/`url`/`lastProbeStatus` (and the
+ * probe bookkeeping) so the API list route can surface them; the extra fields
+ * are structurally compatible with `Monitor` (the MCP tool reads the subset it
+ * knows). `overdue` is meaningful only for check-in monitors — http health is
+ * carried by `status`, so http rows always report `overdue: false`.
+ */
+export type MonitorWithComputed = Monitor & {
+  kind: MonitorKind;
+  url: string | null;
+  timeoutMs: number | null;
+  lastProbeAt: number | null;
+  lastProbeStatus: number | null;
+  consecutiveFailures: number;
+};
+
+/**
  * Monitors with a computed `overdue` flag and their project slug, for the API
  * list route and the MCP list_monitors tool. `projectId` filters to one project.
  */
 export const listMonitorsWithComputed = (
   db: DbOrTx,
   input: { projectId?: string; now?: number },
-): Monitor[] => {
+): MonitorWithComputed[] => {
   const now = input.now ?? Date.now();
   const base = db
     .select({ m: monitors, projectSlug: projects.slug })
@@ -151,6 +266,12 @@ export const listMonitorsWithComputed = (
     status: m.status,
     lastCheckInAt: m.lastCheckInAt,
     createdAt: m.createdAt,
-    overdue: isOverdue(m, now),
+    overdue: m.kind === 'checkin' && isOverdue(m, now),
+    kind: m.kind,
+    url: m.url,
+    timeoutMs: m.timeoutMs,
+    lastProbeAt: m.lastProbeAt,
+    lastProbeStatus: m.lastProbeStatus,
+    consecutiveFailures: m.consecutiveFailures,
   }));
 };

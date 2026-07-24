@@ -127,6 +127,17 @@ const buildMonitorPayload = (
   if (!monitor) return null;
   const project = getProjectById(db, monitor.projectId);
   if (!project) return null;
+  // v0.9 §24: http monitors carry the triggering probe's outcome. The status
+  // code is the last probe's (a failing status like 500, or 2xx/3xx on recovery);
+  // when there was no HTTP response (timeout / network error / blocked target),
+  // last_probe_status is null and we report a generic error instead. Check-in
+  // monitors omit `probe` entirely, so their payload stays byte-identical.
+  const probe =
+    monitor.kind === 'http'
+      ? monitor.lastProbeStatus !== null
+        ? { status: monitor.lastProbeStatus }
+        : { error: 'probe_failed' }
+      : undefined;
   return {
     // 'monitor.missed' when the sweep flips it overdue, 'monitor.recovered' when
     // a check-in clears a missed monitor. Recorded on the row at enqueue time.
@@ -141,6 +152,7 @@ const buildMonitorPayload = (
       graceMinutes: monitor.graceMinutes,
       lastCheckInAt: monitor.lastCheckInAt,
     },
+    ...(probe ? { probe } : {}),
     ...(dashboardUrl ? { url: `${dashboardUrl}/monitors/${monitor.id}` } : {}),
   };
 };

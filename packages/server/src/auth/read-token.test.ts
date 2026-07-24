@@ -173,6 +173,8 @@ describe('CONTRACT R — scoped read token (integration)', () => {
     it('GET /api/projects/:id/monitors', () => allow(`/api/projects/${projectId}/monitors`));
     it('GET /api/projects/:id/usage/summary', () =>
       allow(`/api/projects/${projectId}/usage/summary`));
+    it('GET /api/projects/:id/release-health', () =>
+      allow(`/api/projects/${projectId}/release-health`));
     it('GET /api/issues/:id', () => allow(`/api/issues/${issueId}`));
     it('GET /api/issues/:id/events', () => allow(`/api/issues/${issueId}/events`));
     it('GET /api/issues/:id/impact', () => allow(`/api/issues/${issueId}/impact`));

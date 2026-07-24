@@ -59,6 +59,11 @@ export const registerCheckInRoute = (app: FastifyInstance, db: Db, limiter: Rate
     }
 
     const existing = getMonitorBySlug(db, project.id, slug);
+    // §24: an http monitor is driven by server-side probes, not check-in pings.
+    // A ping against one is a client error (409), never an auto-created shadow.
+    if (existing && existing.kind === 'http') {
+      return reply.code(409).send({ error: 'not_a_checkin_monitor' });
+    }
     if (!existing) {
       // First ping auto-creates — the cadence must be declared exactly once here.
       if (interval.kind !== 'valid') {

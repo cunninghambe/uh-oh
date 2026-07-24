@@ -24,6 +24,7 @@ import {
   type Monitor,
   type Project,
   type Release,
+  type ReleaseHealth,
   type SimilarIssue,
   type TopIssue,
   type UhOhBackend,
@@ -34,9 +35,11 @@ import {
 import { buildIssueBundle } from '../api/bundle.js';
 import { listBreadcrumbs } from '../db/repos/breadcrumbs.js';
 import { getEvent, getLatestEventForIssue, listEventsForIssue } from '../db/repos/events.js';
+import { getAliasTarget } from '../db/repos/fingerprint-aliases.js';
 import { getIssue, listIssues, setIssueStatus } from '../db/repos/issues.js';
 import { listMonitorsWithComputed } from '../db/repos/monitors.js';
 import { createProject, listProjects, updateProject } from '../db/repos/projects.js';
+import { releaseHealth } from '../db/repos/release-health.js';
 import { listReleasesForProject } from '../db/repos/releases.js';
 import { topIssues } from '../db/repos/top-issues.js';
 import { usageSummary } from '../db/repos/usage-summary.js';
@@ -104,9 +107,9 @@ export class InProcessBackend implements UhOhBackend {
       ...(input.status ? { status: input.status } : {}),
       ...(input.sort ? { sort: input.sort } : {}),
     });
-    // IssueRow now structurally satisfies the (widened) MCP Issue type, so no
-    // adapter is needed — the row's real status ('regressed' included) is
-    // surfaced directly.
+    // IssueRow carries every MCP Issue field, including the v0.9 terminal
+    // 'merged' status — the MCP Issue type now names it too, so this is a plain
+    // structural return (no cast needed).
     return Promise.resolve({ issues: rows, total });
   }
 
@@ -116,7 +119,13 @@ export class InProcessBackend implements UhOhBackend {
     const latestEvent = getLatestEventForIssue(this.db, issue.id);
     const breadcrumbs = latestEvent ? listBreadcrumbs(this.db, latestEvent.id) : [];
     const frames = latestEvent ? await symbolicateEvent(this.db, latestEvent.id) : [];
-    return { issue, latestEvent, frames, breadcrumbs };
+    // §24: mirrors GET /api/issues/:id — the pointer is the target of the alias
+    // for the issue's own fingerprint, null unless the issue is merged.
+    const mergedInto =
+      issue.status === 'merged'
+        ? getAliasTarget(this.db, issue.projectId, issue.fingerprint)
+        : null;
+    return { issue, latestEvent, frames, breadcrumbs, mergedInto };
   }
 
   listIssueEvents(input: {
@@ -189,6 +198,12 @@ export class InProcessBackend implements UhOhBackend {
     // Same aggregation the GET /api/projects/:id/usage/summary route runs, so
     // the in-process and HTTP backends return identical summaries.
     return Promise.resolve(usageSummary(this.db, input.projectId, input.days));
+  }
+
+  getReleaseHealth(input: { projectId: string; days: number }): Promise<ReleaseHealth> {
+    // Same aggregation the GET /api/projects/:id/release-health route runs, so
+    // the in-process and HTTP backends return identical release health.
+    return Promise.resolve(releaseHealth(this.db, input.projectId, input.days));
   }
 
   // ── v0.8 agent-loop (§23) ───────────────────────────────────────────────────

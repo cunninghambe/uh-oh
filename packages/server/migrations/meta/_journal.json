@@ -57,6 +57,13 @@
       "when": 1784832413921,
       "tag": "0007_agent_loop",
       "breakpoints": true
+    },
+    {
+      "idx": 8,
+      "version": "6",
+      "when": 1784903419172,
+      "tag": "0008_release_uptime_merge",
+      "breakpoints": true
     }
   ]
 }

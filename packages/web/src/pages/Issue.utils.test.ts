@@ -84,6 +84,12 @@ describe('statusToggleOptions (v0.3: regression surfacing)', () => {
     const statuses: Issue['status'][] = statusToggleOptions('open').map((o) => o.value);
     expect(statuses).toEqual(['open', 'resolved', 'ignored']);
   });
+
+  // v0.9 CONTRACT (SPEC §24 issue merge): 'merged' is system-set only (PATCH rejects it), so it
+  // never offers a toggle — same reasoning as 'regressed' never being a toggle target above.
+  it('a merged issue offers no status toggle at all', () => {
+    expect(statusToggleOptions('merged')).toEqual([]);
+  });
 });
 
 describe('resolvedPlatform (v0.4 CONTRACT P)', () => {

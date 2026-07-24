@@ -14,6 +14,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   E2E_ADMIN_PASSWORD,
+  E2E_DB_PATH_ENV,
   E2E_JWT_SECRET,
   E2E_SERVER_PORT,
   E2E_SERVER_URL,
@@ -102,6 +103,9 @@ export default async function globalSetup(): Promise<() => Promise<void>> {
 
   const tmpDir = await mkdtemp(path.join(tmpdir(), 'uh-oh-e2e-'));
   const dbPath = path.join(tmpDir, 'e2e.db');
+  // v0.9 CONTRACT (SPEC §24 E2E catch-up) — see constants.ts's E2E_DB_PATH_ENV doc comment for
+  // why process.env (not a return value) is how this reaches the test files.
+  process.env[E2E_DB_PATH_ENV] = dbPath;
 
   const server = spawn('node', ['--import', 'tsx', serverRunnerPath], {
     cwd: serverDir,

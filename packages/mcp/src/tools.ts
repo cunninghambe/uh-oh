@@ -23,6 +23,8 @@ import {
   type Monitor,
   type Project,
   type Release,
+  type ReleaseHealthEntry,
+  type ReleaseHealthTotals,
   type ResolvedFrame,
   type SimilarIssue,
   type TopIssue,
@@ -107,6 +109,7 @@ const formatRelease = (r: Release): Record<string, unknown> =>
     version: r.version,
     build: r.build,
     platform: r.platform,
+    commitSha: r.commitSha,
     mappingUploadedAt: toIso(r.mappingUploadedAt),
     sourcemapUploadedAt: toIso(r.sourcemapUploadedAt),
   });
@@ -190,6 +193,13 @@ const formatMonitor = (m: Monitor): Record<string, unknown> =>
     overdue: m.overdue,
     lastCheckInAt: toIso(m.lastCheckInAt),
     createdAt: toIso(m.createdAt),
+    // v0.9 §24 uptime probes. `kind` is always present; `url`/`lastProbeAt`/
+    // `lastProbeStatus` are null (dropped) for check-in monitors, which are
+    // never probed.
+    kind: m.kind,
+    url: m.url,
+    lastProbeAt: toIso(m.lastProbeAt),
+    lastProbeStatus: m.lastProbeStatus,
   });
 
 const formatAnnotation = (a: Annotation): Record<string, unknown> =>
@@ -287,6 +297,31 @@ const formatFullEvent = (
   });
 };
 
+const formatReleaseHealthEntry = (r: ReleaseHealthEntry): Record<string, unknown> =>
+  clean({
+    id: r.id,
+    version: r.version,
+    build: r.build,
+    platform: r.platform,
+    commitSha: r.commitSha,
+    events: r.events,
+    fatalEvents: r.fatalEvents,
+    distinctIssues: r.distinctIssues,
+    firstEventAt: toIso(r.firstEventAt),
+    lastEventAt: toIso(r.lastEventAt),
+    pageviews: r.pageviews,
+    crashesPer1kPageviews: r.crashesPer1kPageviews,
+  });
+
+const formatReleaseHealthTotals = (t: ReleaseHealthTotals): Record<string, unknown> =>
+  clean({
+    events: t.events,
+    fatalEvents: t.fatalEvents,
+    distinctIssues: t.distinctIssues,
+    pageviews: t.pageviews,
+    crashesPer1kPageviews: t.crashesPer1kPageviews,
+  });
+
 // ── Result helpers ────────────────────────────────────────────────────────────
 
 const ok = (value: unknown): CallToolResult => ({
@@ -365,6 +400,8 @@ export const TOOL_SCOPE: Record<string, RequiredScope> = {
   list_top_issues: 'read',
   list_monitors: 'read',
   get_usage_summary: 'read',
+  // v0.9 §24: per-release crash health vs. attributed usage pageviews.
+  get_release_health: 'read',
   list_similar_issues: 'read',
   annotate_issue: 'agent',
   record_fix_attempt: 'agent',
@@ -395,10 +432,12 @@ export const scopeError = (
   };
 };
 
-// User-settable statuses (set_issue_status). 'regressed' is system-set.
+// User-settable statuses (set_issue_status). 'regressed' and 'merged' are
+// system-set.
 const STATUS = z.enum(['open', 'resolved', 'ignored']);
-// list_issues filter — additionally accepts the system-set 'regressed'.
-const FILTER_STATUS = z.enum(['open', 'resolved', 'ignored', 'regressed']);
+// list_issues filter — additionally accepts the system-set 'regressed' and
+// (v0.9 §24) the terminal 'merged' status, mirroring the REST filter exactly.
+const FILTER_STATUS = z.enum(['open', 'resolved', 'ignored', 'regressed', 'merged']);
 const SORT = z.enum(['lastSeen', 'eventCount', 'firstSeen']);
 
 // annotate_issue (§23). 'system' is server-written only (the fix-attempt audit
@@ -507,7 +546,7 @@ export const registerUhOhTools = (
     {
       title: 'List issues',
       description:
-        'List issues for a project (by id or slug), optionally filtered by status (open, resolved, ignored, or the system-set regressed) and sorted. Returns issues plus the total count.',
+        "List issues for a project (by id or slug), optionally filtered by status (open, resolved, ignored, the system-set regressed, or the terminal merged) and sorted. A merged issue is hidden from the default (unfiltered) listing — pass status 'merged' to see them. Returns issues plus the total count.",
       inputSchema: {
         project: z.string().min(1),
         status: FILTER_STATUS.optional(),
@@ -537,7 +576,7 @@ export const registerUhOhTools = (
     {
       title: 'Get issue',
       description:
-        'Get an issue with a summary of its latest event, symbolicated stack frames when available, and its recent breadcrumbs (last 20).',
+        'Get an issue with a summary of its latest event, symbolicated stack frames when available, and its recent breadcrumbs (last 20). A merged issue (v0.9 §24) carries mergedInto, the id of the issue it was folded into.',
       inputSchema: { issueId: z.string().min(1) },
       annotations: READ,
     },
@@ -553,6 +592,7 @@ export const registerUhOhTools = (
             ? { frames: formatFrames(env.exception?.stacktrace, detail.frames) }
             : {}),
           ...formatBreadcrumbs(detail.breadcrumbs),
+          ...(detail.mergedInto ? { mergedInto: detail.mergedInto } : {}),
         });
       }),
   );
@@ -709,7 +749,7 @@ export const registerUhOhTools = (
     {
       title: 'List monitors',
       description:
-        'List check-in monitors, optionally scoped to one project (by id or slug). Each includes its cadence, status (ok, missed, or paused), last check-in, and a computed overdue flag.',
+        "List monitors (check-in or http uptime probes, v0.9 §24), optionally scoped to one project (by id or slug). Each includes its kind ('checkin' or 'http'), cadence, status (ok, missed, or paused), and a computed overdue flag (check-in only). An http monitor additionally carries its url and lastProbeStatus/lastProbeAt; a check-in monitor carries lastCheckInAt instead.",
       inputSchema: { project: z.string().min(1).optional() },
       annotations: READ,
     },
@@ -740,6 +780,31 @@ export const registerUhOhTools = (
       run(async () => {
         const projectId = await resolveProjectId(backend, args.project);
         return ok(await backend.getUsageSummary({ projectId, days: args.days }));
+      }),
+  );
+
+  // ── v0.9 release health (§24) ─────────────────────────────────────────────
+
+  server.registerTool(
+    'get_release_health',
+    {
+      title: 'Get release health',
+      description:
+        'Per-release crash health for a project (by id or slug) over the last N days (default 30, clamped 1..90): each release with events in the window (up to 20, newest first) gets its event/fatal-event/distinct-issue counts against usage pageviews attributed to it by canonical version+build identity, plus crashesPer1kPageviews (events / pageviews × 1000, 1 decimal; null when the release has no attributed pageviews — analytics off, non-web, or unattributed). Also returns project-wide totals over the same window (every event and pageview, attributed or not) with the same ratio.',
+      inputSchema: {
+        project: z.string().min(1),
+        days: z.number().int().min(1).max(90).default(30),
+      },
+      annotations: READ,
+    },
+    (args) =>
+      run(async () => {
+        const projectId = await resolveProjectId(backend, args.project);
+        const health = await backend.getReleaseHealth({ projectId, days: args.days });
+        return ok({
+          releases: health.releases.map(formatReleaseHealthEntry),
+          totals: formatReleaseHealthTotals(health.totals),
+        });
       }),
   );
 

@@ -56,6 +56,7 @@ export const similarIssues = (db: DbOrTx, issueId: string): SimilarIssue[] => {
     FROM issues i
     JOIN projects p ON p.id = i.project_id
     WHERE i.id != ${issueId}
+      AND i.status != 'merged'
       AND (CASE WHEN instr(i.title, ':') > 0
                 THEN substr(i.title, 1, instr(i.title, ':') - 1)
                 ELSE i.title END) = ${key}

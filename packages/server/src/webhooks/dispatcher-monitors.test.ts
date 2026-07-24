@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject } from '../db/repos/projects.js';
-import { createMonitor } from '../db/repos/monitors.js';
+import { applyProbeOutcome, createMonitor } from '../db/repos/monitors.js';
 import { enqueueDispatch, takeDueDispatches } from '../db/repos/webhook-dispatches.js';
 import { startDispatcher as startDispatcherRaw, type DnsLookupAll } from './dispatcher.js';
 
@@ -83,5 +83,43 @@ describe('dispatcher — monitor payloads', () => {
     const body = calls[0]?.body as Record<string, unknown>;
     expect(body['type']).toBe('monitor.recovered');
     expect(body).not.toHaveProperty('url');
+  });
+
+  it('omits the probe field for a check-in monitor (byte-identical v0.8 payload)', async () => {
+    enqueueDispatch(db, { monitorId, url: WEBHOOK_URL, type: 'monitor.missed' }, NOW);
+    const calls = await runOnce();
+    expect(calls[0]?.body).not.toHaveProperty('probe');
+  });
+});
+
+describe('dispatcher — http monitor probe payloads (§24)', () => {
+  const mkHttp = (slug: string) =>
+    createMonitor(db, {
+      projectId,
+      slug,
+      intervalMinutes: 5,
+      graceMinutes: 5,
+      kind: 'http',
+      url: 'https://svc.example/health',
+      timeoutMs: 5000,
+      now: NOW,
+    }).id;
+
+  it('carries probe.status when the last probe returned an HTTP status', async () => {
+    const id = mkHttp('ops');
+    applyProbeOutcome(db, id, { ok: false, status: 502 }, NOW);
+    enqueueDispatch(db, { monitorId: id, url: WEBHOOK_URL, type: 'monitor.missed' }, NOW);
+    const calls = await runOnce();
+    const body = calls[0]?.body as Record<string, unknown>;
+    expect(body['probe']).toEqual({ status: 502 });
+  });
+
+  it('carries a probe.error when the last probe got no HTTP response', async () => {
+    const id = mkHttp('rebind');
+    applyProbeOutcome(db, id, { ok: false, status: null }, NOW);
+    enqueueDispatch(db, { monitorId: id, url: WEBHOOK_URL, type: 'monitor.missed' }, NOW);
+    const calls = await runOnce();
+    const body = calls[0]?.body as Record<string, unknown>;
+    expect(body['probe']).toEqual({ error: 'probe_failed' });
   });
 });

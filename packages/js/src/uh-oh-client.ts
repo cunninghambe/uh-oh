@@ -140,6 +140,18 @@ export interface InitOptions {
    * effect when the host has no reachable `node:fs`.
    */
   spoolDir?: string;
+  /**
+   * Opt-in (default false/absent = off; browser AND Node): wraps
+   * console.debug/log/info/warn/error so every call still invokes the
+   * original with unchanged arguments and `this`, and additionally records a
+   * `{ category: 'console' }` breadcrumb (level per method: debug->debug,
+   * log/info->info, warn->warning, error->error). A re-entrancy guard drops
+   * any console call made while a breadcrumb is being recorded (including one
+   * triggered by a toJSON during stringification, and uh-oh's own debug
+   * logging) - it still reaches the original, it is just not recorded, and
+   * never recurses. Fully restored on close().
+   */
+  consoleBreadcrumbs?: boolean;
 }
 
 export interface CaptureOptions {
@@ -181,6 +193,12 @@ export interface UsageEvent {
   name?: string;
   /** <=10 keys, keys <=64 chars, string values <=256 chars. */
   props?: Record<string, string | number | boolean>;
+  /**
+   * Stamped automatically from `init`'s release on every event (usage
+   * release attribution) - not settable via trackPageview/trackEvent.
+   * <=128 chars.
+   */
+  release?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -282,9 +300,11 @@ interface ProcessLike {
 }
 
 interface ConsoleLike {
-  debug?: (...args: unknown[]) => void;
-  warn?: (...args: unknown[]) => void;
-  error?: (...args: unknown[]) => void;
+  debug?: (...args: unknown[]) => unknown;
+  log?: (...args: unknown[]) => unknown;
+  info?: (...args: unknown[]) => unknown;
+  warn?: (...args: unknown[]) => unknown;
+  error?: (...args: unknown[]) => unknown;
 }
 
 type TimerSet = (cb: () => void, ms: number) => unknown;
@@ -332,6 +352,8 @@ export interface ClientDeps {
   cryptoObj?: CryptoLike | null;
   /** Inject a fake `node:fs` for the Node disk-spool tests. */
   fs?: FsLike | null;
+  /** Test/advanced seam to inject a fake console for the console-breadcrumbs tests. */
+  consoleObj?: ConsoleLike | null;
   now?: () => number;
   setTimeoutFn?: TimerSet;
   clearTimeoutFn?: TimerClear;
@@ -344,7 +366,7 @@ export interface ClientDeps {
 // ---------------------------------------------------------------------------
 
 const SDK_NAME = '@uh-oh/js';
-const SDK_VERSION = '0.5.0';
+const SDK_VERSION = '0.6.0';
 const SPOOL_KEY = 'uh-oh:spool';
 const SPOOL_FILE = 'uh-oh-spool.json';
 const SPOOL_DEBOUNCE_MS = 1_000;
@@ -370,6 +392,12 @@ const USAGE_REFERRER_MAX = 512;
 const USAGE_PROPS_MAX_KEYS = 10;
 const USAGE_PROP_KEY_MAX = 64;
 const USAGE_PROP_VALUE_MAX = 256;
+const USAGE_RELEASE_MAX = 128;
+
+// -- console breadcrumbs (opts.consoleBreadcrumbs) --
+const CONSOLE_BREADCRUMB_MESSAGE_MAX = 500;
+type ConsoleMethod = 'debug' | 'log' | 'info' | 'warn' | 'error';
+const CONSOLE_METHODS: ConsoleMethod[] = ['debug', 'log', 'info', 'warn', 'error'];
 
 const G: GlobalScope = globalThis as unknown as GlobalScope;
 
@@ -553,6 +581,14 @@ function parseUserAgent(ua: string): { osName: string; osVersion: string } {
   return { osName: 'browser', osVersion: 'unknown' };
 }
 
+/** Console-breadcrumbs level mapping: debug->debug, log/info->info, warn->warning, error->error. */
+function consoleBreadcrumbLevel(method: ConsoleMethod): BreadcrumbLevel {
+  if (method === 'debug') return 'debug';
+  if (method === 'warn') return 'warning';
+  if (method === 'error') return 'error';
+  return 'info'; // log, info
+}
+
 interface QueueItem {
   id: string;
   env: EventEnvelope;
@@ -566,6 +602,8 @@ export class Client {
   private readonly opts: InitOptions;
   private readonly runtime: 'browser' | 'node';
   private readonly maxBreadcrumbs: number;
+  /** Raw init release, capped, stamped onto every usage event (usage release attribution). */
+  private readonly usageRelease: string;
 
   // Resolved runtime seams.
   private readonly fetchFn: FetchLike | undefined;
@@ -577,6 +615,7 @@ export class Client {
   private readonly cryptoObj: CryptoLike | undefined;
   private readonly location: LocationLike | undefined;
   private readonly history: HistoryLike | undefined;
+  private readonly consoleObj: ConsoleLike | undefined;
   private readonly now: () => number;
   private readonly setTimeoutFn: TimerSet;
   private readonly clearTimeoutFn: TimerClear;
@@ -605,6 +644,16 @@ export class Client {
   private uninstallers: Array<() => void> = [];
   private wasOnlyUncaughtListener = false;
 
+  // Console breadcrumbs (opts.consoleBreadcrumbs). consoleOriginals doubles as
+  // the double-init guard (installConsoleBreadcrumbs no-ops once it is set)
+  // and as the exact-restore record for close(). consoleRecording is the
+  // re-entrancy guard: true for the entire duration of recordConsoleBreadcrumb,
+  // so any console call it triggers (a toJSON that logs, or our own debug
+  // logging) is detected and skipped without recursing.
+  private consoleOriginals: Partial<Record<ConsoleMethod, (...args: unknown[]) => unknown>> | null =
+    null;
+  private consoleRecording = false;
+
   // Usage analytics: independent queue, batching timer, and state - see the
   // "analytics (usage tracking)" section below.
   private analyticsQueue: UsageEvent[] = [];
@@ -631,6 +680,7 @@ export class Client {
     this.cryptoObj = pick(deps.cryptoObj, G.crypto);
     this.location = pick(deps.location, G.location);
     this.history = pick(deps.history, G.history);
+    this.consoleObj = pick(deps.consoleObj, G.console);
     this.win =
       deps.win !== undefined
         ? deps.win === null
@@ -670,6 +720,14 @@ export class Client {
     this.maxBreadcrumbs =
       typeof max === 'number' && max >= 0 ? Math.floor(max) : DEFAULT_MAX_BREADCRUMBS;
 
+    // CONTRACT RH-STAMP: usage events carry the CANONICAL release string
+    // "version+build" exactly as parseRelease canonicalizes the envelope's
+    // release (a buildless init release becomes "1.2.3+0"). The server
+    // attributes pageviews to a release row by comparing this string against
+    // version+'+'+build, so the two sides must canonicalize identically.
+    const usageRel = parseRelease(opts.release);
+    this.usageRelease = safeStr(usageRel.version + '+' + usageRel.build, USAGE_RELEASE_MAX);
+
     this.dsn = parseDsn(opts.dsn);
     this.noop = this.dsn === null;
   }
@@ -677,7 +735,7 @@ export class Client {
   private log(level: 'debug' | 'warn' | 'error', msg: string, err?: unknown): void {
     if (!this.opts.debug && level === 'debug') return;
     try {
-      const c = G.console;
+      const c = this.consoleObj;
       const line = `uh-oh: ${msg}`;
       if (level === 'error' && c && typeof c.error === 'function') c.error(line, err);
       else if (level === 'warn' && c && typeof c.warn === 'function') c.warn(line, err);
@@ -700,6 +758,7 @@ export class Client {
     } else {
       this.installNodeHandlers();
     }
+    this.installConsoleBreadcrumbs();
     // Restored spool may already hold events.
     void this.drainQueue();
   }
@@ -842,6 +901,121 @@ export class Client {
       // fall through to console
     }
     this.log('error', msg);
+  }
+
+  // ---- console breadcrumbs -----------------------------------------------
+
+  /**
+   * Wraps console.debug/log/info/warn/error (whichever exist as functions).
+   * Guarded against double-init (consoleOriginals already set => no-op, so a
+   * second install() on the same instance never nests wrappers). Each wrapped
+   * method always calls the original with unchanged arguments and `this` -
+   * mirroring installHistoryHooks's call-through-then-rethrow shape - and
+   * records regardless of whether the original threw.
+   */
+  private installConsoleBreadcrumbs(): void {
+    if (!this.opts.consoleBreadcrumbs) return;
+    if (this.consoleOriginals) return;
+    const c = this.consoleObj;
+    if (!c) return;
+    try {
+      const originals: Partial<Record<ConsoleMethod, (...args: unknown[]) => unknown>> = {};
+      for (const method of CONSOLE_METHODS) {
+        const original = c[method];
+        if (typeof original !== 'function') continue;
+        originals[method] = original;
+        const level = consoleBreadcrumbLevel(method);
+        const record = (args: unknown[]): void => this.recordConsoleBreadcrumb(level, args);
+        const wrapped = function (this: unknown, ...args: unknown[]): unknown {
+          let threw = false;
+          let err: unknown;
+          let result: unknown;
+          try {
+            result = original.apply(this, args);
+          } catch (e) {
+            threw = true;
+            err = e;
+          }
+          try {
+            record(args);
+          } catch {
+            // recording must never affect the original call's outcome
+          }
+          if (threw) throw err;
+          return result;
+        };
+        c[method] = wrapped;
+      }
+      this.consoleOriginals = originals;
+      this.uninstallers.push(() => this.restoreConsole());
+    } catch (e) {
+      this.log('debug', 'failed to install console breadcrumbs', e);
+    }
+  }
+
+  /** Restores the exact original console functions. Idempotent. */
+  private restoreConsole(): void {
+    const c = this.consoleObj;
+    const originals = this.consoleOriginals;
+    this.consoleOriginals = null;
+    if (!c || !originals) return;
+    try {
+      for (const method of CONSOLE_METHODS) {
+        const original = originals[method];
+        if (original) c[method] = original;
+      }
+    } catch {
+      // best-effort teardown
+    }
+  }
+
+  /**
+   * Records one console breadcrumb. Re-entrancy guard: a console call made
+   * WHILE this runs (a toJSON invoked by stringifyConsoleArgs's JSON.stringify,
+   * or a nested this.log() debug call from the catch block below) sees
+   * consoleRecording already true and returns immediately - the original still
+   * ran (the wrapper calls it unconditionally before reaching here), it is
+   * simply not recorded, and there is no recursion.
+   */
+  private recordConsoleBreadcrumb(level: BreadcrumbLevel, args: unknown[]): void {
+    if (this.consoleRecording) return;
+    this.consoleRecording = true;
+    try {
+      const crumb: Breadcrumb = {
+        category: 'console',
+        message: this.stringifyConsoleArgs(args),
+        level,
+        ts: new Date(this.now()).toISOString(),
+      };
+      this.breadcrumbs.push(crumb);
+      while (this.breadcrumbs.length > this.maxBreadcrumbs) this.breadcrumbs.shift();
+    } catch (e) {
+      this.log('debug', 'console breadcrumb recording failed', e);
+    } finally {
+      this.consoleRecording = false;
+    }
+  }
+
+  /** Primitives via String, objects via JSON.stringify (fallback below), space-joined, 500-char cap. */
+  private stringifyConsoleArgs(args: unknown[]): string {
+    const parts = args.map((a) => this.stringifyConsoleArg(a));
+    return safeStr(parts.join(' '), CONSOLE_BREADCRUMB_MESSAGE_MAX);
+  }
+
+  private stringifyConsoleArg(arg: unknown): string {
+    if (arg === null || typeof arg !== 'object') {
+      try {
+        return String(arg);
+      } catch {
+        return '[unserializable]';
+      }
+    }
+    try {
+      const json = JSON.stringify(arg);
+      return typeof json === 'string' ? json : '[unserializable]';
+    } catch {
+      return '[unserializable]';
+    }
   }
 
   // ---- capture pipeline --------------------------------------------------
@@ -1614,7 +1788,9 @@ export class Client {
 
   private enqueueAnalytics(evt: UsageEvent): void {
     if (!this.dsn) return;
-    this.analyticsQueue.push(evt);
+    // Stamp the init release on every usage event here (the single choke
+    // point both trackPageview/trackEvent and auto pageviews funnel through).
+    this.analyticsQueue.push({ ...evt, release: this.usageRelease });
     if (this.analyticsQueue.length >= ANALYTICS_MAX_QUEUE) {
       void this.flushAnalytics();
       return;

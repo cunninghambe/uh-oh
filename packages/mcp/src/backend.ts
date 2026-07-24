@@ -28,8 +28,10 @@ export interface Issue {
   lastSeen: number;
   eventCount: number;
   // 'regressed' is system-set (a resolved issue that received a new event; see
-  // §18). It is surfaced here but is not user-settable via set_issue_status.
-  status: 'open' | 'resolved' | 'ignored' | 'regressed';
+  // §18). 'merged' (v0.9 §24) is a system-set terminal status — an issue merged
+  // into another. Both are surfaced here but are not user-settable via
+  // set_issue_status.
+  status: 'open' | 'resolved' | 'ignored' | 'regressed' | 'merged';
   lastAlertedAt: number | null;
 }
 
@@ -66,6 +68,8 @@ export interface Release {
   version: string;
   build: string;
   platform: string;
+  /** v0.8 §23: the deploy-time commit, when the uploader/CLI resolved one. */
+  commitSha: string | null;
   mappingUploadedAt: number | null;
   sourcemapUploadedAt: number | null;
 }
@@ -79,12 +83,14 @@ export interface ResolvedFrame {
   status: string;
 }
 
-// User-settable statuses (the `set_issue_status` input). 'regressed' is
-// system-set and intentionally excluded here.
+// User-settable statuses (the `set_issue_status` input). 'regressed' and
+// 'merged' are system-set and intentionally excluded here.
 export type IssueStatus = 'open' | 'resolved' | 'ignored';
 // Statuses accepted by the `list_issues` filter — adds the system-set
-// 'regressed' so callers can list regressed issues.
-export type IssueFilterStatus = IssueStatus | 'regressed';
+// 'regressed' and (v0.9 §24) the terminal 'merged' status, mirroring the REST
+// filter exactly (the ONLY way to surface merged issues; the default listing
+// hides them).
+export type IssueFilterStatus = IssueStatus | 'regressed' | 'merged';
 export type IssueSort = 'lastSeen' | 'eventCount' | 'firstSeen';
 
 export interface ListIssuesInput {
@@ -268,7 +274,12 @@ export interface ListTopIssuesInput {
   days: number;
 }
 
-/** A check-in monitor with a computed `overdue` flag (list_monitors). */
+/**
+ * A monitor with a computed `overdue` flag (list_monitors). `overdue` is
+ * meaningful only for check-in monitors; http monitors always report `false`
+ * (their health rides `status` instead). `url`/`lastProbeAt`/`lastProbeStatus`
+ * are null for check-in monitors, which are never probed (v0.9 §24).
+ */
 export interface Monitor {
   id: string;
   projectId: string;
@@ -281,6 +292,11 @@ export interface Monitor {
   lastCheckInAt: number | null;
   createdAt: number;
   overdue: boolean;
+  kind: 'checkin' | 'http';
+  url: string | null;
+  lastProbeAt: number | null;
+  /** The probe's HTTP status code, or null if never probed. */
+  lastProbeStatus: number | null;
 }
 
 export interface ListMonitorsInput {
@@ -303,11 +319,51 @@ export interface UsageSummary {
   totals: { pageviews: number; visitors: number; events: number };
 }
 
+// ── v0.9 release health (§24) ───────────────────────────────────────────────
+// Plain data mirroring `/api/projects/:id/release-health` (this package never
+// imports from @uh-oh/server). Timestamps are epoch-ms, matching the REST
+// payload.
+
+/** A single release's crash volume vs. attributed usage pageviews. */
+export interface ReleaseHealthEntry {
+  id: string;
+  version: string;
+  build: string;
+  platform: string;
+  commitSha: string | null;
+  events: number;
+  fatalEvents: number;
+  distinctIssues: number;
+  firstEventAt: number;
+  lastEventAt: number;
+  pageviews: number;
+  /** events / pageviews × 1000, 1 decimal; null when pageviews is 0. */
+  crashesPer1kPageviews: number | null;
+}
+
+/** The same five numeric fields as {@link ReleaseHealthEntry}, project-wide. */
+export interface ReleaseHealthTotals {
+  events: number;
+  fatalEvents: number;
+  distinctIssues: number;
+  pageviews: number;
+  crashesPer1kPageviews: number | null;
+}
+
+/** `GET /api/projects/:id/release-health` (get_release_health). */
+export interface ReleaseHealth {
+  /** Every release with ≥1 event in the window, ≤20, ordered lastEventAt desc. */
+  releases: ReleaseHealthEntry[];
+  totals: ReleaseHealthTotals;
+}
+
 export interface IssueDetail {
   issue: Issue;
   latestEvent: EventRecord | null;
   frames: ResolvedFrame[];
   breadcrumbs: BreadcrumbRecord[];
+  /** v0.9 §24: the target issue id when `issue.status` is 'merged', else null. */
+  mergedInto: string | null;
 }
 
 export interface EventDetail {
@@ -372,6 +428,8 @@ export interface UhOhBackend {
   listMonitors(input: ListMonitorsInput): Promise<Monitor[]>;
   /** CONTRACT U-API — usage analytics summary for a project over `days`. */
   getUsageSummary(input: { projectId: string; days: number }): Promise<UsageSummary>;
+  /** v0.9 §24 — per-release crash health vs. attributed usage pageviews. */
+  getReleaseHealth(input: { projectId: string; days: number }): Promise<ReleaseHealth>;
 
   // ── v0.8 agent-loop (§23) ──────────────────────────────────────────────────
 

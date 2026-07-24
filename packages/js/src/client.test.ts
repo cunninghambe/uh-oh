@@ -80,7 +80,7 @@ describe('Client - envelope + runtime', () => {
     expect(f.calls[0]?.url).toBe(INGEST);
     const env = EventEnvelopeSchema.parse(firstCallEnv(f.calls));
     expect(env.platform).toBe('node');
-    expect(env.sdk).toEqual({ name: '@uh-oh/js', version: '0.5.0' });
+    expect(env.sdk).toEqual({ name: '@uh-oh/js', version: '0.6.0' });
     expect(env.release).toEqual({ version: '1.4.2', build: '37' });
     expect(env.device.osName).toBe('linux');
     expect(env.device.osVersion).toBe('v20.3.1');

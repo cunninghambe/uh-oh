@@ -11,16 +11,82 @@ import { E2E_ADMIN_PASSWORD } from './constants.js';
 export const unique = (label: string): string =>
   `${label}-${String(Date.now())}-${Math.random().toString(36).slice(2, 8)}`;
 
+/** Drives the real login FORM — fill password, click submit. Used directly by auth.spec.ts,
+ * which is the one spec whose job is to exercise this flow itself (wrong password, correct
+ * login redirect). Every other spec just needs an authenticated session; see
+ * `loginAndLandOnProjects` below for why those don't call this. */
 export const login = async (page: Page, password: string = E2E_ADMIN_PASSWORD): Promise<void> => {
   await page.goto('/login');
   await page.getByLabel('Password').fill(password);
   await page.getByRole('button', { name: /sign in/i }).click();
 };
 
-/** Logs in and waits for the redirect to the projects list (the post-login landing page). */
+// v0.9 CONTRACT (SPEC §24 E2E catch-up): the login endpoint is rate-limited per-IP at 10
+// attempts/60s with an escalating lockout (SPEC §5) — real security behavior this suite must
+// not weaken. A full serial run drives ~13 non-auth tests, none of which care about exercising
+// the login FORM itself (only auth.spec.ts does, via `login` above, untouched by this) — so a
+// real UI login per test was observed to exhaust that budget partway through a full run (login
+// starting to fail — "Projects heading not found" after a 429 from /api/auth/login — around the
+// 11th test). Instead, mint ONE real token via a direct API call the first time any spec needs
+// to be logged in, cache it at module scope, and seed localStorage with it on every later call —
+// playwright.config.ts pins `workers: 1` (one shared process for the whole run, tests execute
+// strictly sequentially — see global-setup.ts's DB-sharing comment for the same assumption), so
+// this module is loaded once and the cache is safely shared/ordered across every spec file.
+let cachedAdminToken: string | null = null;
+
+/** Logs in (a real token, from a real login call — just not the UI form on every call) and
+ * lands on the projects list (the post-login landing page). */
 export const loginAndLandOnProjects = async (page: Page): Promise<void> => {
-  await login(page);
+  if (cachedAdminToken === null) {
+    const res = await page.request.post('/api/auth/login', {
+      data: { password: E2E_ADMIN_PASSWORD },
+    });
+    if (!res.ok()) {
+      throw new Error(`cached login failed: ${String(res.status())} ${await res.text()}`);
+    }
+    cachedAdminToken = ((await res.json()) as { token: string }).token;
+  }
+  const token = cachedAdminToken;
+  // Registered before the navigation below so it runs ahead of the app's own bundle, avoiding
+  // any flash of the logged-out state (see auth.ts's KEY for the localStorage key name).
+  await page.addInitScript((t: string) => {
+    localStorage.setItem('uh-oh.token', t);
+  }, token);
+  await page.goto('/');
   await expect(page.getByRole('heading', { name: 'Projects' })).toBeVisible();
+};
+
+/**
+ * Reads the dashboard JWT the login flow already stashed in localStorage (see auth.ts's KEY) so a
+ * spec can make an authenticated REST call through the `request` fixture (e.g. seeding a fixture
+ * the UI itself doesn't create — v0.8 CONTRACT §23 fix attempts) without a second, separate
+ * `/api/auth/login` call. That matters here specifically because the login endpoint is rate
+ * limited per-IP (SPEC §5: 10 attempts/60s before an escalating lockout) and this whole suite
+ * already spends one login per test — reusing the token already in the page avoids adding to that
+ * budget.
+ */
+export const getAdminToken = async (page: Page): Promise<string> => {
+  const token = await page.evaluate(() => localStorage.getItem('uh-oh.token'));
+  if (!token) throw new Error('no auth token in localStorage — was the page logged in?');
+  return token;
+};
+
+/** Extracts the issue id from the current URL (`/issues/<id>`) — there's no dedicated "get
+ * issue" API call a helper could use instead without adding UI; reading it back out of the router
+ * state after a real navigation also exercises that the navigation actually landed on that issue. */
+export const currentIssueId = (page: Page): string => {
+  const match = /\/issues\/([^/?#]+)/.exec(page.url());
+  if (!match?.[1]) throw new Error(`could not find an issue id in the current URL: ${page.url()}`);
+  return match[1];
+};
+
+/** Same idea as {@link currentIssueId}, for a project id (`/projects/<id>`). */
+export const currentProjectId = (page: Page): string => {
+  const match = /\/projects\/([^/?#]+)/.exec(page.url());
+  if (!match?.[1]) {
+    throw new Error(`could not find a project id in the current URL: ${page.url()}`);
+  }
+  return match[1];
 };
 
 /**
@@ -120,6 +186,11 @@ type UsageEventInput = {
   referrer?: string;
   name?: string;
   props?: Record<string, string | number | boolean>;
+  // v0.9 CONTRACT (SPEC §24 usage release attribution): the canonical `version+build` release
+  // identity a real client stamps automatically on every usage event — release-health.spec.ts is
+  // the one caller that sets this explicitly, matching it against an ingested event's release so
+  // the pageviews attribute to the same release row.
+  release?: string;
 };
 
 /**

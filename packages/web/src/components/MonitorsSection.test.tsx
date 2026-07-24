@@ -162,3 +162,132 @@ describe('MonitorsSection', () => {
     });
   });
 });
+
+describe('MonitorsSection — v0.9 CONTRACT (SPEC §24 uptime probes)', () => {
+  const httpMonitor: Monitor = {
+    id: 'm2',
+    projectId: 'p1',
+    slug: 'api-health',
+    name: null,
+    intervalMinutes: 5,
+    graceMinutes: 15,
+    status: 'ok',
+    lastCheckInAt: null,
+    createdAt: Date.now() - 100_000,
+    overdue: false,
+    kind: 'http',
+    url: 'https://example.com/health',
+    timeoutMs: 10_000,
+    lastProbeAt: Date.now() - 3 * 60_000,
+    lastProbeStatus: 200,
+  };
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('shows a kind badge, the URL, and the last probe status for an http monitor row', async () => {
+    vi.spyOn(api, 'listMonitors').mockResolvedValue({ monitors: [httpMonitor] });
+    renderSection();
+
+    expect(await screen.findByText('api-health')).toBeInTheDocument();
+    expect(screen.getByText('HTTP')).toBeInTheDocument();
+    expect(screen.getByText('https://example.com/health')).toBeInTheDocument();
+    expect(screen.getByText(/last probe: 200 \(3m ago\)/)).toBeInTheDocument();
+    // Still shares the same ok/missed/paused status pill as check-in monitors.
+    expect(screen.getByText('ok', { exact: true })).toBeInTheDocument();
+  });
+
+  it('shows "never" for an http monitor that has not been probed yet', async () => {
+    vi.spyOn(api, 'listMonitors').mockResolvedValue({
+      monitors: [{ ...httpMonitor, lastProbeAt: null, lastProbeStatus: null }],
+    });
+    renderSection();
+
+    expect(await screen.findByText(/last probe: never/)).toBeInTheDocument();
+  });
+
+  it('shows no kind badge and the check-in display for a plain check-in monitor', async () => {
+    vi.spyOn(api, 'listMonitors').mockResolvedValue({ monitors: [baseMonitor] });
+    renderSection();
+
+    await screen.findByText('nightly-backup');
+    expect(screen.queryByText('HTTP')).not.toBeInTheDocument();
+    expect(screen.getByText(/every 60m, grace 15m/)).toBeInTheDocument();
+  });
+
+  it('renders an "+ Add HTTP monitor" button that reveals a create form', async () => {
+    vi.spyOn(api, 'listMonitors').mockResolvedValue({ monitors: [] });
+    renderSection();
+
+    await screen.findByText(/No monitors yet/);
+    expect(screen.queryByLabelText('Slug')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: '+ Add HTTP monitor' }));
+
+    expect(screen.getByLabelText('Slug')).toBeInTheDocument();
+    expect(screen.getByLabelText('URL')).toBeInTheDocument();
+  });
+
+  it('submitting the create form POSTs kind:http with slug/url/intervalMinutes/timeoutMs', async () => {
+    vi.spyOn(api, 'listMonitors').mockResolvedValue({ monitors: [] });
+    const createSpy = vi.spyOn(api, 'createMonitor').mockResolvedValue({ monitor: httpMonitor });
+    renderSection();
+
+    fireEvent.click(await screen.findByRole('button', { name: '+ Add HTTP monitor' }));
+    fireEvent.change(screen.getByLabelText('Slug'), { target: { value: 'api-health' } });
+    fireEvent.change(screen.getByLabelText('URL'), {
+      target: { value: 'https://example.com/health' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+
+    await waitFor(() => {
+      expect(createSpy).toHaveBeenCalledWith('p1', {
+        kind: 'http',
+        slug: 'api-health',
+        url: 'https://example.com/health',
+        intervalMinutes: 5,
+        timeoutMs: 10_000,
+      });
+    });
+  });
+
+  it('the create submit button is disabled for an invalid slug', async () => {
+    vi.spyOn(api, 'listMonitors').mockResolvedValue({ monitors: [] });
+    renderSection();
+
+    fireEvent.click(await screen.findByRole('button', { name: '+ Add HTTP monitor' }));
+    fireEvent.change(screen.getByLabelText('Slug'), { target: { value: 'API health!' } });
+    fireEvent.change(screen.getByLabelText('URL'), {
+      target: { value: 'https://example.com/health' },
+    });
+
+    expect(screen.getByRole('button', { name: 'Create' })).toBeDisabled();
+  });
+
+  it('surfaces a create error as visible text', async () => {
+    vi.spyOn(api, 'listMonitors').mockResolvedValue({ monitors: [] });
+    vi.spyOn(api, 'createMonitor').mockRejectedValue(new ApiError(400, 'invalid_url'));
+    renderSection();
+
+    fireEvent.click(await screen.findByRole('button', { name: '+ Add HTTP monitor' }));
+    fireEvent.change(screen.getByLabelText('Slug'), { target: { value: 'api-health' } });
+    fireEvent.change(screen.getByLabelText('URL'), {
+      target: { value: 'https://example.com/health' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Create' }));
+
+    expect(await screen.findByText('invalid_url')).toBeInTheDocument();
+  });
+
+  it("editing an http monitor's row shows URL/Timeout fields, not Grace", async () => {
+    vi.spyOn(api, 'listMonitors').mockResolvedValue({ monitors: [httpMonitor] });
+    renderSection();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+
+    expect(screen.getByLabelText('URL')).toBeInTheDocument();
+    expect(screen.getByLabelText('Timeout (ms)')).toBeInTheDocument();
+    expect(screen.queryByLabelText('Grace (min)')).not.toBeInTheDocument();
+  });
+});

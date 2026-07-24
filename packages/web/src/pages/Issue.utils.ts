@@ -27,8 +27,14 @@ export type StatusToggleOption = { value: Issue['status']; label: string };
 // target — so it never appears as a toggle option. A regressed issue instead offers
 // resolve/ignore/reopen (SPEC brief item 2); every other status keeps the pre-existing
 // open/resolved/ignored toggle, targeting itself.
-export const statusToggleOptions = (current: Issue['status']): StatusToggleOption[] =>
-  current === 'regressed'
+//
+// v0.9 CONTRACT (SPEC §24 issue merge): 'merged' is likewise system-set (only
+// `POST /api/issues/:id/merge` sets it) and PATCH rejects it outright — a merged issue offers no
+// toggle at all (empty array), matching how Issue.tsx hides the whole status-toggle row and shows
+// the merged-state banner instead.
+export const statusToggleOptions = (current: Issue['status']): StatusToggleOption[] => {
+  if (current === 'merged') return [];
+  return current === 'regressed'
     ? [
         { value: 'resolved', label: 'resolve' },
         { value: 'ignored', label: 'ignore' },
@@ -39,6 +45,7 @@ export const statusToggleOptions = (current: Issue['status']): StatusToggleOptio
         { value: 'resolved', label: 'resolved' },
         { value: 'ignored', label: 'ignored' },
       ];
+};
 
 // v0.4 CONTRACT P: the issue detail header's platform badge prefers the issue's own `platform`
 // (server-set from its latest event, but stable even while we're viewing an older event) and

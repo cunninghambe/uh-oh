@@ -3,7 +3,8 @@ import type { Breadcrumb, EventEnvelope } from '@uh-oh/types';
 import type { Db } from '../db/index.js';
 import { insertBreadcrumbs } from '../db/repos/breadcrumbs.js';
 import { insertEvent } from '../db/repos/events.js';
-import { upsertIssue, markIssueAlerted } from '../db/repos/issues.js';
+import { bumpAliasedIssue, upsertIssue, markIssueAlerted } from '../db/repos/issues.js';
+import { getAliasTarget } from '../db/repos/fingerprint-aliases.js';
 import { getProjectByPublicKey } from '../db/repos/projects.js';
 import { upsertRelease } from '../db/repos/releases.js';
 import { enqueueDispatch } from '../db/repos/webhook-dispatches.js';
@@ -51,13 +52,22 @@ export const ingest = (
   let failedFixAttempt = false;
 
   const result = deps.db.transaction((tx): IngestResult => {
-    const { issue, isNew, regressed } = upsertIssue(tx, {
-      projectId: project.id,
-      fingerprint,
-      title,
-      ts: now,
-      platform: envelope.platform,
-    });
+    // §24: an event whose fingerprint matches a merge alias is routed to the
+    // merge target (bumping it) instead of resurrecting the merged source issue.
+    // The alias is consulted BEFORE the normal (project, fingerprint) upsert.
+    const aliasTargetId = getAliasTarget(tx, project.id, fingerprint);
+    const aliasBump = aliasTargetId
+      ? bumpAliasedIssue(tx, aliasTargetId, { ts: now, platform: envelope.platform })
+      : null;
+    const { issue, isNew, regressed } = aliasBump
+      ? { issue: aliasBump.issue, isNew: false, regressed: aliasBump.regressed }
+      : upsertIssue(tx, {
+          projectId: project.id,
+          fingerprint,
+          title,
+          ts: now,
+          platform: envelope.platform,
+        });
 
     // Token consumption stays inside the tx and before the insert on purpose:
     // a rolled-back insert must NOT refund the attacker's bucket (rate limiting

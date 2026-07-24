@@ -1,10 +1,12 @@
-import { and, desc, eq, sql, asc } from 'drizzle-orm';
+import { and, desc, eq, ne, sql, asc } from 'drizzle-orm';
 
 import type { DbOrTx } from '../index.js';
 import { newId } from '../ids.js';
 import { issues, type IssueRow } from '../schema.js';
 
-export type IssueStatus = 'open' | 'resolved' | 'ignored' | 'regressed';
+// 'merged' (v0.9 §24) is a system-set terminal status. It is a valid explicit
+// filter but never a user-settable PATCH target, and default listings hide it.
+export type IssueStatus = 'open' | 'resolved' | 'ignored' | 'regressed' | 'merged';
 
 export type IssuePlatform = 'ios' | 'android' | 'web' | 'node';
 
@@ -66,6 +68,41 @@ export const upsertIssue = (
   return { issue, isNew, regressed };
 };
 
+/**
+ * Bump an EXISTING issue for an aliased event (§24 merge routing). Applies the
+ * same conflict-update semantics as {@link upsertIssue} — grow eventCount, move
+ * lastSeen forward, transition a 'resolved' issue to 'regressed', overwrite
+ * platform — but against a known target id rather than a (project, fingerprint)
+ * pair. The event keeps its own computed fingerprint; only the issue is the
+ * merge target. Returns the fresh issue and whether this bump regressed it.
+ */
+export const bumpAliasedIssue = (
+  db: DbOrTx,
+  targetId: string,
+  input: { ts: number; platform?: IssuePlatform },
+): { issue: IssueRow; regressed: boolean } | null => {
+  const prior = db
+    .select({ status: issues.status })
+    .from(issues)
+    .where(eq(issues.id, targetId))
+    .get();
+  if (prior === undefined) return null;
+
+  const issue = db
+    .update(issues)
+    .set({
+      lastSeen: input.ts,
+      eventCount: sql`${issues.eventCount} + 1`,
+      status: sql`CASE WHEN ${issues.status} = 'resolved' THEN 'regressed' ELSE ${issues.status} END`,
+      platform: input.platform ?? null,
+    })
+    .where(eq(issues.id, targetId))
+    .returning()
+    .get();
+
+  return { issue, regressed: prior.status === 'resolved' };
+};
+
 export type IssueSort = 'lastSeen' | 'eventCount' | 'firstSeen';
 
 const sortColumn = (sort: IssueSort) => {
@@ -86,9 +123,11 @@ export const listIssues = (
 ): { rows: IssueRow[]; total: number } => {
   const limit = input.limit ?? 50;
   const offset = input.offset ?? 0;
+  // A merged issue is hidden from the default listing; it surfaces only when
+  // explicitly filtered with status='merged' (§24).
   const where = input.status
     ? and(eq(issues.projectId, input.projectId), eq(issues.status, input.status))
-    : eq(issues.projectId, input.projectId);
+    : and(eq(issues.projectId, input.projectId), ne(issues.status, 'merged'));
 
   const rows = db
     .select()
