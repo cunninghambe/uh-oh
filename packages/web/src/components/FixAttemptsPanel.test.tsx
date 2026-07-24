@@ -53,6 +53,21 @@ describe('FixAttemptsPanel (v0.8 CONTRACT — SPEC §23 fix attempts)', () => {
     expect(screen.queryByRole('link', { name: 'abcdef0' })).not.toBeInTheDocument();
   });
 
+  // Security hardening: the server now rejects a non-http(s) prUrl at write time,
+  // but a row stored before that check must never become a live href.
+  it('renders a non-http(s) prUrl as plain text, never as an href', () => {
+    render(
+      <FixAttemptsPanel
+        fixAttempts={[{ ...baseAttempt, prUrl: 'javascript:alert(1)' }]}
+        repoUrl={null}
+      />,
+    );
+
+    expect(screen.getByText('javascript:alert(1)')).toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'javascript:alert(1)' })).not.toBeInTheDocument();
+    expect(document.querySelector('a[href^="javascript:"]')).toBeNull();
+  });
+
   it('renders no commit link/text when the attempt has no commitSha', () => {
     render(
       <FixAttemptsPanel

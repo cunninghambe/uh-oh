@@ -8,7 +8,15 @@ import { createProject } from '../db/repos/projects.js';
 import { applyProbeOutcome, createMonitor } from '../db/repos/monitors.js';
 import { insertUsageEvent } from '../db/repos/usage.js';
 import { getIssue, upsertIssue } from '../db/repos/issues.js';
-import { upsertFixAttempt as repoUpsertFixAttempt } from '../db/repos/fix-attempts.js';
+import {
+  listFixAttempts,
+  upsertFixAttempt as repoUpsertFixAttempt,
+} from '../db/repos/fix-attempts.js';
+import {
+  MAX_ANNOTATIONS_PER_ISSUE,
+  countAnnotations,
+  createAnnotation,
+} from '../db/repos/annotations.js';
 import { mergeIssueInto } from '../db/repos/merge.js';
 import { insertEvent } from '../db/repos/events.js';
 import { upsertRelease } from '../db/repos/releases.js';
@@ -507,6 +515,56 @@ describe('InProcessBackend over MCP (InMemoryTransport)', () => {
       });
       expect(isError).toBe(true);
       expect(text).toContain('not_found');
+    });
+
+    // Security hardening: the MCP path must enforce exactly what the REST route
+    // enforces, so an agent cannot pick the looser entry point.
+    it('record_fix_attempt rejects a non-http(s) prUrl at the schema level', async () => {
+      for (const prUrl of ['javascript:alert(1)', 'data:text/html,x', '/relative']) {
+        const { isError, text } = await call(client, 'record_fix_attempt', {
+          issueId: seeded.issueId,
+          prUrl,
+        });
+        expect(isError, prUrl).toBe(true);
+        expect(text).toContain('Invalid arguments');
+      }
+      expect(listFixAttempts(db, seeded.issueId)).toHaveLength(0);
+    });
+
+    it('the backend re-checks the prUrl scheme even when the schema is bypassed', () => {
+      // Direct backend call: proves the guard is not schema-only, mirroring the
+      // body/author byte re-checks already in this backend. Validation rejects
+      // before any await, so it surfaces as a synchronous throw.
+      expect(() =>
+        new InProcessBackend(db).upsertFixAttempt({
+          issueId: seeded.issueId,
+          prUrl: 'javascript:alert(1)',
+        }),
+      ).toThrow(/http\(s\)/);
+      expect(listFixAttempts(db, seeded.issueId)).toHaveLength(0);
+    });
+
+    it('annotate_issue 409s past the per-issue cap, and the backend rejects an over-cap author by bytes', async () => {
+      const backend = new InProcessBackend(db);
+      for (let i = 0; i < MAX_ANNOTATIONS_PER_ISSUE; i += 1) {
+        createAnnotation(db, { issueId: seeded.issueId, body: `n${String(i)}` }, 1000 + i);
+      }
+      const { isError, text } = await call(client, 'annotate_issue', {
+        issueId: seeded.issueId,
+        body: 'one too many',
+      });
+      expect(isError).toBe(true);
+      expect(text).toContain('annotation_limit');
+      expect(countAnnotations(db, seeded.issueId)).toBe(MAX_ANNOTATIONS_PER_ISSUE);
+
+      // 65 three-byte chars pass the schema's 128-CHAR cap but exceed 128 bytes.
+      expect(() =>
+        backend.createAnnotation({
+          issueId: seeded.issueId,
+          body: 'x',
+          author: '中'.repeat(65),
+        }),
+      ).toThrow(/author/);
     });
   });
 

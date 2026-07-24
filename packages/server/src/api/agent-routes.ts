@@ -14,8 +14,10 @@ import { buildAgentAuthMiddleware } from '../auth/agent-token.js';
 import { getIssue, setIssueStatus } from '../db/repos/issues.js';
 import {
   CLIENT_ANNOTATION_KINDS,
+  MAX_ANNOTATIONS_PER_ISSUE,
   MAX_ANNOTATION_AUTHOR,
   MAX_ANNOTATION_BODY,
+  countAnnotations,
   createAnnotation,
   listAnnotations,
   toAnnotationView,
@@ -25,6 +27,7 @@ import {
 import {
   COMMIT_SHA_RE,
   MAX_PR_URL,
+  PR_URL_SCHEME_RE,
   applyFixAttemptTransition,
   getFixAttempt,
   isAllowedClientTransition,
@@ -95,11 +98,18 @@ export const registerAgentRoutes = (
       if (kind !== undefined && !isClientKind(kind)) {
         return reply.code(400).send({ error: 'invalid_kind' });
       }
+      // Author is capped by BYTES like the body, so a multi-byte name cannot
+      // store more than the §23 "≤128" the column documents.
       if (
         author !== undefined &&
-        (typeof author !== 'string' || author.length > MAX_ANNOTATION_AUTHOR)
+        (typeof author !== 'string' || Buffer.byteLength(author, 'utf8') > MAX_ANNOTATION_AUTHOR)
       ) {
         return reply.code(400).send({ error: 'invalid_author' });
+      }
+      // Per-issue cap (§23): annotations are agent-writable and unbounded growth
+      // is a disk-exhaustion vector. Server-written 'system' rows are exempt.
+      if (countAnnotations(db, issue.id) >= MAX_ANNOTATIONS_PER_ISSUE) {
+        return reply.code(409).send({ error: 'annotation_limit' });
       }
 
       const row = createAnnotation(
@@ -143,7 +153,14 @@ export const registerAgentRoutes = (
         return reply.code(400).send({ error: 'invalid_body' });
       }
       const { prUrl, commitSha } = body as { prUrl?: unknown; commitSha?: unknown };
-      if (typeof prUrl !== 'string' || prUrl.length === 0 || prUrl.length > MAX_PR_URL) {
+      // http(s) only: the dashboard renders this as an <a href>, so a
+      // `javascript:` URL would be stored XSS against the admin session.
+      if (
+        typeof prUrl !== 'string' ||
+        prUrl.length === 0 ||
+        prUrl.length > MAX_PR_URL ||
+        !PR_URL_SCHEME_RE.test(prUrl)
+      ) {
         return reply.code(400).send({ error: 'invalid_prUrl' });
       }
       let sha: string | undefined;

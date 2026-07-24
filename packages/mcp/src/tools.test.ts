@@ -1497,6 +1497,31 @@ describe('record_fix_attempt (v0.8 §23)', () => {
     expect(isError).toBe(true);
   });
 
+  it('rejects a non-http(s) prUrl at the schema level (the dashboard renders it as an <a href>)', async () => {
+    for (const prUrl of [
+      'javascript:alert(1)',
+      'JavaScript:alert(1)',
+      'data:text/html,<script>alert(1)</script>',
+      'file:///etc/passwd',
+      '/relative/pr/1',
+    ]) {
+      const { isError, text } = await call(client, 'record_fix_attempt', {
+        issueId: 'i1',
+        prUrl,
+      });
+      expect(isError, prUrl).toBe(true);
+      expect(text).toContain('Invalid arguments');
+    }
+    expect(backend.calls.some((c) => c.method === 'upsertFixAttempt')).toBe(false);
+
+    // http and https both remain valid.
+    for (const prUrl of ['https://github.com/o/r/pull/1', 'http://gh.internal.example/pr/2']) {
+      expect((await call(client, 'record_fix_attempt', { issueId: 'i1', prUrl })).isError).toBe(
+        false,
+      );
+    }
+  });
+
   it('is a not_found tool error for an unknown issue', async () => {
     const { isError, text } = await call(client, 'record_fix_attempt', {
       issueId: 'ghost',

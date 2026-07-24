@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { commitUrl, relativeTime, shortSha } from './format.js';
+import { commitUrl, httpHref, relativeTime, shortSha } from './format.js';
 
 describe('relativeTime', () => {
   it('renders seconds for under a minute', () => {
@@ -55,5 +55,30 @@ describe('commitUrl (SPEC §23: linked when repoUrl starts with https, else plai
 
   it('returns null for an undefined repoUrl (older server omitting the field)', () => {
     expect(commitUrl(undefined, 'abcdef0')).toBeNull();
+  });
+});
+
+describe('httpHref (only http(s) becomes a link)', () => {
+  it('passes http and https URLs through, case-insensitively', () => {
+    expect(httpHref('https://github.com/org/repo/pull/1')).toBe(
+      'https://github.com/org/repo/pull/1',
+    );
+    expect(httpHref('http://gh.internal.example/pr/2')).toBe('http://gh.internal.example/pr/2');
+    expect(httpHref('HTTPS://EXAMPLE.COM/x')).toBe('HTTPS://EXAMPLE.COM/x');
+  });
+
+  it('returns null for script-bearing and other non-http(s) schemes', () => {
+    expect(httpHref('javascript:alert(1)')).toBeNull();
+    expect(httpHref('JaVaScRiPt:alert(1)')).toBeNull();
+    expect(httpHref('data:text/html,<script>alert(1)</script>')).toBeNull();
+    expect(httpHref('vbscript:msgbox(1)')).toBeNull();
+    expect(httpHref('file:///etc/passwd')).toBeNull();
+    expect(httpHref('/relative/path')).toBeNull();
+  });
+
+  it('returns null for null, undefined and empty input', () => {
+    expect(httpHref(null)).toBeNull();
+    expect(httpHref(undefined)).toBeNull();
+    expect(httpHref('')).toBeNull();
   });
 });

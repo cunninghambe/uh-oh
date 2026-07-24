@@ -5,7 +5,7 @@
 // present at all (see the `!== undefined` check there) — this component itself only handles the
 // "we have the array" case (possibly empty), same division of responsibility as ImpactPanel.tsx.
 import type { FixAttempt } from '../api.js';
-import { relativeTime } from '../format.js';
+import { httpHref, relativeTime } from '../format.js';
 import { CommitLink } from './CommitLink.js';
 import { fixAttemptStateStyle } from './FixAttemptsPanel.utils.js';
 
@@ -26,24 +26,36 @@ const FixAttemptRow = ({
 }: {
   attempt: FixAttempt;
   repoUrl: string | null | undefined;
-}) => (
-  <div className="px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-    <div className="flex min-w-0 items-center gap-2">
-      <StatePill state={attempt.state} />
-      <a
-        href={attempt.prUrl}
-        target="_blank"
-        rel="noreferrer"
-        className="max-w-xs truncate text-amber-400 underline hover:text-amber-300"
-        title={attempt.prUrl}
-      >
-        {attempt.prUrl}
-      </a>
-      {attempt.commitSha && <CommitLink sha={attempt.commitSha} repoUrl={repoUrl} />}
+}) => {
+  // Only http(s) becomes a link: same "null means plain text" contract as CommitLink/commitUrl.
+  // The server rejects other schemes at write time; a row stored before that check must not
+  // render a `javascript:` href into the admin session.
+  const href = httpHref(attempt.prUrl);
+  return (
+    <div className="px-3 py-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+      <div className="flex min-w-0 items-center gap-2">
+        <StatePill state={attempt.state} />
+        {href ? (
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            className="max-w-xs truncate text-amber-400 underline hover:text-amber-300"
+            title={attempt.prUrl}
+          >
+            {attempt.prUrl}
+          </a>
+        ) : (
+          <span className="max-w-xs truncate text-zinc-400" title={attempt.prUrl}>
+            {attempt.prUrl}
+          </span>
+        )}
+        {attempt.commitSha && <CommitLink sha={attempt.commitSha} repoUrl={repoUrl} />}
+      </div>
+      <span className="shrink-0 text-zinc-500">{relativeTime(attempt.createdAt)}</span>
     </div>
-    <span className="shrink-0 text-zinc-500">{relativeTime(attempt.createdAt)}</span>
-  </div>
-);
+  );
+};
 
 export const FixAttemptsPanel = ({
   fixAttempts,

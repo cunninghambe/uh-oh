@@ -226,6 +226,43 @@ describe('POST /api/projects/:id/monitors (http)', () => {
     }
   });
 
+  // Security hardening: ranges the original allowlist missed. Each of these was
+  // accepted (201) and probed before the guard was widened.
+  it('rejects the ::/96 IPv4-compatible and CGNAT ranges at save time', async () => {
+    for (const url of [
+      'http://[::7f00:1]/', // ::127.0.0.1 as the URL parser normalizes it
+      'http://[::127.0.0.1]/',
+      'http://100.64.0.1/',
+      'http://[fec0::1]/',
+      'http://192.0.0.8/',
+      'http://198.18.0.1/',
+      'http://224.0.0.1/',
+      'http://255.255.255.255/',
+    ]) {
+      const res = await create({ kind: 'http', slug: 'ssrf2', url, intervalMinutes: 5 });
+      expect(res.statusCode, url).toBe(400);
+      expect(res.json<{ error: string }>().error).toBe('invalid_url');
+    }
+  });
+
+  it('rejects a url carrying credentials at save time', async () => {
+    const res = await create({
+      kind: 'http',
+      slug: 'creds',
+      url: 'http://user:s3cret@example.com/health',
+      intervalMinutes: 5,
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json<{ error: string }>().error).toBe('invalid_url');
+    // Nothing was stored, so nothing can be echoed to a narrower scope.
+    const list = await app().inject({
+      method: 'GET',
+      url: `/api/projects/${project.id}/monitors`,
+      headers: auth(),
+    });
+    expect(JSON.stringify(list.json())).not.toContain('s3cret');
+  });
+
   it('rejects a bad slug and 409s a duplicate slug', async () => {
     expect(
       (
@@ -301,6 +338,26 @@ describe('PATCH /api/monitors/:id — kind immutability + http fields', () => {
       payload: { url: 'http://127.0.0.1' },
     });
     expect(bad.statusCode).toBe(400);
+  });
+
+  it('rejects the widened SSRF ranges and credentials on PATCH too', async () => {
+    const m = await createHttp('ops3');
+    for (const url of [
+      'http://[::7f00:1]/',
+      'http://100.64.0.1/',
+      'http://user:s3cret@example.com/health',
+    ]) {
+      const res = await app().inject({
+        method: 'PATCH',
+        url: `/api/monitors/${m.id}`,
+        headers: auth(),
+        payload: { url },
+      });
+      expect(res.statusCode, url).toBe(400);
+      expect(res.json<{ error: string }>().error).toBe('invalid_url');
+    }
+    // The original url is untouched.
+    expect(getMonitor(db, m.id)?.url).toBe('https://err.example/a');
   });
 
   it('rejects url on a check-in monitor', async () => {

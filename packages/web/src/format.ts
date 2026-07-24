@@ -29,3 +29,13 @@ export const shortSha = (sha: string): string => sha.slice(0, 7);
  */
 export const commitUrl = (repoUrl: string | null | undefined, sha: string): string | null =>
   repoUrl && repoUrl.startsWith('https://') ? `${repoUrl}/commit/${sha}` : null;
+
+/**
+ * Returns `raw` when it is safe to place in an `<a href>`, i.e. http(s), and null otherwise.
+ * The server rejects non-http(s) `prUrl`s at write time, so this is defence in depth for rows
+ * written before that check existed (and for any future field rendered as a link): a
+ * `javascript:` href in the dashboard would run with the admin session's localStorage JWT.
+ * Same shape as commitUrl above: null means "render plain text, not a link".
+ */
+export const httpHref = (raw: string | null | undefined): string | null =>
+  raw && /^https?:\/\//i.test(raw) ? raw : null;

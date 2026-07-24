@@ -455,6 +455,10 @@ const ANNOTATION_AUTHOR_MAX = 128;
 const CLIENT_FIX_TRANSITION = z.enum(['deployed', 'failed']);
 const PR_URL_MAX = 512;
 const COMMIT_SHA_RE = /^[0-9a-f]{7,40}$/i;
+// The dashboard renders pr_url as an <a href>, so only http(s) is accepted;
+// mirrors the server's PR_URL_SCHEME_RE. A `javascript:` URL recorded here would
+// be stored XSS against a dashboard session whose JWT lives in localStorage.
+const PR_URL_SCHEME_RE = /^https?:\/\//i;
 
 /**
  * Register every uh-oh tool on `server`, backed by `backend`. This is the only
@@ -833,7 +837,7 @@ export const registerUhOhTools = (
     {
       title: 'Annotate issue',
       description:
-        "Add an investigation note to an issue — a free-text 'note', 'root_cause', 'fix_plan', or 'verification' record — so the next investigation of the same crash does not start from zero. Body capped at 16KB (413 over); author defaults to 'agent'. The 'system' kind is written by the server only (the fix-attempt audit trail) and cannot be set here.",
+        "Add an investigation note to an issue — a free-text 'note', 'root_cause', 'fix_plan', or 'verification' record — so the next investigation of the same crash does not start from zero. Body capped at 16KB (413 over); author defaults to 'agent'. An issue holds at most 500 client annotations (409 beyond). The 'system' kind is written by the server only (the fix-attempt audit trail) and cannot be set here.",
       inputSchema: {
         issueId: z.string().min(1),
         body: z.string().min(1).max(ANNOTATION_BODY_MAX),
@@ -861,10 +865,10 @@ export const registerUhOhTools = (
     {
       title: 'Record fix attempt',
       description:
-        "Record or update a fix attempt for an issue by its PR URL: upserts by (issue, prUrl) into state 'filed' (a re-record with a different commitSha updates it), then — when state is given and differs from the attempt's current state — transitions it. Allowed transitions: filed->deployed, filed->failed, deployed->failed; anything else (including 'verified', which is system-set by the hourly verify sweep) is rejected. Marking 'deployed' resolves an open/regressed issue, re-arming regression detection. Returns the final fix attempt.",
+        "Record or update a fix attempt for an issue by its PR URL (http(s) only): upserts by (issue, prUrl) into state 'filed' (a re-record with a different commitSha updates it), then — when state is given and differs from the attempt's current state — transitions it. Allowed transitions: filed->deployed, filed->failed, deployed->failed; anything else (including 'verified', which is system-set by the hourly verify sweep) is rejected. Marking 'deployed' resolves an open/regressed issue, re-arming regression detection. Returns the final fix attempt.",
       inputSchema: {
         issueId: z.string().min(1),
-        prUrl: z.string().min(1).max(PR_URL_MAX),
+        prUrl: z.string().min(1).max(PR_URL_MAX).regex(PR_URL_SCHEME_RE),
         commitSha: z.string().regex(COMMIT_SHA_RE).optional(),
         state: CLIENT_FIX_TRANSITION.optional(),
       },

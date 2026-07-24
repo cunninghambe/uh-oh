@@ -80,6 +80,9 @@ export const probeHttpMonitor = async (
   const timer = setTimeout(() => {
     controller.abort();
   }, timeoutMs);
+  // The body is never read, but an undrained body holds its socket open until GC
+  // finalizes it, so every probe explicitly cancels the stream in the `finally`.
+  let response: Response | undefined;
   try {
     const res = await deps.fetchFn(url, {
       method: 'GET',
@@ -88,6 +91,7 @@ export const probeHttpMonitor = async (
       // A 3xx to an internal host would bypass the guards above.
       redirect: 'error',
     });
+    response = res;
     const status = res.status;
     // Success is any 2xx/3xx; the body is intentionally left unread.
     return status >= 200 && status < 400 ? { ok: true, status } : { ok: false, status };
@@ -95,5 +99,12 @@ export const probeHttpMonitor = async (
     return { ok: false, status: null, error: err instanceof Error ? err.message : String(err) };
   } finally {
     clearTimeout(timer);
+    // Guard for a bodyless response (204/HEAD) and for a stubbed fetch whose
+    // Response-alike has no `cancel`; a cancel rejection is not a probe failure.
+    try {
+      await response?.body?.cancel?.();
+    } catch {
+      /* releasing the socket is best-effort */
+    }
   }
 };

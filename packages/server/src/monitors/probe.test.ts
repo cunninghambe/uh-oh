@@ -9,6 +9,7 @@ import { PROBE_USER_AGENT, probeHttpMonitor, type ProbeResult } from './probe.js
 
 const publicLookup: DnsLookupAll = () => Promise.resolve([{ address: '93.184.216.34', family: 4 }]);
 const privateLookup: DnsLookupAll = () => Promise.resolve([{ address: '10.0.0.5', family: 4 }]);
+const compatLookup: DnsLookupAll = () => Promise.resolve([{ address: '::7f00:1', family: 6 }]);
 
 const okFetch = (status: number) =>
   vi.fn(() => Promise.resolve({ status } as Response)) as unknown as typeof fetch;
@@ -56,6 +57,63 @@ describe('probeHttpMonitor', () => {
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
+  it('rejects the widened literal-IP ranges at probe time WITHOUT fetching', async () => {
+    // A monitor row written before the guard was widened (or one that slipped
+    // past a save-time check) must still be refused at probe time.
+    for (const url of [
+      'http://[::7f00:1]/health', // ::/96 IPv4-compatible
+      'http://100.64.0.1/health', // CGNAT
+      'http://[fec0::1]/health', // site-local
+      'http://224.0.0.1/health', // multicast
+      'http://user:s3cret@example.com/health', // credentials in URL
+    ]) {
+      const fetchFn = vi.fn(() => Promise.resolve({ status: 200 } as Response));
+      const res = await probeHttpMonitor(monitor(url), {
+        fetchFn: fetchFn as unknown as typeof fetch,
+        lookupFn: publicLookup,
+      });
+      expect(res.ok, url).toBe(false);
+      expect(res.status).toBeNull();
+      expect(res.error).toMatch(/blocked_url/);
+      expect(fetchFn, url).not.toHaveBeenCalled();
+    }
+  });
+
+  it('cancels the response body so the socket is released without waiting for GC', async () => {
+    const cancel = vi.fn(() => Promise.resolve());
+    const fetchFn = vi.fn(() =>
+      Promise.resolve({ status: 200, body: { cancel } } as unknown as Response),
+    );
+    const res = await probeHttpMonitor(monitor('https://svc.example/health'), {
+      fetchFn: fetchFn as unknown as typeof fetch,
+      lookupFn: publicLookup,
+    });
+    expect(res).toEqual<ProbeResult>({ ok: true, status: 200 });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('still reports the status when cancelling the body throws, and tolerates a null body', async () => {
+    const boom = vi.fn(() => Promise.reject(new Error('already locked')));
+    const failing = vi.fn(() =>
+      Promise.resolve({ status: 500, body: { cancel: boom } } as unknown as Response),
+    );
+    expect(
+      await probeHttpMonitor(monitor('https://svc.example'), {
+        fetchFn: failing as unknown as typeof fetch,
+        lookupFn: publicLookup,
+      }),
+    ).toEqual<ProbeResult>({ ok: false, status: 500 });
+    expect(boom).toHaveBeenCalledTimes(1);
+    // A 204/HEAD-style bodyless response must not throw on the cancel path.
+    const bodyless = vi.fn(() => Promise.resolve({ status: 204, body: null } as Response));
+    expect(
+      await probeHttpMonitor(monitor('https://svc.example'), {
+        fetchFn: bodyless as unknown as typeof fetch,
+        lookupFn: publicLookup,
+      }),
+    ).toEqual<ProbeResult>({ ok: true, status: 204 });
+  });
+
   it('rejects a hostname that resolves to a private address (DNS rebinding) WITHOUT fetching', async () => {
     const fetchFn = vi.fn(() => Promise.resolve({ status: 200 } as Response));
     const res = await probeHttpMonitor(monitor('https://evil.example/health'), {
@@ -65,6 +123,16 @@ describe('probeHttpMonitor', () => {
     expect(res.ok).toBe(false);
     expect(res.status).toBeNull();
     expect(res.error).toBe('blocked_dns:10.0.0.5');
+    expect(fetchFn).not.toHaveBeenCalled();
+  });
+
+  it('rejects a hostname resolving to an ::/96 IPv4-compatible address', async () => {
+    const fetchFn = vi.fn(() => Promise.resolve({ status: 200 } as Response));
+    const res = await probeHttpMonitor(monitor('https://rebind.example/health'), {
+      fetchFn: fetchFn as unknown as typeof fetch,
+      lookupFn: compatLookup,
+    });
+    expect(res.error).toBe('blocked_dns:::7f00:1');
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
