@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
@@ -91,6 +91,73 @@ describe('sweepMonitors', () => {
   });
 });
 
+// The incident this guards: a 'missed' monitor on a project with no webhook_url
+// produced no dispatch row and no log line, so nobody heard about it for days.
+describe('sweepMonitors — instance-level fallback webhook', () => {
+  const DEFAULT_HOOK = 'https://hooks.example.com/instance';
+
+  const hookless = (slug: string) => {
+    const p = createProject(db, { name: 'NoHook' });
+    return createMonitor(db, {
+      projectId: p.id,
+      slug,
+      intervalMinutes: 10,
+      graceMinutes: 5,
+      now: NOW,
+    });
+  };
+
+  it('dispatches to the default webhook when the project has none', () => {
+    const m = hookless('cron');
+    expect(sweepMonitors(db, NOW + 30 * MIN, { defaultWebhookUrl: DEFAULT_HOOK })).toBe(1);
+
+    const dispatches = takeDueDispatches(db, NOW + 31 * MIN, 100).filter(
+      (d) => d.monitorId === m.id,
+    );
+    expect(dispatches).toHaveLength(1);
+    expect(dispatches[0]?.url).toBe(DEFAULT_HOOK);
+    expect(dispatches[0]?.type).toBe('monitor.missed');
+  });
+
+  it("keeps using the project's own webhook when it has one", () => {
+    const m = mk('cron'); // project webhook set in beforeEach
+    expect(sweepMonitors(db, NOW + 30 * MIN, { defaultWebhookUrl: DEFAULT_HOOK })).toBe(1);
+
+    const dispatches = takeDueDispatches(db, NOW + 31 * MIN, 100).filter(
+      (d) => d.monitorId === m.id,
+    );
+    expect(dispatches[0]?.url).toBe('https://hooks.example.com/uh-oh');
+  });
+
+  it('warns (never silently drops) when there is nowhere to send the miss', () => {
+    const warn = vi.fn();
+    const logger = { error: vi.fn(), warn };
+    const m = hookless('cron');
+
+    expect(sweepMonitors(db, NOW + 30 * MIN, { logger })).toBe(1);
+    expect(getMonitor(db, m.id)?.status).toBe('missed');
+    expect(takeDueDispatches(db, NOW + 31 * MIN, 100).filter((d) => d.monitorId === m.id)).toEqual(
+      [],
+    );
+
+    expect(warn).toHaveBeenCalledOnce();
+    const msg = String(warn.mock.calls[0]?.[0]);
+    expect(msg).toContain('monitor.missed');
+    expect(msg).toContain('NoHook');
+    expect(msg).toContain('UH_OH_DEFAULT_WEBHOOK_URL');
+  });
+
+  it('does not warn when the fallback covers the project', () => {
+    const warn = vi.fn();
+    hookless('cron');
+    sweepMonitors(db, NOW + 30 * MIN, {
+      logger: { error: vi.fn(), warn },
+      defaultWebhookUrl: DEFAULT_HOOK,
+    });
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
 describe('startMonitorSweep', () => {
   it('runs a sweep via sweepOnce and stops cleanly', () => {
     const m = mk('cron');
@@ -98,6 +165,31 @@ describe('startMonitorSweep', () => {
     try {
       expect(handle.sweepOnce(NOW + 30 * MIN)).toBe(1);
       expect(getMonitor(db, m.id)?.status).toBe('missed');
+    } finally {
+      handle.stop();
+    }
+  });
+
+  it('threads the default webhook through sweepOnce', () => {
+    const p = createProject(db, { name: 'NoHook' });
+    const m = createMonitor(db, {
+      projectId: p.id,
+      slug: 'cron',
+      intervalMinutes: 10,
+      graceMinutes: 5,
+      now: NOW,
+    });
+    const handle = startMonitorSweep({
+      db,
+      intervalMs: 1_000_000,
+      defaultWebhookUrl: 'https://hooks.example.com/instance',
+    });
+    try {
+      expect(handle.sweepOnce(NOW + 30 * MIN)).toBe(1);
+      const dispatches = takeDueDispatches(db, NOW + 31 * MIN, 100).filter(
+        (d) => d.monitorId === m.id,
+      );
+      expect(dispatches[0]?.url).toBe('https://hooks.example.com/instance');
     } finally {
       handle.stop();
     }

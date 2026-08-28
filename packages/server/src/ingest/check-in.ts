@@ -15,6 +15,7 @@ import {
 } from '../db/repos/monitors.js';
 import { getProjectByPublicKey } from '../db/repos/projects.js';
 import { enqueueDispatch } from '../db/repos/webhook-dispatches.js';
+import { resolveWebhookUrl, warnNoWebhookTarget } from '../webhooks/resolve-url.js';
 import type { Db } from '../db/index.js';
 import type { RateLimiter } from './rate-limit.js';
 
@@ -33,7 +34,13 @@ const parseInterval = (raw: string | undefined): IntervalParse => {
   return { kind: 'valid', value: n };
 };
 
-export const registerCheckInRoute = (app: FastifyInstance, db: Db, limiter: RateLimiter): void => {
+export const registerCheckInRoute = (
+  app: FastifyInstance,
+  db: Db,
+  limiter: RateLimiter,
+  /** Instance-level fallback webhook (UH_OH_DEFAULT_WEBHOOK_URL). */
+  defaultWebhookUrl?: string,
+): void => {
   app.post<{
     Params: { publicKey: string; slug: string };
     Querystring: { intervalMinutes?: string };
@@ -84,12 +91,13 @@ export const registerCheckInRoute = (app: FastifyInstance, db: Db, limiter: Rate
       ...(interval.kind === 'valid' ? { intervalMinutes: interval.value } : {}),
     });
     // A recovering monitor (missed -> ok) fires monitor.recovered once.
-    if (result?.recovered && project.webhookUrl) {
-      enqueueDispatch(
-        db,
-        { monitorId: existing.id, url: project.webhookUrl, type: 'monitor.recovered' },
-        now,
-      );
+    if (result?.recovered) {
+      const url = resolveWebhookUrl(project, defaultWebhookUrl);
+      if (url) {
+        enqueueDispatch(db, { monitorId: existing.id, url, type: 'monitor.recovered' }, now);
+      } else {
+        warnNoWebhookTarget(app.log, project, 'monitor.recovered');
+      }
     }
     return reply.code(202).send({ monitorId: existing.id });
   });

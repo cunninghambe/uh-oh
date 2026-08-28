@@ -2,11 +2,11 @@
 // attempt whose deploy is old enough and whose issue stayed silent flips to
 // 'verified' and dispatches fix.verified; a post-deploy event blocks it.
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
-import { createProject } from '../db/repos/projects.js';
+import { createProject, updateProject } from '../db/repos/projects.js';
 import { upsertIssue } from '../db/repos/issues.js';
 import { insertEvent } from '../db/repos/events.js';
 import {
@@ -121,6 +121,41 @@ describe('sweepFixVerification', () => {
     seedEvent(NOW + 60_000); // a post-deploy event
     expect(sweepFixVerification(db, NOW + 7 * DAY, 7)).toBe(0);
     expect(getFixAttempt(db, id)?.state).toBe('deployed');
+  });
+
+  const verifiedDispatches = (now: number) =>
+    takeDueDispatches(db, now, 100).filter((d) => d.type === 'fix.verified');
+
+  it('dispatches to the instance default when the project has no webhook of its own', () => {
+    updateProject(db, projectId, { webhookUrl: null });
+    deployAttempt('https://gh/pr/1', NOW);
+
+    expect(
+      sweepFixVerification(db, NOW + 7 * DAY, 7, {
+        defaultWebhookUrl: 'https://hooks.example/instance',
+      }),
+    ).toBe(1);
+
+    const dispatched = verifiedDispatches(NOW + 7 * DAY + 1);
+    expect(dispatched).toHaveLength(1);
+    expect(dispatched[0]?.url).toBe('https://hooks.example/instance');
+  });
+
+  it('warns when a verification has nowhere to go', () => {
+    updateProject(db, projectId, { webhookUrl: null });
+    deployAttempt('https://gh/pr/1', NOW);
+    const warn = vi.fn();
+
+    expect(sweepFixVerification(db, NOW + 7 * DAY, 7, { logger: { error: vi.fn(), warn } })).toBe(
+      1,
+    );
+    expect(verifiedDispatches(NOW + 7 * DAY + 1)).toEqual([]);
+
+    expect(warn).toHaveBeenCalledOnce();
+    const msg = String(warn.mock.calls[0]?.[0]);
+    expect(msg).toContain('fix.verified');
+    expect(msg).toContain('App');
+    expect(msg).toContain('UH_OH_DEFAULT_WEBHOOK_URL');
   });
 
   it('startFixVerifySweep runs via sweepOnce and stops cleanly', () => {

@@ -1,5 +1,5 @@
 import type { EventEnvelope } from '@uh-oh/types';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Db } from '../db/index.js';
 import { getIssue, listIssues } from '../db/repos/issues.js';
@@ -229,6 +229,56 @@ describe('webhook dispatch hook in ingest()', () => {
     expect(r.kind).toBe('stored');
     const due = takeDueDispatches(db, 1_000, 10);
     expect(due).toHaveLength(0);
+  });
+
+  it('falls back to the instance default webhook when the project has none', () => {
+    const r = ingestFn(
+      {
+        db,
+        rateLimiter: rl(),
+        now: () => 1_000,
+        defaultWebhookUrl: 'https://hooks.example/instance',
+      },
+      project.publicKey,
+      validEnv,
+    );
+    expect(r.kind).toBe('stored');
+    const due = takeDueDispatches(db, 1_000, 10);
+    expect(due).toHaveLength(1);
+    expect(due[0]?.url).toBe('https://hooks.example/instance');
+  });
+
+  it("prefers the project's own webhook over the instance default", () => {
+    const p = createProject(db, { name: 'Hooked4', webhookUrl: 'https://hooks.test/own' });
+    ingestFn(
+      {
+        db,
+        rateLimiter: rl(),
+        now: () => 1_000,
+        defaultWebhookUrl: 'https://hooks.example/instance',
+      },
+      p.publicKey,
+      validEnv,
+    );
+    expect(takeDueDispatches(db, 1_000, 10)[0]?.url).toBe('https://hooks.test/own');
+  });
+
+  it('warns once on the new-issue transition with nowhere to go, not on every event', () => {
+    const warn = vi.fn();
+    const deps = { db, rateLimiter: rl(), now: () => 1_000, logger: { warn } };
+
+    ingestFn(deps, project.publicKey, validEnv); // new issue → one warn
+    expect(warn).toHaveBeenCalledOnce();
+    const msg = String(warn.mock.calls[0]?.[0]);
+    expect(msg).toContain('issue.new');
+    expect(msg).toContain('App');
+    expect(msg).toContain('UH_OH_DEFAULT_WEBHOOK_URL');
+
+    // Same fingerprint again: no longer a transition, and ingest is the hottest
+    // path in the server — it must not warn per event.
+    ingestFn(deps, project.publicKey, validEnv);
+    ingestFn(deps, project.publicKey, validEnv);
+    expect(warn).toHaveBeenCalledOnce();
   });
 
   it('does NOT enqueue a second dispatch for same fingerprint within dedupe window', () => {

@@ -38,7 +38,12 @@ else
 fi
 
 # Retention: keep 30 days, applied to both the DB and symbols archives.
-find "$DEST" -name 'uh-oh-*.db' -mtime "+$RETENTION_DAYS" -delete
-find "$DEST" -name 'uh-oh-symbols-*.tar.gz' -mtime "+$RETENTION_DAYS" -delete
+# -maxdepth 1: retention manages ONLY the dated files this script writes at the
+# top level. Without it the glob descended into pre-v09/ (root-owned migration
+# safety copies), hit EPERM once those aged past 30 days, and set -e killed the
+# job AFTER a good backup but BEFORE its monitor check-in - three missed
+# heartbeats (2026-08-25..27) for a backup that was actually succeeding.
+find "$DEST" -maxdepth 1 -name 'uh-oh-*.db' -mtime "+$RETENTION_DAYS" -delete
+find "$DEST" -maxdepth 1 -name 'uh-oh-symbols-*.tar.gz' -mtime "+$RETENTION_DAYS" -delete
 
 echo "Backup written: $DB_BACKUP (+ symbols archive if present)"

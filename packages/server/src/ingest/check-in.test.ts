@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
@@ -123,6 +123,41 @@ describe('POST /ingest/:publicKey/check-in/:slug', () => {
     await checkIn(server, 'cron');
     const due = takeDueDispatches(db, Date.now() + 1000, 10);
     expect(due).toHaveLength(0);
+  });
+
+  it('recovers via the instance default webhook when the project has none', async () => {
+    const server = buildServer({
+      db,
+      secret: TEST_SECRET,
+      password: 'test-password',
+      defaultWebhookUrl: 'https://hooks.example/instance',
+    });
+    await checkIn(server, 'cron', project.publicKey, '?intervalMinutes=10');
+    const monitor = getMonitorBySlug(db, project.id, 'cron');
+    setMonitorStatus(db, monitor!.id, 'missed');
+
+    await checkIn(server, 'cron');
+    const recovered = takeDueDispatches(db, Date.now() + 1000, 10).find(
+      (d) => d.type === 'monitor.recovered',
+    );
+    expect(recovered?.url).toBe('https://hooks.example/instance');
+  });
+
+  it('warns instead of silently dropping a recovery with nowhere to go', async () => {
+    const server = app();
+    const warn = vi.spyOn(server.log, 'warn');
+    await checkIn(server, 'cron', project.publicKey, '?intervalMinutes=10');
+    const monitor = getMonitorBySlug(db, project.id, 'cron');
+    setMonitorStatus(db, monitor!.id, 'missed');
+
+    await checkIn(server, 'cron');
+    expect(takeDueDispatches(db, Date.now() + 1000, 10)).toHaveLength(0);
+    expect(warn).toHaveBeenCalledOnce();
+    const msg = String(warn.mock.calls[0]?.[0]);
+    expect(msg).toContain('monitor.recovered');
+    expect(msg).toContain('App');
+    expect(msg).toContain('UH_OH_DEFAULT_WEBHOOK_URL');
+    warn.mockRestore();
   });
 
   it('rate-limits excessive pings to one monitor', async () => {

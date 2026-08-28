@@ -12,6 +12,9 @@ import {
   markDispatchAttempt,
   type DispatchType,
 } from '../db/repos/webhook-dispatches.js';
+import type { SpikeStats } from '../db/repos/spikes.js';
+import type { FixAttemptView } from '../db/repos/fix-attempts.js';
+import type { EventRow } from '../db/schema.js';
 import { metrics } from '../metrics/registry.js';
 import { isBlockedIp, isIpLiteralHost, validateWebhookUrl } from './url-guard.js';
 
@@ -117,11 +120,43 @@ export type DispatcherHandle = {
   stop: () => Promise<void>;
 };
 
+/**
+ * The delivered webhook body. Its exact shape (and property order) is the
+ * receiver contract — see the per-type comments on the builders below. Fields
+ * are optional per event type rather than modelled as a discriminated union so
+ * the builders stay literal-for-literal what they were; the translation to
+ * other formats (Discord) reads them defensively.
+ */
+export type WebhookPayload = {
+  type: DispatchType;
+  dispatchId: string;
+  project: { id: string; name: string; slug: string };
+  monitor?: {
+    id: string;
+    slug: string;
+    name: string | null;
+    intervalMinutes: number;
+    graceMinutes: number;
+    lastCheckInAt: number | null;
+  };
+  probe?: { status: number } | { error: string };
+  issue?: { id: string; fingerprint: string; title: string; eventCount: number };
+  event?: {
+    id: string;
+    level: EventRow['level'];
+    platform: EventRow['platform'];
+    receivedAt: number;
+  };
+  stats?: SpikeStats;
+  fixAttempt?: FixAttemptView | null;
+  url?: string;
+};
+
 const buildMonitorPayload = (
   db: Db,
   dispatch: DispatchRecord,
   dashboardUrl: string | undefined,
-): object | null => {
+): WebhookPayload | null => {
   if (!dispatch.monitorId) return null;
   const monitor = getMonitor(db, dispatch.monitorId);
   if (!monitor) return null;
@@ -176,7 +211,7 @@ const buildSpikePayload = (
   db: Db,
   dispatch: DispatchRecord,
   dashboardUrl: string | undefined,
-): object | null => {
+): WebhookPayload | null => {
   if (!dispatch.issueId) return null;
   const issue = getIssue(db, dispatch.issueId);
   if (!issue) return null;
@@ -199,7 +234,7 @@ const buildFixVerifiedPayload = (
   db: Db,
   dispatch: DispatchRecord,
   dashboardUrl: string | undefined,
-): object | null => {
+): WebhookPayload | null => {
   if (!dispatch.issueId) return null;
   const issue = getIssue(db, dispatch.issueId);
   if (!issue) return null;
@@ -221,7 +256,7 @@ const buildPayload = (
   db: Db,
   dispatch: DispatchRecord,
   dashboardUrl: string | undefined,
-): object | null => {
+): WebhookPayload | null => {
   if (dispatch.type === 'monitor.missed' || dispatch.type === 'monitor.recovered') {
     return buildMonitorPayload(db, dispatch, dashboardUrl);
   }
@@ -264,6 +299,110 @@ const buildPayload = (
       : {}),
     ...(dashboardUrl ? { url: `${dashboardUrl}/issues/${issue.id}` } : {}),
   };
+};
+
+// ---------------------------------------------------------------------------
+// Discord translation
+//
+// The payload above is uh-oh's own JSON contract, and every non-Discord
+// receiver keeps receiving those exact bytes. Discord is the exception it
+// cannot be: its webhook endpoint rejects any body without one of `content` /
+// `embeds` / `file` (400 invalid_form_body), so pointing a project's
+// webhook_url at a Discord webhook silently produced permanent failures — the
+// other half of the missed-alarm incident. For a Discord target only, the
+// payload is rendered as a one-line `{ content }` message.
+// ---------------------------------------------------------------------------
+
+/**
+ * Hosts Discord documents for webhooks. Matched EXACTLY, never by suffix, so
+ * lookalikes (`evil-discord.com`, `discord.com.attacker.net`) do not qualify
+ * and keep the standard payload.
+ */
+const DISCORD_WEBHOOK_HOSTS = new Set(['discord.com', 'discordapp.com']);
+const DISCORD_WEBHOOK_PATH_PREFIX = '/api/webhooks/';
+
+/** Discord's hard limit on `content`; we stay comfortably below it. */
+const DISCORD_CONTENT_LIMIT = 2000;
+const DISCORD_CONTENT_MAX = DISCORD_CONTENT_LIMIT - 100;
+/** Per-field clamp, so one enormous issue title can't push the link out. */
+const DISCORD_FIELD_MAX = 180;
+
+/** True when `raw` is a Discord webhook endpoint (host + `/api/webhooks/` path). */
+export const isDiscordWebhookUrl = (raw: string): boolean => {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
+  return (
+    DISCORD_WEBHOOK_HOSTS.has(url.hostname.toLowerCase()) &&
+    url.pathname.startsWith(DISCORD_WEBHOOK_PATH_PREFIX)
+  );
+};
+
+/** Collapse whitespace (the summary is one line) and clamp to `max` chars. */
+const field = (value: string, max = DISCORD_FIELD_MAX): string => {
+  const flat = value.replace(/\s+/g, ' ').trim();
+  return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
+};
+
+/** `1755777180000` → `2026-08-21 11:53 UTC`; null → `never`. */
+const utcMinute = (ms: number | null | undefined): string =>
+  ms === null || ms === undefined
+    ? 'never'
+    : `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+
+const plural = (n: number, one: string, many: string): string =>
+  `${String(n)} ${n === 1 ? one : many}`;
+
+/**
+ * Render a payload as a single-line Discord message body. Always returns a
+ * non-empty string under {@link DISCORD_CONTENT_LIMIT} characters — an empty
+ * `content` is itself a 400 from Discord.
+ */
+export const toDiscordContent = (payload: WebhookPayload): string => {
+  const project = field(payload.project.name);
+  const link = payload.url ? ` — ${payload.url}` : '';
+  const monitorName = field(payload.monitor?.name ?? payload.monitor?.slug ?? 'monitor');
+  const issueTitle = field(payload.issue?.title ?? 'issue');
+  const events = plural(payload.issue?.eventCount ?? 0, 'event', 'events');
+
+  let content: string;
+  switch (payload.type) {
+    case 'monitor.missed':
+      content =
+        `🔴 Monitor missed: **${monitorName}** (${project}) — ` +
+        `last check-in ${utcMinute(payload.monitor?.lastCheckInAt)}${link}`;
+      break;
+    case 'monitor.recovered':
+      content =
+        `🟢 Monitor recovered: **${monitorName}** (${project}) — ` +
+        `last check-in ${utcMinute(payload.monitor?.lastCheckInAt)}${link}`;
+      break;
+    case 'issue.new':
+      content = `💥 New issue: **${issueTitle}** (${project}) — ${events}${link}`;
+      break;
+    case 'issue.regressed':
+      content = `🔁 Issue regressed: **${issueTitle}** (${project}) — ${events}${link}`;
+      break;
+    case 'issue.spike':
+      content =
+        `📈 Issue spike: **${issueTitle}** (${project}) — ` +
+        `${String(payload.stats?.lastHour ?? 0)} in the last hour vs ` +
+        `${(payload.stats?.baselineHourly ?? 0).toFixed(1)}/h baseline${link}`;
+      break;
+    case 'fix.verified':
+      content =
+        `✅ Fix verified: **${issueTitle}** (${project})` +
+        `${payload.fixAttempt ? ` — ${field(payload.fixAttempt.prUrl)}` : ''}${link}`;
+      break;
+  }
+
+  return content.length <= DISCORD_CONTENT_MAX
+    ? content
+    : `${content.slice(0, DISCORD_CONTENT_MAX - 1)}…`;
 };
 
 const nextAttemptFor = (attempt: number, now: number): number | null =>
@@ -348,11 +487,17 @@ const dispatchOne = async (
     let statusCode: number | null = null;
     let errorMsg: string | null = null;
 
+    // Discord targets get a `{ content }` message; every other target keeps the
+    // uh-oh payload bytes exactly as built above (that shape is the contract).
+    const body = isDiscordWebhookUrl(dispatch.url)
+      ? JSON.stringify({ content: toDiscordContent(payload) })
+      : JSON.stringify(payload);
+
     try {
       const res = await fetchFn(dispatch.url, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify(payload),
+        body,
         signal: controller.signal,
         // Do not follow redirects — a 3xx to an internal host would bypass the
         // literal-IP guard above.

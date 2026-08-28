@@ -60,6 +60,13 @@ export type ServerDeps = {
    * fix-attempts) WITHOUT a JWT. Unset = feature off.
    */
   agentToken?: string | undefined;
+  /**
+   * Instance-level fallback webhook (UH_OH_DEFAULT_WEBHOOK_URL), used for any
+   * project that has no webhook_url of its own. Validated at startup; unset =
+   * feature off. Threaded into the two request-path enqueue sites (event ingest
+   * and monitor check-ins); the sweeps get it from their own deps in index.ts.
+   */
+  defaultWebhookUrl?: string | undefined;
 };
 
 const MAX_BODY_BYTES = 1_048_576;
@@ -102,7 +109,14 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   });
 
   const ingestRateLimiter = createRateLimiter({ capacity: 10, refillPerSec: 1 });
-  const ingest = deps.ingest ?? makeIngest({ db: deps.db, rateLimiter: ingestRateLimiter });
+  const ingest =
+    deps.ingest ??
+    makeIngest({
+      db: deps.db,
+      rateLimiter: ingestRateLimiter,
+      defaultWebhookUrl: deps.defaultWebhookUrl,
+      logger: app.log,
+    });
 
   // Check-in limiter: generous, keyed per (publicKey, slug). A healthy monitor
   // pings every few minutes, so a big bucket tolerates retries/bursts.
@@ -205,7 +219,7 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
 
   app.get('/healthz', () => ({ ok: true }));
 
-  registerCheckInRoute(app, deps.db, checkInLimiter);
+  registerCheckInRoute(app, deps.db, checkInLimiter, deps.defaultWebhookUrl);
   registerUsageIngestRoute(app, deps.db, usageLimiter);
 
   registerAuthRoutes(app, deps.db, deps.secret, deps.password, loginLimiter);

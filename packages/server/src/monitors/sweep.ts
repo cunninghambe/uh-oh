@@ -23,12 +23,21 @@ import {
 import { getProjectById } from '../db/repos/projects.js';
 import { enqueueDispatch } from '../db/repos/webhook-dispatches.js';
 import type { DnsLookupAll } from '../webhooks/dispatcher.js';
+import { resolveWebhookUrl, warnNoWebhookTarget } from '../webhooks/resolve-url.js';
 import { metrics } from '../metrics/registry.js';
 import { probeHttpMonitor } from './probe.js';
 
 export type SweepLogger = {
   error: (msg: string, meta?: object) => void;
   info?: (msg: string, meta?: object) => void;
+  warn?: (msg: string, meta?: object) => void;
+};
+
+/** Options for one sweep pass (mirrors {@link HttpProbeSweepDeps}'s shape). */
+export type MonitorSweepOptions = {
+  logger?: SweepLogger | undefined;
+  /** Instance-level fallback webhook (UH_OH_DEFAULT_WEBHOOK_URL). */
+  defaultWebhookUrl?: string | undefined;
 };
 
 export type MonitorSweepDeps = {
@@ -41,6 +50,11 @@ export type MonitorSweepDeps = {
   fetchFn?: typeof fetch;
   /** DNS resolver for the probe-time SSRF re-check; injectable for tests. */
   lookupFn?: DnsLookupAll;
+  /**
+   * Instance-level fallback webhook used when a project has no webhook_url of
+   * its own. Threaded from UH_OH_DEFAULT_WEBHOOK_URL at startup.
+   */
+  defaultWebhookUrl?: string | undefined;
 };
 
 export type MonitorSweepHandle = {
@@ -58,7 +72,8 @@ const defaultLookup: DnsLookupAll = (hostname) => dnsLookup(hostname, { all: tru
  * dispatch per project webhook. Each transition is its own transaction so one
  * bad row can't abort the whole sweep. Returns the number of new misses.
  */
-export const sweepMonitors = (db: Db, now: number, logger?: SweepLogger): number => {
+export const sweepMonitors = (db: Db, now: number, opts: MonitorSweepOptions = {}): number => {
+  const { logger, defaultWebhookUrl } = opts;
   let missed = 0;
   for (const m of listOkMonitors(db)) {
     if (!isOverdue(m, now)) continue;
@@ -66,12 +81,13 @@ export const sweepMonitors = (db: Db, now: number, logger?: SweepLogger): number
       db.transaction((tx) => {
         setMonitorStatus(tx, m.id, 'missed');
         const project = getProjectById(tx, m.projectId);
-        if (project?.webhookUrl) {
-          enqueueDispatch(
-            tx,
-            { monitorId: m.id, url: project.webhookUrl, type: 'monitor.missed' },
-            now,
-          );
+        const url = resolveWebhookUrl(project, defaultWebhookUrl);
+        if (url) {
+          enqueueDispatch(tx, { monitorId: m.id, url, type: 'monitor.missed' }, now);
+        } else if (project) {
+          // A miss with nowhere to send it is the exact failure this sweep
+          // exists to prevent — say so instead of dropping it silently.
+          warnNoWebhookTarget(logger, project, 'monitor.missed');
         }
       });
       // Count only after the transaction commits (mirrors ingest's metric timing).
@@ -91,6 +107,8 @@ export type HttpProbeSweepDeps = {
   fetchFn: typeof fetch;
   lookupFn: DnsLookupAll;
   logger?: SweepLogger;
+  /** Instance-level fallback webhook (UH_OH_DEFAULT_WEBHOOK_URL). */
+  defaultWebhookUrl?: string | undefined;
 };
 
 /**
@@ -120,17 +138,13 @@ export const sweepHttpProbes = async (
             now,
           );
           if (transition) {
+            const type = transition === 'missed' ? 'monitor.missed' : 'monitor.recovered';
             const project = getProjectById(tx, m.projectId);
-            if (project?.webhookUrl) {
-              enqueueDispatch(
-                tx,
-                {
-                  monitorId: m.id,
-                  url: project.webhookUrl,
-                  type: transition === 'missed' ? 'monitor.missed' : 'monitor.recovered',
-                },
-                now,
-              );
+            const url = resolveWebhookUrl(project, deps.defaultWebhookUrl);
+            if (url) {
+              enqueueDispatch(tx, { monitorId: m.id, url, type }, now);
+            } else if (project) {
+              warnNoWebhookTarget(deps.logger, project, type);
             }
           }
         });
@@ -158,10 +172,16 @@ export const startMonitorSweep = (deps: MonitorSweepDeps): MonitorSweepHandle =>
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
+  const sweepOptions: MonitorSweepOptions = {
+    logger: deps.logger,
+    defaultWebhookUrl: deps.defaultWebhookUrl,
+  };
+
   const runProbes = (now: number): Promise<number> =>
     sweepHttpProbes(deps.db, now, {
       fetchFn,
       lookupFn,
+      defaultWebhookUrl: deps.defaultWebhookUrl,
       ...(deps.logger ? { logger: deps.logger } : {}),
     });
 
@@ -169,7 +189,7 @@ export const startMonitorSweep = (deps: MonitorSweepDeps): MonitorSweepHandle =>
     if (stopped) return;
     const now = nowFn();
     try {
-      sweepMonitors(deps.db, now, deps.logger);
+      sweepMonitors(deps.db, now, sweepOptions);
       // http probes await network I/O; run them in the background so the tick
       // stays responsive. They must never reject the tick or silently die.
       void runProbes(now).catch((err: unknown) => {
@@ -198,7 +218,7 @@ export const startMonitorSweep = (deps: MonitorSweepDeps): MonitorSweepHandle =>
       stopped = true;
       if (timer !== undefined) clearTimeout(timer);
     },
-    sweepOnce: (now?: number) => sweepMonitors(deps.db, now ?? nowFn(), deps.logger),
+    sweepOnce: (now?: number) => sweepMonitors(deps.db, now ?? nowFn(), sweepOptions),
     probeOnce: (now?: number) => runProbes(now ?? nowFn()),
   };
 };
