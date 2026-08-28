@@ -16,6 +16,7 @@ import {
 import { getIssue } from '../db/repos/issues.js';
 import { getProjectById } from '../db/repos/projects.js';
 import { enqueueDispatch } from '../db/repos/webhook-dispatches.js';
+import { resolveWebhookUrl, warnNoWebhookTarget } from '../webhooks/resolve-url.js';
 import { metrics } from '../metrics/registry.js';
 
 const DAY_MS = 86_400_000;
@@ -43,6 +44,14 @@ export const resolveFixVerifyDays = (raw: string | undefined): number => {
 export type SweepLogger = {
   error: (msg: string, meta?: object) => void;
   info?: (msg: string, meta?: object) => void;
+  warn?: (msg: string, meta?: object) => void;
+};
+
+/** Options for one sweep pass. */
+export type FixVerifySweepOptions = {
+  logger?: SweepLogger | undefined;
+  /** Instance-level fallback webhook (UH_OH_DEFAULT_WEBHOOK_URL). */
+  defaultWebhookUrl?: string | undefined;
 };
 
 export type FixVerifySweepDeps = {
@@ -53,6 +62,11 @@ export type FixVerifySweepDeps = {
   /** Sweep cadence (default 1 hour). */
   intervalMs?: number;
   logger?: SweepLogger;
+  /**
+   * Instance-level fallback webhook used when a project has no webhook_url of
+   * its own. Threaded from UH_OH_DEFAULT_WEBHOOK_URL at startup.
+   */
+  defaultWebhookUrl?: string | undefined;
 };
 
 export type FixVerifySweepHandle = {
@@ -71,8 +85,9 @@ export const sweepFixVerification = (
   db: Db,
   now: number,
   verifyDays: number,
-  logger?: SweepLogger,
+  opts: FixVerifySweepOptions = {},
 ): number => {
+  const { logger, defaultWebhookUrl } = opts;
   const deployedBefore = now - verifyDays * DAY_MS;
   let verified = 0;
   for (const attempt of listDeployedAttemptsToVerify(db, deployedBefore)) {
@@ -91,12 +106,11 @@ export const sweepFixVerification = (
         );
         const issue = getIssue(tx, attempt.issueId);
         const project = issue ? getProjectById(tx, issue.projectId) : null;
-        if (project?.webhookUrl) {
-          enqueueDispatch(
-            tx,
-            { issueId: attempt.issueId, url: project.webhookUrl, type: 'fix.verified' },
-            now,
-          );
+        const url = resolveWebhookUrl(project, defaultWebhookUrl);
+        if (url) {
+          enqueueDispatch(tx, { issueId: attempt.issueId, url, type: 'fix.verified' }, now);
+        } else if (project) {
+          warnNoWebhookTarget(logger, project, 'fix.verified');
         }
       });
       metrics.fixVerified.inc();
@@ -118,10 +132,15 @@ export const startFixVerifySweep = (deps: FixVerifySweepDeps): FixVerifySweepHan
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
+  const sweepOptions: FixVerifySweepOptions = {
+    logger: deps.logger,
+    defaultWebhookUrl: deps.defaultWebhookUrl,
+  };
+
   const tick = (): void => {
     if (stopped) return;
     try {
-      sweepFixVerification(deps.db, nowFn(), verifyDays, deps.logger);
+      sweepFixVerification(deps.db, nowFn(), verifyDays, sweepOptions);
     } catch (err) {
       deps.logger?.error('fix verify sweep iteration failed', {
         error: err instanceof Error ? err.message : String(err),
@@ -143,6 +162,6 @@ export const startFixVerifySweep = (deps: FixVerifySweepDeps): FixVerifySweepHan
       if (timer !== undefined) clearTimeout(timer);
     },
     sweepOnce: (now?: number) =>
-      sweepFixVerification(deps.db, now ?? nowFn(), verifyDays, deps.logger),
+      sweepFixVerification(deps.db, now ?? nowFn(), verifyDays, sweepOptions),
   };
 };

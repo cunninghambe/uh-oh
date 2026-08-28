@@ -138,6 +138,48 @@ describe('sweepHttpProbes — cap, SSRF, and metric', () => {
     });
   });
 
+  it('falls back to the instance webhook, or warns when there is none', async () => {
+    // A project with no webhook_url of its own.
+    const hookless = createProject(db, { name: 'NoHook' });
+    const m = createMonitor(db, {
+      projectId: hookless.id,
+      slug: 'ops',
+      intervalMinutes: 1,
+      graceMinutes: 5,
+      kind: 'http',
+      url: 'https://svc.example/health',
+      timeoutMs: 5000,
+      now: NOW,
+    });
+    const fetchFn = vi.fn(() =>
+      Promise.resolve({ status: 500 } as Response),
+    ) as unknown as typeof fetch;
+    const warn = vi.fn();
+    const base = { fetchFn, lookupFn: publicLookup };
+
+    // Two consecutive failures flip it missed — with no target anywhere, that
+    // transition must still be audible.
+    await sweepHttpProbes(db, NOW, { ...base, logger: { error: vi.fn(), warn } });
+    await sweepHttpProbes(db, NOW + 1 * MIN, { ...base, logger: { error: vi.fn(), warn } });
+    expect(getMonitor(db, m.id)?.status).toBe('missed');
+    expect(dispatchesOfType('monitor.missed', m.id)).toHaveLength(0);
+    expect(warn).toHaveBeenCalledOnce();
+    expect(String(warn.mock.calls[0]?.[0])).toContain('monitor.missed');
+
+    // Recovery with a default webhook configured goes to the fallback.
+    const okFetch = vi.fn(() =>
+      Promise.resolve({ status: 200 } as Response),
+    ) as unknown as typeof fetch;
+    await sweepHttpProbes(db, NOW + 2 * MIN, {
+      fetchFn: okFetch,
+      lookupFn: publicLookup,
+      defaultWebhookUrl: 'https://hooks.example/instance',
+    });
+    const recovered = dispatchesOfType('monitor.recovered', m.id);
+    expect(recovered).toHaveLength(1);
+    expect(recovered[0]?.url).toBe('https://hooks.example/instance');
+  });
+
   it('increments uh_oh_uptime_probe_failures_total once per failed probe', async () => {
     mkHttp('a');
     mkHttp('b');

@@ -1,7 +1,7 @@
 // CONTRACT S (§23) — the spike sweep. Fires issue.spike exactly once per episode
 // against a quiet baseline, never for steady-state noise, and clears silently.
 
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { Db } from '../db/index.js';
 import { makeTestDb } from '../db/test-utils.js';
@@ -112,6 +112,61 @@ describe('sweepSpikes', () => {
     setIssueStatus(db, issue.id, 'resolved');
     expect(sweepSpikes(db, NOW)).toBe(0);
     expect(getIssue(db, issue.id)?.spikeActive).toBe(false);
+  });
+});
+
+describe('sweepSpikes — instance-level fallback webhook', () => {
+  const DEFAULT_HOOK = 'https://hooks.example/instance';
+
+  /** A spiking issue on a project that has no webhook_url of its own. */
+  const seedHooklessSpike = () => {
+    const p = createProject(db, { name: 'NoHook' });
+    const { issue } = upsertIssue(db, {
+      projectId: p.id,
+      fingerprint: `fp-nohook-${fpN++}`,
+      title: 'TypeError: boom',
+      ts: NOW,
+      platform: 'web',
+    });
+    for (let i = 0; i < 12; i++) {
+      insertEvent(db, {
+        projectId: p.id,
+        issueId: issue.id,
+        releaseId: null,
+        fingerprint: 'fp',
+        level: 'error',
+        platform: 'web',
+        payload: '{}',
+        receivedAt: NOW - 30 * 60_000,
+        deviceInfo: '{}',
+        userInfo: null,
+      });
+    }
+    return issue;
+  };
+
+  it('dispatches to the default webhook when the project has none', () => {
+    const issue = seedHooklessSpike();
+    expect(sweepSpikes(db, NOW, { defaultWebhookUrl: DEFAULT_HOOK })).toBe(1);
+
+    const fired = spikeDispatches(NOW + 1).filter((d) => d.issueId === issue.id);
+    expect(fired).toHaveLength(1);
+    expect(fired[0]?.url).toBe(DEFAULT_HOOK);
+  });
+
+  it('warns when the spike has nowhere to go', () => {
+    const warn = vi.fn();
+    const issue = seedHooklessSpike();
+
+    expect(sweepSpikes(db, NOW, { logger: { error: vi.fn(), warn } })).toBe(1);
+    expect(getIssue(db, issue.id)?.spikeActive).toBe(true);
+    expect(spikeDispatches(NOW + 1).filter((d) => d.issueId === issue.id)).toEqual([]);
+
+    expect(warn).toHaveBeenCalledOnce();
+    const msg = String(warn.mock.calls[0]?.[0]);
+    expect(msg).toContain('issue.spike');
+    expect(msg).toContain('NoHook');
+    expect(msg).toContain('UH_OH_DEFAULT_WEBHOOK_URL');
   });
 });
 

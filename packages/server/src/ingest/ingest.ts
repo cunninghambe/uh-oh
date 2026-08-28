@@ -8,6 +8,11 @@ import { getAliasTarget } from '../db/repos/fingerprint-aliases.js';
 import { getProjectByPublicKey } from '../db/repos/projects.js';
 import { upsertRelease } from '../db/repos/releases.js';
 import { enqueueDispatch } from '../db/repos/webhook-dispatches.js';
+import {
+  resolveWebhookUrl,
+  warnNoWebhookTarget,
+  type WebhookTargetLogger,
+} from '../webhooks/resolve-url.js';
 import { writeSystemAnnotation } from '../db/repos/annotations.js';
 import {
   applyFixAttemptTransition,
@@ -28,6 +33,13 @@ export type IngestDeps = {
   db: Db;
   rateLimiter: RateLimiter;
   now?: () => number;
+  /**
+   * Instance-level fallback webhook used when a project has no webhook_url of
+   * its own. Threaded from UH_OH_DEFAULT_WEBHOOK_URL at startup.
+   */
+  defaultWebhookUrl?: string | undefined;
+  /** Used to warn when an alert-worthy transition has nowhere to go. */
+  logger?: WebhookTargetLogger | undefined;
 };
 
 const isoToMs = (iso: string): number => {
@@ -129,8 +141,11 @@ export const ingest = (
       }
     }
 
-    if (project.webhookUrl) {
-      if (regressed) {
+    // Project webhook first, then the instance-level fallback; null means the
+    // alert has nowhere to go (warned about below, never dropped silently).
+    const webhookUrl = resolveWebhookUrl(project, deps.defaultWebhookUrl);
+    if (regressed) {
+      if (webhookUrl) {
         // The resolved -> regressed transition dispatches immediately, bypassing
         // the dedupe window for this one dispatch. last_alerted_at is updated so
         // subsequent events on the now-regressed issue respect the normal window.
@@ -139,24 +154,34 @@ export const ingest = (
           {
             issueId: issue.id,
             eventId: event.id,
-            url: project.webhookUrl,
+            url: webhookUrl,
             type: 'issue.regressed',
           },
           now,
         );
         markIssueAlerted(tx, issue.id, now);
       } else {
-        const shouldFire =
-          isNew ||
-          issue.lastAlertedAt === null ||
-          now - issue.lastAlertedAt > project.alertDedupeMinutes * 60_000;
-        if (shouldFire) {
+        warnNoWebhookTarget(deps.logger, project, 'issue.regressed');
+      }
+    } else {
+      const shouldFire =
+        isNew ||
+        issue.lastAlertedAt === null ||
+        now - issue.lastAlertedAt > project.alertDedupeMinutes * 60_000;
+      if (shouldFire) {
+        if (webhookUrl) {
           enqueueDispatch(
             tx,
-            { issueId: issue.id, eventId: event.id, url: project.webhookUrl, type: 'issue.new' },
+            { issueId: issue.id, eventId: event.id, url: webhookUrl, type: 'issue.new' },
             now,
           );
           markIssueAlerted(tx, issue.id, now);
+        } else if (isNew) {
+          // Only the genuine new-issue transition warns. With no target we also
+          // never set last_alerted_at (nothing was alerted), so `shouldFire`
+          // stays true for every later event on the issue — warning on those too
+          // would turn the hottest path in the server into a log firehose.
+          warnNoWebhookTarget(deps.logger, project, 'issue.new');
         }
       }
     }

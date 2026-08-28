@@ -9,6 +9,7 @@ import { agentTokenFromEnv } from './auth/agent-token.js';
 import { cleanupExpiredSessions } from './db/repos/sessions.js';
 import { pruneOldData, resolveRetentionDays } from './db/repos/retention.js';
 import { startDispatcher } from './webhooks/dispatcher.js';
+import { resolveDefaultWebhookUrl } from './webhooks/resolve-url.js';
 import { startMonitorSweep } from './monitors/sweep.js';
 import { startSpikeSweep } from './spikes/sweep.js';
 import { resolveFixVerifyDays, startFixVerifySweep } from './fixes/verify-sweep.js';
@@ -90,6 +91,16 @@ if (isMain) {
   const ipRateBurst = Number(process.env['UH_OH_IP_RATE_BURST'] ?? 100);
   const retentionDays = resolveRetentionDays(process.env['UH_OH_RETENTION_DAYS']);
   const dashboardUrl = process.env['UH_OH_DASHBOARD_URL'];
+  // Instance-level fallback webhook: read and validated ONCE here, then threaded
+  // (like dashboardUrl) to every alert enqueue site. Deliberately NOT fatal when
+  // invalid — a typo in an optional alert destination must not take the whole
+  // collector down; log it loudly and boot without the fallback.
+  const defaultWebhookUrl = resolveDefaultWebhookUrl(
+    process.env['UH_OH_DEFAULT_WEBHOOK_URL'],
+    (message) => {
+      console.error(message);
+    },
+  );
 
   const { db, close: closeDb } = openDb(dbPath);
   applyMigrations(db);
@@ -111,18 +122,20 @@ if (isMain) {
     symbolToken,
     readToken,
     agentToken,
+    defaultWebhookUrl,
   });
   app.log.level = logLevel;
   const dispatcherHandle = startDispatcher({ db, logger: app.log, dashboardUrl });
   // Dead-man's-switch sweep: flip overdue monitors to 'missed' every 60s.
-  const monitorSweepHandle = startMonitorSweep({ db, logger: app.log });
+  const monitorSweepHandle = startMonitorSweep({ db, logger: app.log, defaultWebhookUrl });
   // Spike sweep (§23): flag issues whose last-hour volume dwarfs baseline every 5m.
-  const spikeSweepHandle = startSpikeSweep({ db, logger: app.log });
+  const spikeSweepHandle = startSpikeSweep({ db, logger: app.log, defaultWebhookUrl });
   // Fix-verification sweep (§23): confirm deployed fixes that held, hourly.
   const fixVerifySweepHandle = startFixVerifySweep({
     db,
     logger: app.log,
     verifyDays: fixVerifyDays,
+    defaultWebhookUrl,
   });
 
   const runRetention = () => {
