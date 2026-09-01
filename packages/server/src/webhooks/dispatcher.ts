@@ -16,6 +16,7 @@ import type { SpikeStats } from '../db/repos/spikes.js';
 import type { FixAttemptView } from '../db/repos/fix-attempts.js';
 import type { EventRow } from '../db/schema.js';
 import { metrics } from '../metrics/registry.js';
+import { DEFAULT_ALERT_LOCAL_TZ, formatAlertMinute } from './alert-time.js';
 import { isBlockedIp, isIpLiteralHost, validateWebhookUrl } from './url-guard.js';
 
 /** Fields of a webhook_dispatches row the dispatcher reads. */
@@ -61,6 +62,11 @@ export type DispatcherDeps = {
    * the webhook payload (never emit a dead relative link).
    */
   dashboardUrl?: string | undefined;
+  /**
+   * IANA zone for the local half of alert timestamps (`UH_OH_ALERT_LOCAL_TZ`,
+   * validated at boot). Unset → {@link DEFAULT_ALERT_LOCAL_TZ}.
+   */
+  alertLocalTz?: string | undefined;
 };
 
 /** Reject a promise if it does not settle within `ms`. */
@@ -348,11 +354,9 @@ const field = (value: string, max = DISCORD_FIELD_MAX): string => {
   return flat.length <= max ? flat : `${flat.slice(0, max - 1)}…`;
 };
 
-/** `1755777180000` → `2026-08-21 11:53 UTC`; null → `never`. */
-const utcMinute = (ms: number | null | undefined): string =>
-  ms === null || ms === undefined
-    ? 'never'
-    : `${new Date(ms).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+/** `1755777180000` → `2025-08-21 11:53 UTC (07:53 EDT)`; null → `never`. */
+const checkInTime = (ms: number | null | undefined, localTz: string): string =>
+  ms === null || ms === undefined ? 'never' : formatAlertMinute(ms, localTz);
 
 const plural = (n: number, one: string, many: string): string =>
   `${String(n)} ${n === 1 ? one : many}`;
@@ -360,9 +364,13 @@ const plural = (n: number, one: string, many: string): string =>
 /**
  * Render a payload as a single-line Discord message body. Always returns a
  * non-empty string under {@link DISCORD_CONTENT_LIMIT} characters — an empty
- * `content` is itself a 400 from Discord.
+ * `content` is itself a 400 from Discord. Timestamps render as UTC followed by
+ * the time in `localTz` (see alert-time.ts).
  */
-export const toDiscordContent = (payload: WebhookPayload): string => {
+export const toDiscordContent = (
+  payload: WebhookPayload,
+  localTz: string = DEFAULT_ALERT_LOCAL_TZ,
+): string => {
   const project = field(payload.project.name);
   const link = payload.url ? ` — ${payload.url}` : '';
   const monitorName = field(payload.monitor?.name ?? payload.monitor?.slug ?? 'monitor');
@@ -374,12 +382,12 @@ export const toDiscordContent = (payload: WebhookPayload): string => {
     case 'monitor.missed':
       content =
         `🔴 Monitor missed: **${monitorName}** (${project}) — ` +
-        `last check-in ${utcMinute(payload.monitor?.lastCheckInAt)}${link}`;
+        `last check-in ${checkInTime(payload.monitor?.lastCheckInAt, localTz)}${link}`;
       break;
     case 'monitor.recovered':
       content =
         `🟢 Monitor recovered: **${monitorName}** (${project}) — ` +
-        `last check-in ${utcMinute(payload.monitor?.lastCheckInAt)}${link}`;
+        `last check-in ${checkInTime(payload.monitor?.lastCheckInAt, localTz)}${link}`;
       break;
     case 'issue.new':
       content = `💥 New issue: **${issueTitle}** (${project}) — ${events}${link}`;
@@ -419,6 +427,7 @@ const dispatchOne = async (
   lookupFn: DnsLookupAll,
   now: number,
   dashboardUrl: string | undefined,
+  alertLocalTz: string,
   logger?: DispatcherLogger,
 ): Promise<void> => {
   try {
@@ -490,7 +499,7 @@ const dispatchOne = async (
     // Discord targets get a `{ content }` message; every other target keeps the
     // uh-oh payload bytes exactly as built above (that shape is the contract).
     const body = isDiscordWebhookUrl(dispatch.url)
-      ? JSON.stringify({ content: toDiscordContent(payload) })
+      ? JSON.stringify({ content: toDiscordContent(payload, alertLocalTz) })
       : JSON.stringify(payload);
 
     try {
@@ -564,6 +573,7 @@ export const startDispatcher = (deps: DispatcherDeps): DispatcherHandle => {
   const nowFn = deps.now ?? (() => Date.now());
   const dashboardUrl =
     deps.dashboardUrl && deps.dashboardUrl.length > 0 ? deps.dashboardUrl : undefined;
+  const alertLocalTz = deps.alertLocalTz ?? DEFAULT_ALERT_LOCAL_TZ;
 
   if (!dashboardUrl) {
     deps.logger?.warn?.('UH_OH_DASHBOARD_URL is unset; webhook payloads will omit the "url" field');
@@ -586,6 +596,7 @@ export const startDispatcher = (deps: DispatcherDeps): DispatcherHandle => {
           lookupFn,
           now,
           dashboardUrl,
+          alertLocalTz,
           deps.logger,
         ).finally(() => {
           inFlight.delete(p);

@@ -10,6 +10,7 @@ import { cleanupExpiredSessions } from './db/repos/sessions.js';
 import { pruneOldData, resolveRetentionDays } from './db/repos/retention.js';
 import { startDispatcher } from './webhooks/dispatcher.js';
 import { resolveDefaultWebhookUrl } from './webhooks/resolve-url.js';
+import { resolveAlertLocalTz } from './webhooks/alert-time.js';
 import { startMonitorSweep } from './monitors/sweep.js';
 import { startSpikeSweep } from './spikes/sweep.js';
 import { resolveFixVerifyDays, startFixVerifySweep } from './fixes/verify-sweep.js';
@@ -101,6 +102,13 @@ if (isMain) {
       console.error(message);
     },
   );
+  // Local half of alert timestamps: validated ONCE here for the same reason —
+  // a typo in a display preference must not take the collector down, and an
+  // unknown zone would otherwise throw inside every Discord dispatch instead of
+  // once at boot.
+  const alertLocalTz = resolveAlertLocalTz(process.env['UH_OH_ALERT_LOCAL_TZ'], (message) => {
+    console.error(message);
+  });
 
   const { db, close: closeDb } = openDb(dbPath);
   applyMigrations(db);
@@ -125,7 +133,7 @@ if (isMain) {
     defaultWebhookUrl,
   });
   app.log.level = logLevel;
-  const dispatcherHandle = startDispatcher({ db, logger: app.log, dashboardUrl });
+  const dispatcherHandle = startDispatcher({ db, logger: app.log, dashboardUrl, alertLocalTz });
   // Dead-man's-switch sweep: flip overdue monitors to 'missed' every 60s.
   const monitorSweepHandle = startMonitorSweep({ db, logger: app.log, defaultWebhookUrl });
   // Spike sweep (§23): flag issues whose last-hour volume dwarfs baseline every 5m.
