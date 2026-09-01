@@ -83,14 +83,14 @@ describe('toDiscordContent', () => {
   it('renders monitor.missed as the red one-liner with the last check-in', () => {
     expect(toDiscordContent(monitorPayload('monitor.missed'))).toBe(
       '🔴 Monitor missed: **cluster-rebuild** (Whitespace) — ' +
-        `last check-in 2026-08-21 11:53 UTC — ${DASHBOARD}/monitors/m_1`,
+        `last check-in 2026-08-21 11:53 UTC (07:53 EDT) — ${DASHBOARD}/monitors/m_1`,
     );
   });
 
   it('renders monitor.recovered in green', () => {
     expect(toDiscordContent(monitorPayload('monitor.recovered'))).toBe(
       '🟢 Monitor recovered: **cluster-rebuild** (Whitespace) — ' +
-        `last check-in 2026-08-21 11:53 UTC — ${DASHBOARD}/monitors/m_1`,
+        `last check-in 2026-08-21 11:53 UTC (07:53 EDT) — ${DASHBOARD}/monitors/m_1`,
     );
   });
 
@@ -102,6 +102,15 @@ describe('toDiscordContent', () => {
     });
     expect(content).toContain('**Cluster rebuild**');
     expect(content).toContain('last check-in never');
+  });
+
+  it('renders the check-in in the given local zone', () => {
+    expect(toDiscordContent(monitorPayload('monitor.missed'), 'Asia/Kolkata')).toContain(
+      'last check-in 2026-08-21 11:53 UTC (17:23 GMT+5:30) — ',
+    );
+    expect(toDiscordContent(monitorPayload('monitor.missed'), 'UTC')).toContain(
+      'last check-in 2026-08-21 11:53 UTC — ',
+    );
   });
 
   it('renders issue.new with the title, project and event count', () => {
@@ -201,7 +210,7 @@ describe('toDiscordContent', () => {
     });
     expect(content).toContain(DASHBOARD);
     expect(noLink).not.toContain(DASHBOARD);
-    expect(noLink.endsWith('UTC')).toBe(true);
+    expect(noLink.endsWith('UTC (07:53 EDT)')).toBe(true);
   });
 
   it('stays one line and well under Discord’s 2000-char cap for a monstrous title', () => {
@@ -248,7 +257,7 @@ describe('dispatcher delivery', () => {
   afterEach(() => close());
 
   /** Run the dispatcher once, returning the RAW request bodies it POSTed. */
-  const runOnce = async (): Promise<{ url: string; body: string }[]> => {
+  const runOnce = async (alertLocalTz?: string): Promise<{ url: string; body: string }[]> => {
     const calls: { url: string; body: string }[] = [];
     const fetchFn = vi.fn((url: string, init?: { body?: string }) => {
       calls.push({ url, body: init?.body ?? '' });
@@ -260,6 +269,7 @@ describe('dispatcher delivery', () => {
       now: () => NOW,
       pollIntervalMs: 10,
       dashboardUrl: DASHBOARD,
+      alertLocalTz,
     });
     await new Promise<void>((r) => setTimeout(r, 80));
     await handle.stop();
@@ -275,7 +285,18 @@ describe('dispatcher delivery', () => {
     expect(JSON.parse(calls[0]?.body ?? '')).toEqual({
       content:
         '🔴 Monitor missed: **cluster-rebuild** (Whitespace) — ' +
-        `last check-in 2026-08-21 11:53 UTC — ${DASHBOARD}/monitors/${monitorId}`,
+        `last check-in 2026-08-21 11:53 UTC (07:53 EDT) — ${DASHBOARD}/monitors/${monitorId}`,
+    });
+  });
+
+  it('renders the check-in in the zone the dispatcher was started with', async () => {
+    enqueueDispatch(db, { monitorId, url: DISCORD_URL, type: 'monitor.missed' }, NOW);
+    const calls = await runOnce('Asia/Kolkata');
+
+    expect(JSON.parse(calls[0]?.body ?? '')).toEqual({
+      content:
+        '🔴 Monitor missed: **cluster-rebuild** (Whitespace) — ' +
+        `last check-in 2026-08-21 11:53 UTC (17:23 GMT+5:30) — ${DASHBOARD}/monitors/${monitorId}`,
     });
   });
 
