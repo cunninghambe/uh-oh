@@ -77,7 +77,7 @@ v0.1 is feature-complete enough to replace Sentry for one developer's RN Android
 - Structured logs (pino) — JSON, levels, request IDs
 - `/metrics` endpoint (Prometheus text format) — `uh_oh_events_ingested_total`, `uh_oh_issues_new_total`, `uh_oh_webhook_failures_total`, `uh_oh_request_duration_seconds` histogram; nginx restricts `/metrics` to localhost
 - Security headers on server responses; CSP is owned by nginx, which serves the dashboard static files (the server sets no CSP)
-- CORS: ingest open (`Access-Control-Allow-Origin: *` + OPTIONS preflight on `/ingest/:publicKey` only); `/api/*` emits no CORS headers (same-origin only)
+- CORS: ingest open on `/ingest/*` only (one OPTIONS preflight route; every ingest response, errors included, carries the headers). A well-formed request `Origin` is echoed with `Access-Control-Allow-Credentials: true` and `Vary: Origin`, because `sendBeacon` is credentialed and a credentialed preflight rejects `*`; no Origin or an opaque/malformed one gets `*`. Safe because nothing under `/ingest/*` reads cookies. `/api/*` emits no CORS headers (same-origin only)
 
 ### Out of scope (v0.1)
 
@@ -733,5 +733,12 @@ Every browser copy of the client up to 0.6.0 delivered nothing: production's acc
 - **Version.** `SDK_VERSION`, `packages/js/package.json` and the vendor script's `CLIENT_VERSION` move together (test-enforced), so a fixed copy is recognisable by the `sdk.version` it stamps.
 
 **RN SDK (`packages/sdk`).** The same JSON-safety guard (`json-safe.ts`; before, `Spool._fitEntry`'s `JSON.stringify` threw and the crash was silently dropped, every crash while a poisoned breadcrumb stayed in the buffer). Envelopes are clamped to the wire schema (exception type 256, value 4096, 500 frames, filename 1024, breadcrumb category 1-64 and message 1024, release parts non-empty and at most 64): the server 400s anything over a cap and the spool drops a 4xx as permanent, so a long message or a stack overflow used to cost the whole report.
+
+**Server (`packages/server`, browser ingest).** Each item has a test that failed against 90d24af (`ingest/browser-transport.test.ts`, `hardening/ip-rate-limit.test.ts`).
+
+- **Credentialed CORS on `/ingest/*`** (`ingest/browser-transport.ts`, see §2 Hardening). An `onRequest` hook ahead of the per-IP limiter sets the headers, so 400, 401, 413 and 429 answers are readable too; one `OPTIONS /ingest/*` route replaces the two per-route handlers. Once deployed, the `application/json` beacons of every already-vendored client up to 0.6.0 pass their preflight without re-vendoring.
+- **Event ingest reads `text/plain` JSON**, as usage already did, so a 0.6.1 crash beacon lands. Both routes share one parser built on Fastify's own JSON parser, so a `text/plain` body meets the same prototype-poisoning rule as `application/json` (a bare `JSON.parse` let `__proto__` keys through). Malformed or empty text is a clean 400 (`invalid_envelope` / `invalid_body`), never a 500.
+- **Check-ins accept any content type.** The body is ignored by contract, but Fastify's default parsers answered 415 to a form-encoded POST (`curl -d`, `wget --post-data`, Apps Script's default) and 400 to an empty `application/json` one. The route now discards any body; the 1 MiB cap still answers 413.
+- **Per-IP limiter.** Defaults are named constants (600/min, burst 100; `infra/README.md` and `setup-server.sh` said 120/20). An invalid `UH_OH_IP_RATE_PER_MIN`/`_BURST` (a typo made it `NaN`, which denies every request after each IP's first) is logged and falls back to the default. The `/healthz` and `/metrics` skip list ignores the query string (`/healthz?probe=1` used to be rate limited).
 
 **Distribution.** `js-dist` still carries 0.5.0 (`35ec007`, built from `66225c1`); `sdk-dist` was built 2026-05-19, before the July crash-safety hardening. Republish with `node scripts/build-js-dist.mjs` / `build-sdk-dist.mjs` from a clean `main` after merge (both force-push), then refresh lockfiles in the git-dependency consumers and re-run `scripts/vendor-js-client.mjs` and `scripts/vendor-sourcemap-uploader.mjs` in the vendoring consumers.

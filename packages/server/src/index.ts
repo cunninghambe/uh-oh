@@ -14,6 +14,11 @@ import { resolveAlertLocalTz } from './webhooks/alert-time.js';
 import { startMonitorSweep } from './monitors/sweep.js';
 import { startSpikeSweep } from './spikes/sweep.js';
 import { resolveFixVerifyDays, startFixVerifySweep } from './fixes/verify-sweep.js';
+import {
+  DEFAULT_IP_RATE_BURST,
+  DEFAULT_IP_RATE_PER_MINUTE,
+  resolveIpRateSetting,
+} from './hardening/ip-rate-limit.js';
 
 export { applyMigrations, openDb } from './db/index.js';
 export { buildServer } from './server.js';
@@ -88,8 +93,21 @@ if (isMain) {
   const port = Number(process.env['UH_OH_PORT'] ?? 3300);
   const host = process.env['UH_OH_HOST'] ?? '0.0.0.0';
   const logLevel = process.env['UH_OH_LOG_LEVEL'] ?? 'info';
-  const ipRatePerMinute = Number(process.env['UH_OH_IP_RATE_PER_MIN'] ?? 600);
-  const ipRateBurst = Number(process.env['UH_OH_IP_RATE_BURST'] ?? 100);
+  const logEnvError = (message: string) => {
+    console.error(message);
+  };
+  const ipRatePerMinute = resolveIpRateSetting(
+    'UH_OH_IP_RATE_PER_MIN',
+    process.env['UH_OH_IP_RATE_PER_MIN'],
+    DEFAULT_IP_RATE_PER_MINUTE,
+    logEnvError,
+  );
+  const ipRateBurst = resolveIpRateSetting(
+    'UH_OH_IP_RATE_BURST',
+    process.env['UH_OH_IP_RATE_BURST'],
+    DEFAULT_IP_RATE_BURST,
+    logEnvError,
+  );
   const retentionDays = resolveRetentionDays(process.env['UH_OH_RETENTION_DAYS']);
   const dashboardUrl = process.env['UH_OH_DASHBOARD_URL'];
   // Instance-level fallback webhook: read and validated ONCE here, then threaded

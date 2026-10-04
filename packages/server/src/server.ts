@@ -14,7 +14,16 @@ import { makeIngest } from './ingest/ingest.js';
 import { registerCheckInRoute } from './ingest/check-in.js';
 import { registerUsageIngestRoute } from './ingest/usage.js';
 import { createRateLimiter } from './ingest/rate-limit.js';
-import { createIpRateLimiter } from './hardening/ip-rate-limit.js';
+import {
+  addTextPlainJsonParser,
+  ingestCorsHook,
+  registerIngestPreflight,
+} from './ingest/browser-transport.js';
+import {
+  createIpRateLimiter,
+  DEFAULT_IP_RATE_BURST,
+  DEFAULT_IP_RATE_PER_MINUTE,
+} from './hardening/ip-rate-limit.js';
 import { securityHeadersHook } from './hardening/security-headers.js';
 import { registerMetricsRoute } from './metrics/route.js';
 import { metrics } from './metrics/registry.js';
@@ -73,6 +82,12 @@ const MAX_BODY_BYTES = 1_048_576;
 const DEFAULT_MAX_SYMBOL_BYTES = 50 * 1024 * 1024;
 const SKIP_IP_RATE_LIMIT = new Set(['/healthz', '/metrics']);
 
+/** Request path without the query string (`/healthz?x=1` -> `/healthz`). */
+const pathOf = (url: string): string => {
+  const q = url.indexOf('?');
+  return q === -1 ? url : url.slice(0, q);
+};
+
 export const buildServer = (deps: ServerDeps): FastifyInstance => {
   if (!deps.secret || deps.secret.length === 0) {
     throw new Error('buildServer requires a non-empty JWT secret');
@@ -127,8 +142,8 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
   const usageLimiter = createRateLimiter({ capacity: 200, refillPerSec: 20 });
 
   const ipLimiter = createIpRateLimiter({
-    perMinute: deps.ipRatePerMinute ?? 600,
-    burst: deps.ipRateBurst ?? 100,
+    perMinute: deps.ipRatePerMinute ?? DEFAULT_IP_RATE_PER_MINUTE,
+    burst: deps.ipRateBurst ?? DEFAULT_IP_RATE_BURST,
   });
   const loginLimiter = createLoginLimiter();
 
@@ -151,8 +166,12 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
     done();
   });
 
+  // CORS for the public ingest surface. Registered BEFORE the per-IP limiter so
+  // the limiter's own 429 still carries CORS headers a browser can read.
+  app.addHook('onRequest', ingestCorsHook);
+
   app.addHook('onRequest', async (req, reply) => {
-    if (SKIP_IP_RATE_LIMIT.has(req.url)) return;
+    if (SKIP_IP_RATE_LIMIT.has(pathOf(req.url))) return;
     // Requests presenting a VALID symbol-upload token bypass the per-IP limiter:
     // deploy pipelines legitimately fire hundreds of sequential map uploads in
     // seconds, which would exhaust a per-minute IP budget (seen in production on
@@ -180,41 +199,45 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
     done();
   });
 
-  // Ingest is called cross-origin from RN apps → open CORS on this route only.
-  // `/api/*` stays same-origin (no CORS headers emitted).
-  app.options<{ Params: { publicKey: string } }>('/ingest/:publicKey', (_req, reply) => {
-    return reply
-      .header('Access-Control-Allow-Origin', '*')
-      .header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-      .header('Access-Control-Allow-Headers', 'content-type')
-      .header('Access-Control-Max-Age', '86400')
-      .code(204)
-      .send();
-  });
+  // Ingest is called cross-origin (browsers, RN apps), so /ingest/* has open
+  // CORS: one preflight route for the whole surface, response headers from
+  // ingestCorsHook above. `/api/*` stays same-origin (no CORS headers emitted).
+  registerIngestPreflight(app);
 
-  app.post<{ Params: { publicKey: string }; Body: unknown }>('/ingest/:publicKey', (req, reply) => {
-    reply.header('Access-Control-Allow-Origin', '*');
-    const parsed = EventEnvelopeSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return reply.code(400).send({
-        error: 'invalid_envelope',
-        issues: parsed.error.issues.map((i: z.core.$ZodIssue) => ({
-          path: i.path,
-          message: i.message,
-          code: i.code,
-        })),
-      });
-    }
+  // Encapsulated so the text/plain JSON parser is scoped to event ingest. A
+  // browser crash beacon sent as text/plain needs no preflight; without this
+  // parser Fastify's default hands the route a raw string and it 400s.
+  void app.register((instance, _opts, done) => {
+    addTextPlainJsonParser(instance);
 
-    const result = ingest(req.params.publicKey, parsed.data);
+    instance.post<{ Params: { publicKey: string }; Body: unknown }>(
+      '/ingest/:publicKey',
+      (req, reply) => {
+        const parsed = EventEnvelopeSchema.safeParse(req.body);
+        if (!parsed.success) {
+          return reply.code(400).send({
+            error: 'invalid_envelope',
+            issues: parsed.error.issues.map((i: z.core.$ZodIssue) => ({
+              path: i.path,
+              message: i.message,
+              code: i.code,
+            })),
+          });
+        }
 
-    if (result.kind === 'unknown-key') {
-      return reply.code(401).send({ error: 'unknown_public_key' });
-    }
-    if (result.kind === 'rate-limited') {
-      return reply.code(202).send({ eventId: null, rateLimited: true });
-    }
-    return reply.code(202).send({ eventId: result.eventId });
+        const result = ingest(req.params.publicKey, parsed.data);
+
+        if (result.kind === 'unknown-key') {
+          return reply.code(401).send({ error: 'unknown_public_key' });
+        }
+        if (result.kind === 'rate-limited') {
+          return reply.code(202).send({ eventId: null, rateLimited: true });
+        }
+        return reply.code(202).send({ eventId: result.eventId });
+      },
+    );
+
+    done();
   });
 
   app.get('/healthz', () => ({ ok: true }));

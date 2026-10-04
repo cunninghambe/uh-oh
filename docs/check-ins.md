@@ -22,7 +22,9 @@ checkIn(slug: string, opts?: { intervalMinutes?: number }): void
 
 The request shape is `POST <origin>/ingest/<publicKey>/check-in/<slug>[?intervalMinutes=N]`,
 202 on success. The client never inspects the response — success or failure
-looks the same from the caller's side.
+looks the same from the caller's side. Everything rides in the URL: the body
+and its content type are ignored, so a form-encoded, JSON, text or empty POST
+all work (up to the server's 1 MiB body cap).
 
 Below are copy-paste snippets for the three places check-ins are going out
 in practice. Swap in real slugs and DSNs before using.

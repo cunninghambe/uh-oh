@@ -41,6 +41,27 @@ export const registerCheckInRoute = (
   /** Instance-level fallback webhook (UH_OH_DEFAULT_WEBHOOK_URL). */
   defaultWebhookUrl?: string,
 ): void => {
+  // A check-in carries everything in its URL; the body is ignored by contract.
+  // So the route accepts ANY content type (still under the global body cap)
+  // instead of Fastify's defaults, which 415 a form-encoded POST (curl -d,
+  // wget --post-data, Apps Script UrlFetchApp's default content type) and 400 an
+  // empty application/json one. Encapsulated so the catch-all stays scoped here.
+  void app.register((instance, _opts, done) => {
+    instance.removeAllContentTypeParsers();
+    instance.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, _body, parsed) => {
+      parsed(null, undefined);
+    });
+    registerCheckInHandler(instance, db, limiter, defaultWebhookUrl);
+    done();
+  });
+};
+
+const registerCheckInHandler = (
+  app: FastifyInstance,
+  db: Db,
+  limiter: RateLimiter,
+  defaultWebhookUrl: string | undefined,
+): void => {
   app.post<{
     Params: { publicKey: string; slug: string };
     Querystring: { intervalMinutes?: string };

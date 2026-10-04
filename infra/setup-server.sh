@@ -50,8 +50,8 @@ Create it with the following variables (see infra/README.md for details):
 
 Optional:
   UH_OH_LOG_LEVEL=info
-  UH_OH_IP_RATE_PER_MIN=120
-  UH_OH_IP_RATE_BURST=20
+  UH_OH_IP_RATE_PER_MIN=600
+  UH_OH_IP_RATE_BURST=100
   UH_OH_RETENTION_DAYS=90
   UH_OH_DEFAULT_WEBHOOK_URL=https://discord.com/api/webhooks/<id>/<token>
   UH_OH_ALERT_LOCAL_TZ=America/New_York
