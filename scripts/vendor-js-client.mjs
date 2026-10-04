@@ -24,7 +24,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const REPO = join(__dirname, '..');
 
 export const CLIENT_SOURCE = join(REPO, 'packages', 'js', 'src', 'uh-oh-client.ts');
-export const CLIENT_VERSION = '0.6.0';
+export const CLIENT_VERSION = '0.6.1';
 export const GENERATED_MARKER = 'GENERATED FILE - vendored from uh-oh';
 
 /**
@@ -37,7 +37,7 @@ export function buildHeader(outPath) {
     [
       `// ${GENERATED_MARKER} packages/js/src/uh-oh-client.ts (v${CLIENT_VERSION}).`,
       `// Do not hand-edit. Regenerate: node scripts/vendor-js-client.mjs --out ${outPath}`,
-      '// Replace with `npm add github:cunninghambe/uh-oh#js-dist` once that branch is published.',
+      '// Or install the published build instead: pnpm add github:cunninghambe/uh-oh#js-dist',
     ].join('\n') + '\n\n'
   );
 }

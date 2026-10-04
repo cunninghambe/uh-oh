@@ -366,7 +366,7 @@ export interface ClientDeps {
 // ---------------------------------------------------------------------------
 
 const SDK_NAME = '@uh-oh/js';
-const SDK_VERSION = '0.6.0';
+const SDK_VERSION = '0.6.1';
 const SPOOL_KEY = 'uh-oh:spool';
 const SPOOL_FILE = 'uh-oh-spool.json';
 const SPOOL_DEBOUNCE_MS = 1_000;
@@ -382,6 +382,8 @@ const VALUE_MAX = 4096;
 const CATEGORY_MAX = 64;
 const MESSAGE_MAX = 1024;
 const SLUG_RE = /^[a-z0-9-]{1,64}$/;
+// CORS-safelisted, so a beacon needs no preflight (see beaconBody).
+const BEACON_CONTENT_TYPE = 'text/plain;charset=UTF-8';
 
 // -- usage analytics: batching + validation (mirrors CONTRACT U-IN server-side) --
 const ANALYTICS_MAX_QUEUE = 20;
@@ -533,6 +535,88 @@ function parseStackLine(line: string): StackFrame {
     return makeFrame(fn || undefined, ff[2], toInt(ff[3]), toInt(ff[4]));
   }
   return { inApp: true };
+}
+
+const JSON_SAFE_MAX_DEPTH = 32;
+
+/**
+ * Converts any value into plain JSON data, never throwing. Mirrors
+ * JSON.stringify (toJSON honoured, undefined/functions/symbols dropped from
+ * objects and nulled in arrays, non-finite numbers become null) and also
+ * survives what JSON.stringify throws on: a BigInt becomes its decimal string,
+ * a true cycle (an object inside itself) becomes "[Circular]", a throwing
+ * toJSON or getter becomes "[unserializable]", and nesting past 32 levels
+ * becomes "[Truncated]". A value shared by two keys is NOT a cycle and is kept
+ * on both.
+ */
+function toJsonSafe(value: unknown, ancestors: object[] = []): JsonValue | undefined {
+  if (value === null) return null;
+  switch (typeof value) {
+    case 'string':
+    case 'boolean':
+      return value;
+    case 'number':
+      return Number.isFinite(value) ? value : null;
+    case 'bigint':
+      return value.toString();
+    case 'object':
+      break;
+    default:
+      return undefined; // undefined, function, symbol
+  }
+  const obj = value;
+  if (ancestors.includes(obj)) return '[Circular]';
+  if (ancestors.length >= JSON_SAFE_MAX_DEPTH) return '[Truncated]';
+  try {
+    const toJSON = (obj as { toJSON?: unknown }).toJSON;
+    if (typeof toJSON === 'function') {
+      return toJsonSafe((toJSON as () => unknown).call(obj), ancestors);
+    }
+    ancestors.push(obj);
+    try {
+      if (Array.isArray(obj)) {
+        return obj.map((item: unknown) => {
+          try {
+            return toJsonSafe(item, ancestors) ?? null;
+          } catch {
+            return '[unserializable]';
+          }
+        });
+      }
+      const out: Record<string, JsonValue> = {};
+      for (const key of Object.keys(obj)) {
+        let v: JsonValue | undefined;
+        try {
+          v = toJsonSafe((obj as Record<string, unknown>)[key], ancestors);
+        } catch {
+          v = '[unserializable]';
+        }
+        if (v !== undefined) out[key] = v;
+      }
+      return out;
+    } finally {
+      ancestors.pop();
+    }
+  } catch {
+    return '[unserializable]';
+  }
+}
+
+/**
+ * Returns the envelope as plain JSON data so it can always be stringified for
+ * sending and persisting. Fast path: an ordinary envelope is just round-tripped
+ * through JSON (identical to what was sent before). Only when JSON.stringify
+ * throws (a BigInt or a cycle in user, context or breadcrumb data, a throwing
+ * toJSON) does the tolerant walk run. Without this, the throw happened inside
+ * sendOne and read as a network failure, so the event sat at the head of the
+ * queue forever and blocked every later event.
+ */
+function jsonSafeEnvelope(env: EventEnvelope): EventEnvelope {
+  try {
+    return JSON.parse(JSON.stringify(env)) as EventEnvelope;
+  } catch {
+    return toJsonSafe(env) as unknown as EventEnvelope;
+  }
 }
 
 function isErrorLike(err: unknown): err is { name?: unknown; message?: unknown; stack?: unknown } {
@@ -691,10 +775,13 @@ export class Client {
           : undefined;
 
     this.now = deps.now ?? (() => Date.now());
-    this.setTimeoutFn = deps.setTimeoutFn ?? G.setTimeout ?? (() => 0);
-    this.clearTimeoutFn = deps.clearTimeoutFn ?? G.clearTimeout ?? (() => undefined);
-    this.setIntervalFn = deps.setIntervalFn ?? G.setInterval ?? (() => 0);
-    this.clearIntervalFn = deps.clearIntervalFn ?? G.clearInterval ?? (() => undefined);
+    // The global timers are bound to globalThis: they are called as methods
+    // (`this.setTimeoutFn(...)`), and a browser throws "Illegal invocation"
+    // when window.setTimeout & co. run with a `this` that is not the window.
+    this.setTimeoutFn = deps.setTimeoutFn ?? bindGlobal(G.setTimeout) ?? (() => 0);
+    this.clearTimeoutFn = deps.clearTimeoutFn ?? bindGlobal(G.clearTimeout) ?? (() => undefined);
+    this.setIntervalFn = deps.setIntervalFn ?? bindGlobal(G.setInterval) ?? (() => 0);
+    this.clearIntervalFn = deps.clearIntervalFn ?? bindGlobal(G.clearInterval) ?? (() => undefined);
 
     const detected = this.win !== undefined && this.doc !== undefined ? 'browser' : 'node';
     this.runtime = opts.runtime ?? detected;
@@ -881,15 +968,23 @@ export class Client {
   }
 
   private writeStderr(err: unknown): void {
-    let msg: string;
-    if (err instanceof Error || isErrorLike(err)) {
-      const e = err as { stack?: unknown; message?: unknown };
-      msg =
-        typeof e.stack === 'string'
-          ? e.stack
-          : `${SDK_NAME} uncaughtException: ${String(e.message)}`;
-    } else {
-      msg = `${SDK_NAME} uncaughtException: ${String(err)}`;
+    // Building the message must not throw either: onUncaughtException calls
+    // this right before exit(1), and a throw here (String() on a message with
+    // no toString, a throwing stack getter) used to skip the exit and leave
+    // the process running after an uncaught exception.
+    let msg = `${SDK_NAME} uncaughtException: [unprintable value]`;
+    try {
+      if (err instanceof Error || isErrorLike(err)) {
+        const e = err as { stack?: unknown; message?: unknown };
+        msg =
+          typeof e.stack === 'string'
+            ? e.stack
+            : `${SDK_NAME} uncaughtException: ${String(e.message)}`;
+      } else {
+        msg = `${SDK_NAME} uncaughtException: ${String(err)}`;
+      }
+    } catch {
+      // keep the placeholder
     }
     try {
       const w = this.proc?.stderr?.write;
@@ -1052,7 +1147,7 @@ export class Client {
       const env = this.buildEnvelope(exception, level, id);
       const finalEnv = this.applyBeforeSend(env);
       if (finalEnv === null) return '';
-      this.enqueue(finalEnv);
+      this.enqueue(jsonSafeEnvelope(finalEnv));
       void this.drainQueue();
       return id;
     } catch (e) {
@@ -1221,13 +1316,17 @@ export class Client {
       controller = undefined;
     }
     const timer = controller
-      ? this.setTimeoutFn(() => {
-          try {
-            controller?.abort();
-          } catch {
-            // ignore
-          }
-        }, SEND_TIMEOUT_MS)
+      ? this.startTimer(
+          'timeout',
+          () => {
+            try {
+              controller?.abort();
+            } catch {
+              // ignore
+            }
+          },
+          SEND_TIMEOUT_MS,
+        )
       : null;
     try {
       const init: FetchInit = {
@@ -1241,7 +1340,7 @@ export class Client {
     } catch {
       // one attempt only - never retried, never throws
     } finally {
-      if (timer !== null) this.clearTimeoutFn(timer);
+      this.stopTimer('timeout', timer);
     }
   }
 
@@ -1269,13 +1368,17 @@ export class Client {
       controller = undefined;
     }
     const timer = controller
-      ? this.setTimeoutFn(() => {
-          try {
-            controller?.abort();
-          } catch {
-            // ignore
-          }
-        }, SEND_TIMEOUT_MS)
+      ? this.startTimer(
+          'timeout',
+          () => {
+            try {
+              controller?.abort();
+            } catch {
+              // ignore
+            }
+          },
+          SEND_TIMEOUT_MS,
+        )
       : null;
 
     try {
@@ -1291,19 +1394,70 @@ export class Client {
     } catch {
       return { ok: false };
     } finally {
-      if (timer !== null) this.clearTimeoutFn(timer);
+      this.stopTimer('timeout', timer);
     }
   }
 
-  /** Coalescing drain: at most one runs; a request mid-drain triggers one more. */
+  /**
+   * Starts a host timer and never throws. A host timer that throws (an unbound
+   * browser setTimeout raises "Illegal invocation") yields null and the caller
+   * degrades: no abort timeout, no retry tick, no debounce. It must not reject
+   * instead, because a rejection out of this pipeline reaches the client's own
+   * unhandledrejection handler, which captures it, fails to send it, and
+   * captures that failure again: an endless loop. `unref` keeps a Node event
+   * loop from being held open by uh-oh alone.
+   */
+  private startTimer(
+    kind: 'timeout' | 'interval',
+    cb: () => void,
+    ms: number,
+    unref = false,
+  ): unknown {
+    let handle: unknown;
+    try {
+      handle = kind === 'interval' ? this.setIntervalFn(cb, ms) : this.setTimeoutFn(cb, ms);
+    } catch (e) {
+      this.log('debug', `could not start a ${kind} timer`, e);
+      return null;
+    }
+    if (unref) {
+      try {
+        const t = handle as { unref?: () => void };
+        if (t && typeof t.unref === 'function') t.unref();
+      } catch {
+        // unref unavailable (browser); harmless
+      }
+    }
+    return handle === undefined ? null : handle;
+  }
+
+  /** Clears a timer from startTimer and never throws. */
+  private stopTimer(kind: 'timeout' | 'interval', handle: unknown): void {
+    if (handle === null) return;
+    try {
+      if (kind === 'interval') this.clearIntervalFn(handle);
+      else this.clearTimeoutFn(handle);
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * Coalescing drain: at most one runs; a request mid-drain triggers one more.
+   * The returned promise never rejects (callers fire it with `void`).
+   */
   private drainQueue(): Promise<void> {
     if (this.drainInFlight) {
       this.drainRequested = true;
       return this.drainInFlight;
     }
-    this.drainInFlight = this.drainLoop().finally(() => {
-      this.drainInFlight = null;
-    });
+    this.drainInFlight = this.drainLoop()
+      .catch((e: unknown) => {
+        this.log('debug', 'drain failed', e);
+      })
+      .finally(() => {
+        this.drainInFlight = null;
+      });
     return this.drainInFlight;
   }
 
@@ -1381,16 +1535,15 @@ export class Client {
 
   private ensureRetryTimer(): void {
     if (this.retryTimer !== null) return;
-    this.retryTimer = this.setIntervalFn(() => {
-      void this.drainQueue();
-    }, RETRY_INTERVAL_MS);
-    // Do not keep a Node event loop alive purely for retries.
-    try {
-      const t = this.retryTimer as { unref?: () => void };
-      if (t && typeof t.unref === 'function') t.unref();
-    } catch {
-      // unref unavailable (browser); harmless
-    }
+    // Unref'd: do not keep a Node event loop alive purely for retries.
+    this.retryTimer = this.startTimer(
+      'interval',
+      () => {
+        void this.drainQueue();
+      },
+      RETRY_INTERVAL_MS,
+      true,
+    );
   }
 
   private clearRetryTimer(): void {
@@ -1504,17 +1657,18 @@ export class Client {
     if (this.runtime !== 'node' || !this.fs || !this.spoolFile) return;
     this.spoolDirty = true;
     if (this.spoolTimer !== null) return;
-    this.spoolTimer = this.setTimeoutFn(() => {
-      this.spoolTimer = null;
-      this.flushSpool();
-    }, SPOOL_DEBOUNCE_MS);
-    // Do not keep a Node event loop alive purely for a pending spool write.
-    try {
-      const t = this.spoolTimer as { unref?: () => void };
-      if (t && typeof t.unref === 'function') t.unref();
-    } catch {
-      // unref unavailable; harmless
-    }
+    // Unref'd: do not keep a Node event loop alive purely for a spool write.
+    this.spoolTimer = this.startTimer(
+      'timeout',
+      () => {
+        this.spoolTimer = null;
+        this.flushSpool();
+      },
+      SPOOL_DEBOUNCE_MS,
+      true,
+    );
+    // No timer available: write now rather than never.
+    if (this.spoolTimer === null) this.flushSpool();
   }
 
   /**
@@ -1626,11 +1780,21 @@ export class Client {
     this.persist();
   }
 
+  /**
+   * Beacon bodies are text/plain on purpose. navigator.sendBeacon always sends
+   * with credentials mode "include"; a body typed application/json is not a
+   * CORS-safelisted type, so the browser preflights it, and a preflight
+   * answered "Access-Control-Allow-Origin: *" fails for a credentialed request,
+   * so the POST is never sent (production showed only lone OPTIONS requests).
+   * text/plain is a CORS "simple" request: no preflight. Both ingest routes
+   * parse a text/plain body as JSON. A bare string body (no Blob) is sent by
+   * the browser as text/plain too.
+   */
   private beaconBody(payload: unknown): unknown {
     const json = JSON.stringify(payload);
     try {
       const BlobCtorRef = G.Blob;
-      if (BlobCtorRef) return new BlobCtorRef([json], { type: 'application/json' });
+      if (BlobCtorRef) return new BlobCtorRef([json], { type: BEACON_CONTENT_TYPE });
     } catch {
       // fall through to string
     }
@@ -1800,17 +1964,18 @@ export class Client {
 
   private ensureAnalyticsTimer(): void {
     if (this.analyticsTimer !== null) return;
-    this.analyticsTimer = this.setTimeoutFn(() => {
-      this.analyticsTimer = null;
-      void this.flushAnalytics();
-    }, ANALYTICS_DEBOUNCE_MS);
-    // Do not keep a Node event loop alive purely for a pending analytics batch.
-    try {
-      const t = this.analyticsTimer as { unref?: () => void };
-      if (t && typeof t.unref === 'function') t.unref();
-    } catch {
-      // unref unavailable (browser); harmless
-    }
+    // Unref'd: do not keep a Node event loop alive purely for an analytics
+    // batch. With no timer the batch waits for the 20-event cap, flush(),
+    // close() or the pagehide beacon instead of throwing.
+    this.analyticsTimer = this.startTimer(
+      'timeout',
+      () => {
+        this.analyticsTimer = null;
+        void this.flushAnalytics();
+      },
+      ANALYTICS_DEBOUNCE_MS,
+      true,
+    );
   }
 
   private clearAnalyticsTimer(): void {
@@ -1853,13 +2018,17 @@ export class Client {
       controller = undefined;
     }
     const timer = controller
-      ? this.setTimeoutFn(() => {
-          try {
-            controller?.abort();
-          } catch {
-            // ignore
-          }
-        }, SEND_TIMEOUT_MS)
+      ? this.startTimer(
+          'timeout',
+          () => {
+            try {
+              controller?.abort();
+            } catch {
+              // ignore
+            }
+          },
+          SEND_TIMEOUT_MS,
+        )
       : null;
 
     try {
@@ -1877,7 +2046,7 @@ export class Client {
     } catch {
       this.log('debug', 'analytics batch dropped: send failed (no retry, no spool)');
     } finally {
-      if (timer !== null) this.clearTimeoutFn(timer);
+      this.stopTimer('timeout', timer);
     }
   }
 
@@ -2015,10 +2184,12 @@ export class Client {
       const finish = (): void => {
         if (settled) return;
         settled = true;
-        if (timer !== null) this.clearTimeoutFn(timer);
+        this.stopTimer('timeout', timer);
         resolve();
       };
-      timer = this.setTimeoutFn(finish, ms);
+      // No usable timer (startTimer returned null): the flush is then bounded
+      // only by the sends themselves, which never reject.
+      timer = this.startTimer('timeout', finish, ms);
       Promise.all([this.drainQueue(), this.flushAnalytics()]).then(finish, finish);
     });
   }
@@ -2054,20 +2225,85 @@ function pick<T>(dep: T | null | undefined, fromGlobal: T | undefined): T | unde
   return dep;
 }
 
+/**
+ * Binds a host function taken off globalThis (setTimeout, clearInterval, ...)
+ * back to globalThis. Browser globals are WebIDL operations that throw
+ * "TypeError: Illegal invocation" when called with any other `this`, which is
+ * exactly what storing one on the Client and calling `this.setTimeoutFn(...)`
+ * does. Node's timers ignore `this`, so the unbound version passed every Node
+ * and injected-fake test while the real browser client never sent anything.
+ */
+function bindGlobal<F extends (...args: never[]) => unknown>(fn: F | undefined): F | undefined {
+  return typeof fn === 'function' ? (fn.bind(globalThis) as F) : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Functional singleton API - what consumer apps import. Every entry point is
 // wrapped so it can never throw out of the public surface.
 // ---------------------------------------------------------------------------
 
-let current: Client | null = null;
+// The live client is kept in a global slot keyed by Symbol.for, not only in
+// this module. A bundler can evaluate this file more than once in one process:
+// Next.js (Turbopack) builds instrumentation.ts and each route handler as
+// separate module graphs, so init() in instrumentation set a client that route
+// code never saw, and the minifier folded the route copy's captureException
+// down to `return ""`. Every copy reads the same Symbol.for key, so the copy
+// that called init() serves them all.
+//
+// Contract: one functional-API client per global scope (a page, a Node
+// process, a worker; workers have their own globalThis). A second init() from
+// any copy closes and replaces the first, as a second init() always did within
+// one copy. Two independent apps on one page that each need their own DSN
+// should construct `new Client()` directly. close() from any copy clears the
+// slot, so a test that resets modules should still call close(). When the slot
+// cannot be written (a frozen global), each copy keeps its own client.
+const CLIENT_SLOT = Symbol.for('uh-oh.client');
+let moduleClient: Client | null = null;
+
+function isClientLike(v: unknown): v is Client {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    typeof (v as { captureException?: unknown }).captureException === 'function'
+  );
+}
+
+/** The client every copy shares, else this copy's own (slot unwritable). */
+function liveClient(): Client | null {
+  try {
+    const held = (G as unknown as Record<symbol, unknown>)[CLIENT_SLOT];
+    if (isClientLike(held)) return held;
+    if (held === null) return null; // cleared by some copy's close()
+  } catch {
+    // unreadable global: fall back to this copy's own client
+  }
+  return moduleClient;
+}
+
+function setLiveClient(c: Client | null): void {
+  moduleClient = c;
+  try {
+    (G as unknown as Record<symbol, unknown>)[CLIENT_SLOT] = c;
+  } catch {
+    // frozen or locked-down global: this copy keeps its own client
+  }
+}
 
 export function init(opts: InitOptions): void {
+  let next: Client | null = null;
   try {
-    if (current) current.close();
-    current = new Client(opts);
-    current.install();
+    const previous = liveClient();
+    if (previous) previous.close();
+    next = new Client(opts);
+    setLiveClient(next);
+    next.install();
   } catch (e) {
-    current = null;
+    try {
+      next?.close();
+    } catch {
+      // never throw
+    }
+    setLiveClient(null);
     try {
       if (opts && opts.debug) {
         const c = G.console;
@@ -2081,7 +2317,8 @@ export function init(opts: InitOptions): void {
 
 export function captureException(err: unknown, opts?: CaptureOptions): string {
   try {
-    return current ? current.captureException(err, opts) : '';
+    const c = liveClient();
+    return c ? c.captureException(err, opts) : '';
   } catch {
     return '';
   }
@@ -2089,7 +2326,8 @@ export function captureException(err: unknown, opts?: CaptureOptions): string {
 
 export function captureMessage(msg: string, level?: Level): string {
   try {
-    return current ? current.captureMessage(msg, level) : '';
+    const c = liveClient();
+    return c ? c.captureMessage(msg, level) : '';
   } catch {
     return '';
   }
@@ -2097,7 +2335,7 @@ export function captureMessage(msg: string, level?: Level): string {
 
 export function addBreadcrumb(b: BreadcrumbInput): void {
   try {
-    current?.addBreadcrumb(b);
+    liveClient()?.addBreadcrumb(b);
   } catch {
     // never throw
   }
@@ -2105,7 +2343,7 @@ export function addBreadcrumb(b: BreadcrumbInput): void {
 
 export function setUser(u: UserInfo | null): void {
   try {
-    current?.setUser(u);
+    liveClient()?.setUser(u);
   } catch {
     // never throw
   }
@@ -2113,7 +2351,7 @@ export function setUser(u: UserInfo | null): void {
 
 export function setContext(key: string, value: Record<string, unknown> | null): void {
   try {
-    current?.setContext(key, value);
+    liveClient()?.setContext(key, value);
   } catch {
     // never throw
   }
@@ -2121,7 +2359,7 @@ export function setContext(key: string, value: Record<string, unknown> | null): 
 
 export function setTag(key: string, value: string | null): void {
   try {
-    current?.setTag(key, value);
+    liveClient()?.setTag(key, value);
   } catch {
     // never throw
   }
@@ -2129,7 +2367,7 @@ export function setTag(key: string, value: string | null): void {
 
 export function setFingerprint(parts: string[] | null): void {
   try {
-    current?.setFingerprint(parts);
+    liveClient()?.setFingerprint(parts);
   } catch {
     // never throw
   }
@@ -2137,7 +2375,7 @@ export function setFingerprint(parts: string[] | null): void {
 
 export function checkIn(slug: string, opts?: CheckInOptions): void {
   try {
-    current?.checkIn(slug, opts);
+    liveClient()?.checkIn(slug, opts);
   } catch {
     // never throw
   }
@@ -2145,7 +2383,7 @@ export function checkIn(slug: string, opts?: CheckInOptions): void {
 
 export function trackPageview(path?: string): void {
   try {
-    current?.trackPageview(path);
+    liveClient()?.trackPageview(path);
   } catch {
     // never throw
   }
@@ -2153,7 +2391,7 @@ export function trackPageview(path?: string): void {
 
 export function trackEvent(name: string, props?: Record<string, string | number | boolean>): void {
   try {
-    current?.trackEvent(name, props);
+    liveClient()?.trackEvent(name, props);
   } catch {
     // never throw
   }
@@ -2161,7 +2399,8 @@ export function trackEvent(name: string, props?: Record<string, string | number 
 
 export function flush(timeoutMs?: number): Promise<void> {
   try {
-    return current ? current.flush(timeoutMs) : Promise.resolve();
+    const c = liveClient();
+    return c ? c.flush(timeoutMs) : Promise.resolve();
   } catch {
     return Promise.resolve();
   }
@@ -2169,10 +2408,10 @@ export function flush(timeoutMs?: number): Promise<void> {
 
 export function close(): void {
   try {
-    current?.close();
+    liveClient()?.close();
   } catch {
     // never throw
   } finally {
-    current = null;
+    setLiveClient(null);
   }
 }

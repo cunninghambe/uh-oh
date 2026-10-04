@@ -12,7 +12,13 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { CLIENT_SOURCE, GENERATED_MARKER, buildHeader, vendor } from './vendor-js-client.mjs';
+import {
+  CLIENT_SOURCE,
+  CLIENT_VERSION,
+  GENERATED_MARKER,
+  buildHeader,
+  vendor,
+} from './vendor-js-client.mjs';
 
 const REPO = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -63,6 +69,18 @@ function tmp(label) {
 void test('the client source contains no U+2014 (em dash)', () => {
   const src = readFileSync(CLIENT_SOURCE, 'utf8');
   assert.equal(src.includes('—'), false, 'uh-oh-client.ts must not contain an em dash');
+});
+
+// The version lives in three hand-edited places. Vendored copies are told
+// apart in the field only by the sdk.version they stamp on every event and by
+// the version in this header, so all three must move together.
+void test('CLIENT_VERSION, SDK_VERSION and packages/js/package.json agree', () => {
+  const src = readFileSync(CLIENT_SOURCE, 'utf8');
+  const sdkVersion = /const SDK_VERSION = '([^']+)';/.exec(src)?.[1];
+  const pkgText = readFileSync(join(REPO, 'packages', 'js', 'package.json'), 'utf8');
+  const pkgVersion = /"version":\s*"([^"]+)"/.exec(pkgText)?.[1];
+  assert.equal(sdkVersion, CLIENT_VERSION, 'SDK_VERSION in uh-oh-client.ts');
+  assert.equal(pkgVersion, CLIENT_VERSION, 'version in packages/js/package.json');
 });
 
 void test('the emitted header contains no U+2014 (em dash)', () => {
