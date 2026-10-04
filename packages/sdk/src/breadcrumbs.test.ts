@@ -51,6 +51,26 @@ describe('BreadcrumbBuffer', () => {
     expect(buf.get()[0]?.message).toBe('1');
   });
 
+  // EventEnvelopeSchema allows at most 100 breadcrumbs. A larger maxBreadcrumbs
+  // used to make every event built after the 101st crumb a 400, which the
+  // spool drops as permanent.
+  it('never holds more than the wire cap of 100, whatever cap is asked for', () => {
+    const buf = new BreadcrumbBuffer(250);
+    for (let i = 0; i < 300; i++) buf.add({ category: 'a', message: String(i) });
+    expect(buf.get()).toHaveLength(100);
+    expect(buf.get()[0]?.message).toBe('200');
+  });
+
+  it('a cap of 0 keeps no breadcrumbs; an invalid cap falls back to 100', () => {
+    const none = new BreadcrumbBuffer(0);
+    none.add({ category: 'a', message: 'x' });
+    expect(none.get()).toHaveLength(0);
+
+    const bad = new BreadcrumbBuffer(Number.NaN);
+    for (let i = 0; i < 150; i++) bad.add({ category: 'a', message: String(i) });
+    expect(bad.get()).toHaveLength(100);
+  });
+
   it('get returns a copy (mutation does not affect buffer)', () => {
     const buf = new BreadcrumbBuffer();
     buf.add({ category: 'nav', message: 'x' });
