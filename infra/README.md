@@ -114,6 +114,12 @@ Logs are structured JSON (pino). Pipe through `jq` for readability:
 journalctl -u uh-oh-server -f | jq .
 ```
 
+An alert that could not be delivered logs at level 50 with its dispatch `id`, alert `type`, `target`, `error` and `statusCode`. The target is the webhook's origin only (`https://discord.com`); the full URL holds the webhook's credential and never reaches the journal. The same failure is also kept on the `webhook_dispatches` row (`last_error`, `last_response_code`) for 7 days. To list recent alert and background-job problems:
+
+```bash
+journalctl -u uh-oh-server --since '7 days ago' -o cat | jq -c 'select(.level >= 40)'
+```
+
 ### Bounding journald disk usage
 
 By default journald's disk usage is capped as a fraction of the filesystem it lives on, which on a small VPS can still be large enough to matter, especially if request logging is verbose (`UH_OH_LOG_LEVEL=debug`) or the box is under sustained crash-storm traffic. Set an explicit cap in `/etc/systemd/journald.conf`:

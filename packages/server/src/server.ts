@@ -14,6 +14,7 @@ import { makeIngest } from './ingest/ingest.js';
 import { registerCheckInRoute } from './ingest/check-in.js';
 import { registerUsageIngestRoute } from './ingest/usage.js';
 import { createRateLimiter } from './ingest/rate-limit.js';
+import { toStructuredLogger } from './logging/structured-logger.js';
 import {
   addTextPlainJsonParser,
   ingestCorsHook,
@@ -130,7 +131,8 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
       db: deps.db,
       rateLimiter: ingestRateLimiter,
       defaultWebhookUrl: deps.defaultWebhookUrl,
-      logger: app.log,
+      // ingest() logs as (message, context); raw pino would drop the context.
+      logger: toStructuredLogger(app.log),
     });
 
   // Check-in limiter: generous, keyed per (publicKey, slug). A healthy monitor

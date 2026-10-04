@@ -16,6 +16,7 @@ import {
 import { getProjectByPublicKey } from '../db/repos/projects.js';
 import { enqueueDispatch } from '../db/repos/webhook-dispatches.js';
 import { resolveWebhookUrl, warnNoWebhookTarget } from '../webhooks/resolve-url.js';
+import { toStructuredLogger } from '../logging/structured-logger.js';
 import type { Db } from '../db/index.js';
 import type { RateLimiter } from './rate-limit.js';
 
@@ -62,6 +63,8 @@ const registerCheckInHandler = (
   limiter: RateLimiter,
   defaultWebhookUrl: string | undefined,
 ): void => {
+  // warnNoWebhookTarget logs as (message, context); raw pino would drop the context.
+  const alertLog = toStructuredLogger(app.log);
   app.post<{
     Params: { publicKey: string; slug: string };
     Querystring: { intervalMinutes?: string };
@@ -117,7 +120,7 @@ const registerCheckInHandler = (
       if (url) {
         enqueueDispatch(db, { monitorId: existing.id, url, type: 'monitor.recovered' }, now);
       } else {
-        warnNoWebhookTarget(app.log, project, 'monitor.recovered');
+        warnNoWebhookTarget(alertLog, project, 'monitor.recovered');
       }
     }
     return reply.code(202).send({ monitorId: existing.id });

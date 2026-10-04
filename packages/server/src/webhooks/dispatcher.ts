@@ -126,6 +126,24 @@ export type DispatcherHandle = {
   stop: () => Promise<void>;
 };
 
+const UNPARSEABLE_TARGET = '<unparseable url>';
+
+/**
+ * The part of a webhook URL that is safe to write to a log: its origin only.
+ * Webhook URLs carry their credential in the path or query (Discord
+ * `/api/webhooks/<id>/<token>`, Slack `/services/<T>/<B>/<secret>`), so a full
+ * URL in a journal line is a leaked secret. The origin still tells an operator
+ * which receiver failed. Userinfo is never part of an origin.
+ */
+export const webhookLogTarget = (raw: string): string => {
+  try {
+    const { origin } = new URL(raw);
+    return origin === 'null' ? UNPARSEABLE_TARGET : origin;
+  } catch {
+    return UNPARSEABLE_TARGET;
+  }
+};
+
 /**
  * The delivered webhook body. Its exact shape (and property order) is the
  * receiver contract — see the per-type comments on the builders below. Fields
@@ -450,7 +468,8 @@ const dispatchOne = async (
     if (!guard.ok) {
       logger?.error('webhook url blocked (SSRF guard)', {
         id: dispatch.id,
-        url: dispatch.url,
+        type: dispatch.type,
+        target: webhookLogTarget(dispatch.url),
         reason: guard.reason,
       });
       metrics.webhookFailures.inc();
@@ -473,7 +492,8 @@ const dispatchOne = async (
       if (dns.blocked) {
         logger?.error('webhook host resolves to a blocked address (SSRF guard)', {
           id: dispatch.id,
-          url: dispatch.url,
+          type: dispatch.type,
+          target: webhookLogTarget(dispatch.url),
           address: dns.address,
         });
         metrics.webhookFailures.inc();
@@ -529,7 +549,8 @@ const dispatchOne = async (
       metrics.webhookFailures.inc();
       logger?.error('webhook dispatch failed permanently', {
         id: dispatch.id,
-        url: dispatch.url,
+        type: dispatch.type,
+        target: webhookLogTarget(dispatch.url),
         error: errorMsg,
         statusCode,
       });

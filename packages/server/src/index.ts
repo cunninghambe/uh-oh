@@ -8,12 +8,10 @@ import { readTokenFromEnv } from './auth/read-token.js';
 import { agentTokenFromEnv } from './auth/agent-token.js';
 import { cleanupExpiredSessions } from './db/repos/sessions.js';
 import { pruneOldData, resolveRetentionDays } from './db/repos/retention.js';
-import { startDispatcher } from './webhooks/dispatcher.js';
 import { resolveDefaultWebhookUrl } from './webhooks/resolve-url.js';
 import { resolveAlertLocalTz } from './webhooks/alert-time.js';
-import { startMonitorSweep } from './monitors/sweep.js';
-import { startSpikeSweep } from './spikes/sweep.js';
-import { resolveFixVerifyDays, startFixVerifySweep } from './fixes/verify-sweep.js';
+import { resolveFixVerifyDays } from './fixes/verify-sweep.js';
+import { startBackgroundJobs } from './background-jobs.js';
 import {
   DEFAULT_IP_RATE_BURST,
   DEFAULT_IP_RATE_PER_MINUTE,
@@ -151,17 +149,15 @@ if (isMain) {
     defaultWebhookUrl,
   });
   app.log.level = logLevel;
-  const dispatcherHandle = startDispatcher({ db, logger: app.log, dashboardUrl, alertLocalTz });
-  // Dead-man's-switch sweep: flip overdue monitors to 'missed' every 60s.
-  const monitorSweepHandle = startMonitorSweep({ db, logger: app.log, defaultWebhookUrl });
-  // Spike sweep (§23): flag issues whose last-hour volume dwarfs baseline every 5m.
-  const spikeSweepHandle = startSpikeSweep({ db, logger: app.log, defaultWebhookUrl });
-  // Fix-verification sweep (§23): confirm deployed fixes that held, hourly.
-  const fixVerifySweepHandle = startFixVerifySweep({
+  // Webhook dispatcher + monitor, spike and fix-verification sweeps. They log
+  // through toStructuredLogger(app.log), never app.log raw (see background-jobs.ts).
+  const jobs = startBackgroundJobs({
     db,
-    logger: app.log,
-    verifyDays: fixVerifyDays,
+    log: app.log,
+    dashboardUrl,
+    alertLocalTz,
     defaultWebhookUrl,
+    fixVerifyDays,
   });
 
   const runRetention = () => {
@@ -188,11 +184,11 @@ if (isMain) {
     try {
       clearInterval(cleanupInterval);
       clearInterval(retentionInterval);
-      monitorSweepHandle.stop(); // stop the dead-man's-switch sweep
-      spikeSweepHandle.stop(); // stop the spike sweep
-      fixVerifySweepHandle.stop(); // stop the fix-verification sweep
+      jobs.monitorSweep.stop(); // stop the dead-man's-switch sweep
+      jobs.spikeSweep.stop(); // stop the spike sweep
+      jobs.fixVerifySweep.stop(); // stop the fix-verification sweep
       await app.close(); // stop accepting new requests
-      await dispatcherHandle.stop(); // drain in-flight webhook dispatches
+      await jobs.dispatcher.stop(); // drain in-flight webhook dispatches
       closeDb(); // close the SQLite handle
     } catch (err) {
       console.error(err);
