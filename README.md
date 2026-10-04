@@ -10,10 +10,10 @@ A single Node process + SQLite + a small React dashboard. Designed for anyone wh
 - Captures Java uncaught exceptions, native NDK signals, and ANRs via an Android bridge (xCrash + UEH)
 - Captures browser (`window` error/unhandledrejection) and Node (`uncaughtException`/`unhandledRejection`) errors via `@uh-oh/js` — a single dependency-free vendorable client (`node scripts/vendor-js-client.mjs --out <path>`)
 - Groups events into issues by fingerprint
-- Symbolicates Hermes JS and Android ProGuard stacks server-side, on demand (web/node frames render raw for now)
+- Symbolicates Hermes JS and Android ProGuard stacks server-side, on demand, plus web and Node stacks against per-bundle source maps (`uh-oh upload next-sourcemaps`, or `uh-oh upload sourcemap --platform web|node`); a frame with no map keeps its raw file, line and column
 - Single-user JWT-gated dashboard with project + issue + release + symbol-upload UIs
-- Fires a generic outbound webhook per project on new issues (wire it to Slack, Discord, email, whatever)
-- MCP-native: 14 tools (projects, issues, symbolicated events, status changes, health, issue bundles, top issues, monitors) via the `uh-oh-mcp` stdio bin or the JWT-gated `POST /mcp` Streamable-HTTP endpoint — triage crashes from Claude Code (see `SPEC.md` §17, §20)
+- Fires an outbound webhook per project on new, regressed and spiking issues, missed/recovered monitors and verified fixes, with an instance-wide fallback (`UH_OH_DEFAULT_WEBHOOK_URL`) for projects that have none; a Discord webhook URL gets a one-line chat message, anything else the generic JSON payload (see `infra/README.md`)
+- MCP-native: 18 tools (projects, issues, symbolicated events, status changes, health, issue bundles, top issues, monitors, usage, release health, similar issues, annotations, fix attempts) via the `uh-oh-mcp` stdio bin or the JWT-gated `POST /mcp` Streamable-HTTP endpoint, to triage crashes from Claude Code (see `SPEC.md` §17, §20)
 - Scoped read token for headless agent debugging: set `UH_OH_READ_TOKEN` and an agent session reaches the read-only API surface (and a read-only `POST /mcp` tool scope, where mutating tools are refused) via the `X-Uh-Oh-Read-Token` header — no daily dashboard JWT (see `SPEC.md` §22)
 - Fix dossiers: `get_issue_bundle` returns issue + impact + symbolicated stack **with the original source lines** (extracted from your uploaded source maps) in one call — everything an agent needs to go crash → fix
 - Dead-man's-switch monitors: check-in pings on the ingest keypath, a 60s sweep, and `monitor.missed`/`monitor.recovered` webhooks — know when a worker, cron, or Apps Script goes silent (see `SPEC.md` §20)
@@ -61,7 +61,9 @@ This is a pnpm workspace. Each package is independently testable.
 | `@uh-oh/server`       | Fastify + SQLite + Drizzle. Ingest, API, workers.                                     |
 | `@uh-oh/web`          | Vite + React 19 + TanStack Router/Query + Tailwind v4 dashboard.                      |
 | `@uh-oh/react-native` | The SDK. JS core + Android native module.                                             |
-| `@uh-oh/cli`          | TS CLI for uploading ProGuard mappings + Hermes source maps.                          |
+| `@uh-oh/cli`          | `uh-oh` CLI: login, project list/create/dsn, symbol uploads (`SPEC.md` §11, §18).     |
+| `@uh-oh/js`           | Dependency-free browser + Node client, vendored into apps.                            |
+| `@uh-oh/mcp`          | MCP tool registry, shared by the `/mcp` route and the `uh-oh-mcp` stdio bin.          |
 
 ## Spec
 

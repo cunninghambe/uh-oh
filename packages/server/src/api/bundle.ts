@@ -50,7 +50,30 @@ const ANNOTATION_TAIL = 10;
 
 type ParsedPayload = {
   release?: { version?: unknown; build?: unknown };
-  exception?: { type?: unknown; value?: unknown; mechanism?: unknown };
+  exception?: { type?: unknown; value?: unknown; mechanism?: unknown; stacktrace?: unknown };
+};
+
+/**
+ * symbolicateEvent returns a frame it could not resolve (no map uploaded, a
+ * corrupt map, no position) with only filename + function, so without this the
+ * bundle names the file but never the line. Put the raw line and column back
+ * on every frame that did not resolve: for a Node service running its own
+ * source with no maps uploaded, the raw position IS the source line. A
+ * resolved ('ok') frame keeps its resolved line untouched.
+ * symbolicateEvent returns one frame per raw frame, so they align by index.
+ */
+const withRawPositions = (frames: BundleFrame[], rawStack: unknown): BundleFrame[] => {
+  const raw = Array.isArray(rawStack) ? (rawStack as unknown[]) : [];
+  return frames.map((f, i) => {
+    if (f.status === 'ok' || f.lineno !== undefined) return f;
+    const r = raw[i] as { lineno?: unknown; colno?: unknown } | null | undefined;
+    if (!r || typeof r !== 'object') return f;
+    return {
+      ...f,
+      ...(typeof r.lineno === 'number' ? { lineno: r.lineno } : {}),
+      ...(typeof r.colno === 'number' ? { colno: r.colno } : {}),
+    };
+  });
 };
 
 const parsePayload = (payload: string): ParsedPayload => {
@@ -135,7 +158,10 @@ export const buildIssueBundle = async (
 
   if (latest) {
     const env = parsePayload(latest.payload);
-    const frames: BundleFrame[] = await symbolicateEvent(db, latest.id);
+    const frames: BundleFrame[] = withRawPositions(
+      await symbolicateEvent(db, latest.id),
+      env.exception?.stacktrace,
+    );
 
     const crumbs = listBreadcrumbs(db, latest.id);
     const tail =

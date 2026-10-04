@@ -125,6 +125,9 @@ export interface IssueImpact {
 
 /** A resolved frame in a bundle — a {@link ResolvedFrame} plus optional context. */
 export interface BundleFrame extends ResolvedFrame {
+  /** Raw column, carried (with the raw `lineno`) only on a frame that did not
+   *  resolve, so an unsymbolicated frame still says where it crashed. */
+  colno?: number;
   context?: { pre: string[]; line: string; post: string[] };
 }
 
