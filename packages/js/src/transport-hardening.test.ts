@@ -24,6 +24,12 @@
 //    activity, and sendBeacon returns false for the same body. A crash with
 //    100 breadcrumbs of 1 KB read as a network error on every retry, so it sat
 //    at the head of the queue and every crash behind it waited.
+// 5. A crash whose POST is still in flight when the page hides is sent once.
+//    beaconFlush used to beacon every queued crash, the one being fetched
+//    included, although a keepalive fetch outlives the page: the server got
+//    it twice (two 202s with one envelope timestamp in Chrome 154). And
+//    drainOnce removed queue[0] once the answer came, by then possibly a
+//    different crash, which was dropped without ever being sent.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventEnvelopeSchema } from '@uh-oh/types';
@@ -665,5 +671,272 @@ describe('bodies over the 64 KiB keepalive quota still leave the browser', () =>
     expect(chrome.beaconCalls[0]?.url).toBe('https://errors.example.com/ingest/pk/usage');
     expect(f.attempts).toHaveLength(0);
     c.close();
+  });
+});
+
+describe('a crash whose POST is in flight when the page hides is sent once', () => {
+  interface Held {
+    value: string;
+    keepalive: boolean;
+    answer: (status: number) => void;
+    /** Rejects the request as Chromium does when the page unloads mid-request. */
+    fail: () => void;
+    /** Rejects it as the client's own send timeout does (an AbortError). */
+    abort: () => void;
+  }
+
+  /**
+   * A fetch whose every request stays in flight until the test answers it.
+   * With `refuseKeepalive` a keepalive request is refused at once with a
+   * TypeError, as Chrome does when the keepalive quota is taken; the plain
+   * retry is then held like any other.
+   */
+  function heldFetch(opts: { refuseKeepalive?: boolean } = {}) {
+    const held: Held[] = [];
+    const fn = (_url: string, init: FetchInitShape): Promise<{ ok: boolean; status: number }> => {
+      const keepalive = init.keepalive === true;
+      if (keepalive && opts.refuseKeepalive === true) {
+        return Promise.reject(new TypeError('Failed to fetch'));
+      }
+      return new Promise((resolve, reject) => {
+        held.push({
+          value: (JSON.parse(init.body) as EventEnvelope).exception.value,
+          keepalive,
+          answer: (status) => resolve({ ok: status >= 200 && status < 300, status }),
+          fail: () => reject(new TypeError('Failed to fetch')),
+          abort: () =>
+            reject(Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' })),
+        });
+      });
+    };
+    return { fn, held, values: (): string[] => held.map((h) => h.value) };
+  }
+
+  function page(fetchFn: ReturnType<typeof heldFetch>['fn']) {
+    const w = fakeWindow();
+    const doc = { visibilityState: 'visible', referrer: '' };
+    const nav = fakeNavigator({ beaconOk: true });
+    const store = fakeStorage();
+    const c = new Client(
+      { dsn: DSN, release: '1.0.0+1' },
+      {
+        fetchFn,
+        win: w.win,
+        doc,
+        navigator: nav.nav,
+        storage: store.storage,
+        setIntervalFn: () => 0,
+        clearIntervalFn: () => undefined,
+      },
+    );
+    c.install();
+    const hide = (how: 'pagehide' | 'visibilitychange'): void => {
+      doc.visibilityState = 'hidden';
+      w.dispatch(how, {});
+    };
+    const spooled = (): string[] =>
+      (JSON.parse(store.map.get(SPOOL_KEY) ?? '[]') as Array<{ env: EventEnvelope }>).map(
+        (item) => item.env.exception.value,
+      );
+    const beaconed = (): Promise<string[]> =>
+      Promise.all(
+        nav.beaconCalls.map(
+          async (b) => (JSON.parse(await beaconText(b.data)) as EventEnvelope).exception.value,
+        ),
+      );
+    return { c, hide, spooled, beaconed, store };
+  }
+
+  const settle = async (): Promise<void> => {
+    for (let i = 0; i < 5; i += 1) await tick();
+  };
+
+  it.each(['pagehide', 'visibilitychange'] as const)(
+    'on %s the in-flight crash is not beaconed, and the crash captured after it is sent next',
+    async (how) => {
+      const f = heldFetch();
+      const p = page(f.fn);
+      p.c.captureException(new Error('A'));
+      await settle();
+      expect(f.values()).toEqual(['A']);
+      expect(f.held[0]?.keepalive).toBe(true);
+
+      p.hide(how);
+      // Its keepalive fetch outlives the page: no beacon, and not in the spool
+      // either, or the next page load would send it again.
+      expect(await p.beaconed()).toEqual([]);
+      expect(p.spooled()).toEqual([]);
+      expect(p.c.size()).toBe(1);
+
+      p.c.captureException(new Error('B'));
+      expect(p.spooled()).toEqual(['B']);
+
+      f.held[0]?.answer(202);
+      await settle();
+      // A is gone, B was neither dropped nor sent twice: it is the next request.
+      expect(f.values()).toEqual(['A', 'B']);
+      expect(p.c.size()).toBe(1);
+      expect(p.spooled()).toEqual(['B']);
+
+      f.held[1]?.answer(202);
+      await settle();
+      expect(f.values()).toEqual(['A', 'B']);
+      expect(p.c.size()).toBe(0);
+      expect(p.store.map.has(SPOOL_KEY)).toBe(false);
+      expect(await p.beaconed()).toEqual([]);
+      p.c.close();
+    },
+  );
+
+  it.each([
+    ['400', [400]],
+    ['413, then 413 to the trimmed retry', [413, 413]],
+    ['413, then 202 to the trimmed retry', [413, 202]],
+  ] as const)(
+    'an in-flight crash answered %s is removed by id; the crash behind it is sent next',
+    async (_label, answers) => {
+      const f = heldFetch();
+      const p = page(f.fn);
+      p.c.captureException(new Error('A'));
+      await settle();
+      p.hide('visibilitychange');
+      p.c.captureException(new Error('B'));
+
+      for (const [i, status] of answers.entries()) {
+        f.held[i]?.answer(status);
+        await settle();
+      }
+      expect(f.values()).toEqual([...answers.map(() => 'A'), 'B']);
+      expect(p.c.size()).toBe(1);
+      expect(p.spooled()).toEqual(['B']);
+      p.c.close();
+    },
+  );
+
+  it('413 then 503 keeps the trimmed in-flight crash without overwriting the one behind it', async () => {
+    const f = heldFetch();
+    const p = page(f.fn);
+    p.c.captureException(new Error('A'));
+    await settle();
+    p.hide('visibilitychange');
+    p.c.captureException(new Error('B'));
+
+    f.held[0]?.answer(413);
+    await settle();
+    f.held[1]?.answer(503);
+    await settle();
+    expect(p.c.size()).toBe(2);
+    expect(p.spooled()).toEqual(['A', 'B']);
+    expect(await p.beaconed()).toEqual([]);
+    p.c.close();
+  });
+
+  it('when the in-flight crash fails after the page hid, it is kept and spooled for a retry', async () => {
+    const f = heldFetch();
+    const p = page(f.fn);
+    p.c.captureException(new Error('A'));
+    await settle();
+    p.hide('visibilitychange');
+    expect(p.spooled()).toEqual([]);
+
+    f.held[0]?.answer(503);
+    await settle();
+    expect(await p.beaconed()).toEqual([]);
+    expect(p.c.size()).toBe(1);
+    expect(p.spooled()).toEqual(['A']);
+    p.c.close();
+  });
+
+  it('a keepalive request rejected as the page unloads is not sent again, now or next page', async () => {
+    // Chromium 149 rejects the in-flight keepalive fetch with "TypeError:
+    // Failed to fetch" 1 ms after pagehide, while the POST itself still
+    // reaches the server. Read as a quota refusal, it was retried without
+    // keepalive and written back to the spool, and the next page sent it again.
+    const f = heldFetch();
+    const p = page(f.fn);
+    p.c.captureException(new Error('A'));
+    await settle();
+    p.hide('pagehide');
+    f.held[0]?.fail();
+    await settle();
+
+    expect(f.values()).toEqual(['A']);
+    expect(await p.beaconed()).toEqual([]);
+    expect(p.spooled()).toEqual([]);
+    expect(p.c.size()).toBe(0);
+    p.c.close();
+  });
+
+  it('a keepalive request our own timeout aborts after the page hid is kept and spooled', async () => {
+    // An abort cancels even a keepalive request, so this crash did not leave.
+    const f = heldFetch();
+    const p = page(f.fn);
+    p.c.captureException(new Error('A'));
+    await settle();
+    p.hide('visibilitychange');
+    f.held[0]?.abort();
+    await settle();
+
+    expect(f.values()).toEqual(['A']);
+    expect(await p.beaconed()).toEqual([]);
+    expect(p.spooled()).toEqual(['A']);
+    expect(p.c.size()).toBe(1);
+    p.c.close();
+  });
+
+  it('a send without keepalive dies with the page: not beaconed, kept in the spool', async () => {
+    // Refused keepalive, retried plain (the quota is held by other requests).
+    const f = heldFetch({ refuseKeepalive: true });
+    const p = page(f.fn);
+    p.c.captureException(new Error('A'));
+    await settle();
+    expect(f.held.map((h) => [h.value, h.keepalive])).toEqual([['A', false]]);
+
+    p.hide('pagehide');
+    expect(await p.beaconed()).toEqual([]);
+    expect(p.spooled()).toEqual(['A']);
+    expect(p.c.size()).toBe(1);
+
+    // The unload cancels the plain request; the spool still has it.
+    f.held[0]?.fail();
+    await settle();
+    expect(p.spooled()).toEqual(['A']);
+    expect(p.c.size()).toBe(1);
+    p.c.close();
+  });
+
+  it('an oversized crash in flight (no keepalive) is not beaconed and stays spooled', async () => {
+    const f = heldFetch();
+    const p = page(f.fn);
+    for (let i = 0; i < 100; i += 1) {
+      p.c.addBreadcrumb({ category: 'log', message: `${String(i)} ${'x'.repeat(1000)}` });
+    }
+    p.c.captureException(new Error('big'));
+    await settle();
+    expect(f.held.map((h) => [h.value, h.keepalive])).toEqual([['big', false]]);
+
+    p.hide('pagehide');
+    expect(await p.beaconed()).toEqual([]);
+    expect(p.spooled()).toEqual(['big']);
+    p.c.close();
+  });
+
+  it('an answer for a crash the 50-event cap already evicted removes nothing else', async () => {
+    const f = heldFetch();
+    const p = page(f.fn);
+    p.c.captureException(new Error('e0'));
+    await settle();
+    for (let i = 1; i <= 50; i += 1) p.c.captureException(new Error(`e${String(i)}`));
+    await settle();
+    // e0 is in flight; the 51st capture pushed it out of the queue.
+    expect(f.values()).toEqual(['e0']);
+    expect(p.c.size()).toBe(50);
+
+    f.held[0]?.answer(202);
+    await settle();
+    // e1, the new head, is sent next instead of being dropped unsent.
+    expect(f.values()).toEqual(['e0', 'e1']);
+    expect(p.c.size()).toBe(50);
+    p.c.close();
   });
 });

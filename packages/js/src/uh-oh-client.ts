@@ -721,6 +721,22 @@ interface QueueItem {
   env: EventEnvelope;
 }
 
+/**
+ * The queue item whose POST drainOnce is waiting on. `keepalive` is whether
+ * that request went with keepalive, so it outlives the page. `handedOff` is
+ * set by beaconFlush when the page hides during the send: the item is not
+ * beaconed (the request already carries it), and while that request is a
+ * keepalive one it is left out of the spool, or the next page load would send
+ * it a second time. `unloaded` is set by post() when that keepalive request
+ * then rejects with a TypeError (see sendQueued).
+ */
+interface InFlight {
+  id: string;
+  keepalive: boolean;
+  handedOff: boolean;
+  unloaded: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Client.
 // ---------------------------------------------------------------------------
@@ -762,6 +778,7 @@ export class Client {
 
   // Queue + guards.
   private queue: QueueItem[] = [];
+  private inFlight: InFlight | null = null;
   private capturing = false;
   private drainInFlight: Promise<void> | null = null;
   private drainRequested = false;
@@ -1398,7 +1415,40 @@ export class Client {
     this.persist();
   }
 
-  private async sendOne(env: EventEnvelope): Promise<{ ok: boolean; status?: number }> {
+  /**
+   * sendOne for a queue item, recorded in `inFlight` until it settles so that
+   * beaconFlush leaves it alone. For an item beaconFlush handed to its
+   * keepalive request (and so left out of the spool):
+   * - a TypeError is treated like a sent beacon and the item is dropped.
+   *   Chromium rejects an in-flight keepalive fetch with "TypeError: Failed to
+   *   fetch" as the page unloads while the request itself goes on to the
+   *   server (Chromium 149: the rejection came 1 ms after pagehide and the
+   *   POST still arrived). Retrying or re-spooling it would send it twice.
+   * - any other outcome (an HTTP answer, or our own timeout's abort, which
+   *   does cancel the request) goes back into the spool and drainOnce handles
+   *   it as usual: a 202 removes it, a 503 keeps it for a retry.
+   */
+  private async sendQueued(
+    item: QueueItem,
+    env: EventEnvelope,
+  ): Promise<{ ok: boolean; status?: number }> {
+    const flight: InFlight = { id: item.id, keepalive: false, handedOff: false, unloaded: false };
+    this.inFlight = flight;
+    let res: { ok: boolean; status?: number } = { ok: false };
+    try {
+      res = await this.sendOne(env, flight);
+    } finally {
+      if (this.inFlight === flight) this.inFlight = null;
+    }
+    if (flight.unloaded) this.removeQueued(item.id);
+    else if (flight.handedOff && flight.keepalive) this.persist();
+    return res;
+  }
+
+  private async sendOne(
+    env: EventEnvelope,
+    flight?: InFlight,
+  ): Promise<{ ok: boolean; status?: number }> {
     if (!this.dsn) return { ok: false };
     const fetchFn = this.fetchFn;
     if (!fetchFn) return { ok: false };
@@ -1431,7 +1481,7 @@ export class Client {
         body: JSON.stringify(env),
         ...(controller ? { signal: controller.signal } : {}),
       };
-      const res = await this.post(fetchFn, this.dsn.ingestUrl, init);
+      const res = await this.post(fetchFn, this.dsn.ingestUrl, init, flight);
       return { ok: res.ok, status: res.status };
     } catch {
       return { ok: false };
@@ -1451,14 +1501,28 @@ export class Client {
    * is shared with other keepalive requests in flight) is retried once
    * without it. Offline that costs one extra failed attempt. An abort is not
    * a TypeError and is not retried. Rejects when the last attempt rejects.
+   * `flight` (a queued crash's send) records which kind of request is going.
    */
-  private async post(fetchFn: FetchLike, url: string, init: FetchInit): Promise<FetchResponse> {
+  private async post(
+    fetchFn: FetchLike,
+    url: string,
+    init: FetchInit,
+    flight?: InFlight,
+  ): Promise<FetchResponse> {
     if (this.runtime !== 'browser' || !fitsKeepalive(init.body)) return fetchFn(url, init);
     try {
+      if (flight) flight.keepalive = true;
       return await fetchFn(url, { ...init, keepalive: true });
     } catch (e) {
       if (!isTypeError(e)) throw e;
+      if (flight?.handedOff === true) {
+        // After the page hid, a TypeError is the page unloading, not the
+        // quota: the request goes on without us (see sendQueued).
+        flight.unloaded = true;
+        throw e;
+      }
       this.log('debug', 'keepalive send refused; retrying once without keepalive', e);
+      if (flight) flight.keepalive = false;
       return fetchFn(url, init);
     }
   }
@@ -1539,16 +1603,22 @@ export class Client {
     this.updateRetryTimer();
   }
 
+  /**
+   * Sends the queue head by head. While a send is in flight the queue can
+   * change under it (beaconFlush rebuilds it, a capture appends, the 50-event
+   * cap evicts the oldest), so the head that was sent is removed by id, never
+   * by position: shift() used to drop whichever crash had become the head,
+   * unsent.
+   */
   private async drainOnce(): Promise<void> {
     if (!this.dsn) return;
     while (this.queue.length > 0 && !this.closed) {
       const item = this.queue[0];
       if (!item) break;
-      const res = await this.sendOne(item.env);
+      const res = await this.sendQueued(item, item.env);
 
       if (res.ok) {
-        this.queue.shift();
-        this.persist();
+        this.removeQueued(item.id);
         continue;
       }
 
@@ -1558,21 +1628,19 @@ export class Client {
           ...item.env,
           breadcrumbs: item.env.breadcrumbs.slice(-50),
         };
-        const retry = await this.sendOne(trimmed);
+        const retry = await this.sendQueued(item, trimmed);
         if (retry.ok) {
-          this.queue.shift();
-          this.persist();
+          this.removeQueued(item.id);
           continue;
         }
         if (retry.status === 413) {
           this.log('debug', 'event dropped after second 413');
-          this.queue.shift();
-          this.persist();
+          this.removeQueued(item.id);
           continue;
         }
         // Transient failure after trimming: keep the TRIMMED event and stop.
+        // `item` is the queued object itself (if it is still queued).
         item.env = trimmed;
-        this.queue[0] = item;
         this.persist();
         break;
       }
@@ -1580,14 +1648,20 @@ export class Client {
       // Other 4xx (not 429): permanent, drop and continue.
       if (res.status !== undefined && res.status >= 400 && res.status < 500 && res.status !== 429) {
         this.log('debug', `event dropped on ${String(res.status)} response`);
-        this.queue.shift();
-        this.persist();
+        this.removeQueued(item.id);
         continue;
       }
 
       // Network error, 5xx, or 429: retain and stop; the retry timer picks up.
       break;
     }
+  }
+
+  /** Removes a sent (or permanently refused) item, wherever it now sits. */
+  private removeQueued(id: string): void {
+    const i = this.queue.findIndex((q) => q.id === id);
+    if (i !== -1) this.queue.splice(i, 1);
+    this.persist();
   }
 
   private updateRetryTimer(): void {
@@ -1636,7 +1710,12 @@ export class Client {
     const storage = this.storage;
     if (!storage) return;
     try {
-      let items = this.queue.slice(-MAX_QUEUE);
+      // A crash handed to a keepalive request at pagehide is on its way
+      // already (see InFlight); spooling it would send it again next page.
+      const f = this.inFlight;
+      const queued =
+        f && f.handedOff && f.keepalive ? this.queue.filter((q) => q.id !== f.id) : this.queue;
+      let items = queued.slice(-MAX_QUEUE);
       let serialized = JSON.stringify(items);
       while (serialized.length > MAX_SPOOL_BYTES && items.length > 1) {
         items = items.slice(1);
@@ -1832,7 +1911,18 @@ export class Client {
       return;
     }
     const remaining: QueueItem[] = [];
+    const flight = this.inFlight;
     for (const item of this.queue) {
+      if (flight && item.id === flight.id) {
+        // Its POST is in flight: a beacon too would deliver it twice. It stays
+        // queued until that POST settles (see sendQueued). A keepalive POST
+        // outlives the page, so persist() leaves it out of the spool; a plain
+        // one (over the quota, or refused) dies with the page, so the spool
+        // keeps it for the next page load.
+        flight.handedOff = true;
+        remaining.push(item);
+        continue;
+      }
       let ok = false;
       try {
         const json = JSON.stringify(item.env);
