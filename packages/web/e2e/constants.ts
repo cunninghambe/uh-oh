@@ -20,6 +20,13 @@ export const E2E_ADMIN_PASSWORD = 'uh-oh-e2e-admin-password';
 export const E2E_JWT_SECRET = 'uh-oh-e2e-jwt-secret-at-least-32-characters-long-ok';
 export const E2E_WRONG_PASSWORD = 'definitely-not-the-password';
 
+// browser-ingest.spec.ts only (see ingest-harness.ts): its own BUILT server and a second "app"
+// origin that serves the BUILT @uh-oh/js client. The page loads from http://localhost:<app port>
+// and posts to http://127.0.0.1:<ingest port>, so every request is cross-origin and cross-site,
+// exactly like a vendored client posting to err.autogeny.ai. Same fixed-port reasoning as above.
+export const E2E_INGEST_SERVER_PORT = 34597;
+export const E2E_INGEST_APP_PORT = 34596;
+
 // v0.9 CONTRACT (SPEC §24 E2E catch-up): the env var global-setup.ts stashes the booted server's
 // temp SQLite path under, for the couple of scenarios that seed columns only a background sweep
 // normally writes (see db.ts) — issues.spike_active/last_spike_at and monitors.last_probe_at/

@@ -10,6 +10,7 @@
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p e2e/tsconfig.json --noEmit",
     "e2e": "playwright test",
+    "e2e:ingest": "pnpm --filter @uh-oh/server... --filter @uh-oh/js build && playwright test browser-ingest",
     "e2e:install": "playwright install chromium"
   },
   "dependencies": {

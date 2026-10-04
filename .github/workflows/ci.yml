@@ -87,8 +87,9 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       # Compiles-cleanly gate for @uh-oh/server (the main `ci` job above never builds it).
-      # The e2e run itself boots the server via `tsx` against source, not this dist output —
-      # see packages/web/e2e/server-runner.ts for why — but this still catches a broken build.
+      # The dashboard specs boot the server via `tsx` against source (see
+      # packages/web/e2e/server-runner.ts for why). browser-ingest.spec.ts boots THIS dist output
+      # and the built @uh-oh/js client, so this step must stay ahead of the e2e run.
       # Recursive, not just the server: the server's own build type-resolves against
       # @uh-oh/types and @uh-oh/mcp dist/, which don't exist on a fresh runner.
       - name: Build server (and its workspace deps)
