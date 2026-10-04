@@ -122,6 +122,21 @@ journalctl -u uh-oh-server --since '7 days ago' -o cat | jq -c 'select(.level >=
 
 A dead webhook also shows in the `get_server_health` MCP tool: `failedWebhookDispatches` counts the stored failed rows and `lastWebhookFailureAt` is when the latest one failed. Both come from the database, so a restart does not reset them (`webhookFailures` beside them is the in-memory `/metrics` counter, which does). Over HTTP the same figures are at `GET /api/health` (JWT). A scheduled check should alert when `lastWebhookFailureAt` is newer than its previous run.
 
+#### Dropped old-client reports (temporary)
+
+Browser apps still vendoring `@uh-oh/js` before 0.6.1 (0.5.0 in kanban, spoonworks, opening-bell and whitespace; 0.2.0 in bookforge) send mostly reports of the client's own "Illegal invocation" timer bug. Ingest drops those, and only those, answering 202 as for a stored event so the client forgets them: no event, no issue, no alert (`SPEC.md` §25, `packages/server/src/ingest/old-client-guard.ts`). Genuine errors from the same apps are stored as usual. Each drop counts per project, by slug, and the server logs one info line per project for the first drop after a start, then at most one per 10 minutes, with the running count (`dropped`) and `sdkVersion`. Neither shows the public key. Both counts are in memory and restart at 0.
+
+```bash
+# Per-project drop lines since midnight
+journalctl -u uh-oh-server --since today -o cat \
+  | jq -c 'select((.msg // "") | startswith("dropped an @uh-oh/js")) | {time, slug, sdkVersion, dropped}'
+
+# Exact counts since the process started (3300 = UH_OH_PORT)
+curl -s http://127.0.0.1:3300/metrics | grep '^uh_oh_old_client_reports_dropped_total'
+```
+
+A project whose count keeps growing still serves an old client somewhere, or its returning visitors still hold an old spool (the 0.6.1 client restores and sends it on their next visit). Remove the guard once every app is re-vendored to 0.6.1 or later and no drop has been counted for about two weeks; the comment at the top of `old-client-guard.ts` lists what goes with it.
+
 ### Bounding journald disk usage
 
 By default journald's disk usage is capped as a fraction of the filesystem it lives on, which on a small VPS can still be large enough to matter, especially if request logging is verbose (`UH_OH_LOG_LEVEL=debug`) or the box is under sustained crash-storm traffic. Set an explicit cap in `/etc/systemd/journald.conf`:

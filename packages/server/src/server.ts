@@ -235,6 +235,12 @@ export const buildServer = (deps: ServerDeps): FastifyInstance => {
         if (result.kind === 'rate-limited') {
           return reply.code(202).send({ eventId: null, rateLimited: true });
         }
+        if (result.kind === 'dropped') {
+          // An old client's report of its own timer bug (ingest/old-client-guard.ts,
+          // temporary): the exact answer a stored event gets, so the client
+          // treats it as sent and takes it off its queue.
+          return reply.code(202).send({ eventId: result.eventId });
+        }
         return reply.code(202).send({ eventId: result.eventId });
       },
     );
