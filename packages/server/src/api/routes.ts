@@ -27,6 +27,7 @@ import { buildIssueBundle } from './bundle.js';
 import { validateWebhookUrl } from '../webhooks/url-guard.js';
 import { clampDays, issueStats, projectStats } from '../db/repos/stats.js';
 import { clampUsageDays, usageSummary } from '../db/repos/usage-summary.js';
+import { summarizeFailedDispatches } from '../db/repos/webhook-dispatches.js';
 import { metrics } from '../metrics/registry.js';
 
 // list_top_issues bounds (mirrored by the MCP tool schema).
@@ -402,6 +403,14 @@ export const registerApiRoutes = (
       return { issues: topIssues(db, { limit, days }) };
     },
   );
+
+  // The database half of get_server_health for the HTTP backend: permanently
+  // failed webhook dispatches, which survive a restart (the in-memory
+  // uh_oh_webhook_failures_total does not). JWT only, like /api/top-issues; the
+  // read and agent tokens see the same figures through get_server_health on /mcp.
+  app.get('/api/health', { preHandler }, () => ({
+    failedWebhookDispatches: summarizeFailedDispatches(db),
+  }));
 
   app.get<{ Params: { id: string }; Querystring: { symbolicate?: string } }>(
     '/api/events/:id',

@@ -120,6 +120,8 @@ An alert that could not be delivered logs at level 50 with its dispatch `id`, al
 journalctl -u uh-oh-server --since '7 days ago' -o cat | jq -c 'select(.level >= 40)'
 ```
 
+A dead webhook also shows in the `get_server_health` MCP tool: `failedWebhookDispatches` counts the stored failed rows and `lastWebhookFailureAt` is when the latest one failed. Both come from the database, so a restart does not reset them (`webhookFailures` beside them is the in-memory `/metrics` counter, which does). Over HTTP the same figures are at `GET /api/health` (JWT). A scheduled check should alert when `lastWebhookFailureAt` is newer than its previous run.
+
 ### Bounding journald disk usage
 
 By default journald's disk usage is capped as a fraction of the filesystem it lives on, which on a small VPS can still be large enough to matter, especially if request logging is verbose (`UH_OH_LOG_LEVEL=debug`) or the box is under sustained crash-storm traffic. Set an explicit cap in `/etc/systemd/journald.conf`:

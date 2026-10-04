@@ -375,13 +375,27 @@ export interface EventDetail {
   frames?: ResolvedFrame[];
 }
 
+export interface FailedWebhookDispatches {
+  /** Permanently failed dispatches still stored (rows are pruned after 7 days). */
+  failed: number;
+  /** Epoch ms of the most recent permanent failure, or null when there is none. */
+  lastFailedAt: number | null;
+}
+
 export interface HealthReport {
   ok: boolean;
   /** True when the /metrics subset below was actually available. */
   metricsAvailable: boolean;
   eventsIngested: number;
   issuesNew: number;
+  /** In-memory counter: permanent webhook failures since the server process started. */
   webhookFailures: number;
+  /**
+   * Failed webhook dispatches read from the database, so unlike
+   * `webhookFailures` they survive a restart. Null when the server could not
+   * report them (an older server without GET /api/health, or the call failed).
+   */
+  failedWebhookDispatches: FailedWebhookDispatches | null;
 }
 
 /**

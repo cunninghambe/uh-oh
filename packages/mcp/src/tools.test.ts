@@ -436,6 +436,13 @@ class FakeBackend implements UhOhBackend {
     return Promise.resolve([{ ...RELEASE }]);
   }
 
+  // Swappable so tests can exercise a server that could not report the
+  // database-backed webhook failures.
+  failedWebhookDispatches: HealthReport['failedWebhookDispatches'] = {
+    failed: 2,
+    lastFailedAt: 1_700_000_000_000,
+  };
+
   getHealth(): Promise<HealthReport> {
     this.rec('getHealth');
     return Promise.resolve({
@@ -444,6 +451,7 @@ class FakeBackend implements UhOhBackend {
       eventsIngested: 12,
       issuesNew: 3,
       webhookFailures: 1,
+      failedWebhookDispatches: this.failedWebhookDispatches,
     });
   }
 
@@ -1093,6 +1101,29 @@ describe('releases + health', () => {
       issuesNew: 3,
       webhookFailures: 1,
     });
+  });
+
+  it('get_server_health reports the database-backed webhook failures with an ISO time', async () => {
+    const { isError, data } = await call(client, 'get_server_health');
+    expect(isError).toBe(false);
+    expect(data['failedWebhookDispatches']).toBe(2);
+    expect(data['lastWebhookFailureAt']).toBe('2023-11-14T22:13:20.000Z');
+  });
+
+  it('get_server_health reports zero stored failures and no failure time', async () => {
+    backend.failedWebhookDispatches = { failed: 0, lastFailedAt: null };
+    const { data } = await call(client, 'get_server_health');
+    expect(data['failedWebhookDispatches']).toBe(0);
+    expect(data).not.toHaveProperty('lastWebhookFailureAt');
+  });
+
+  it('get_server_health leaves both fields out when the server could not report them', async () => {
+    backend.failedWebhookDispatches = null;
+    const { isError, data } = await call(client, 'get_server_health');
+    expect(isError).toBe(false);
+    expect(data).not.toHaveProperty('failedWebhookDispatches');
+    expect(data).not.toHaveProperty('lastWebhookFailureAt');
+    expect(data['webhookFailures']).toBe(1);
   });
 });
 

@@ -15,6 +15,7 @@ import {
   type ClientFixAttemptTransition,
   type EventDetail,
   type EventRecord,
+  type FailedWebhookDispatches,
   type FixAttempt,
   type HealthReport,
   type Issue,
@@ -419,6 +420,25 @@ export class HttpBackend implements UhOhBackend {
       this.log(`metrics probe failed: ${err instanceof Error ? err.message : String(err)}`);
     }
 
-    return { ok, metricsAvailable, ...subset };
+    // The database half (failed webhook dispatches) needs auth. Production's
+    // proxy keeps /metrics on localhost, so from another machine this is the
+    // only webhook-failure figure available. A failure here never fails health.
+    let failedWebhookDispatches: FailedWebhookDispatches | null = null;
+    try {
+      const body = (await this.api('GET', '/api/health')) as {
+        failedWebhookDispatches?: Partial<FailedWebhookDispatches>;
+      } | null;
+      const f = body?.failedWebhookDispatches;
+      if (f && typeof f.failed === 'number') {
+        failedWebhookDispatches = {
+          failed: f.failed,
+          lastFailedAt: typeof f.lastFailedAt === 'number' ? f.lastFailedAt : null,
+        };
+      }
+    } catch (err) {
+      this.log(`health API probe failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    return { ok, metricsAvailable, ...subset, failedWebhookDispatches };
   }
 }

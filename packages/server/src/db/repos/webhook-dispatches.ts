@@ -1,4 +1,4 @@
-import { and, eq, lte } from 'drizzle-orm';
+import { and, count, eq, lte, max } from 'drizzle-orm';
 
 import type { DbOrTx } from '../index.js';
 import { newId } from '../ids.js';
@@ -79,8 +79,16 @@ export const markDispatchAttempt = (
   }
 
   if (result.nextAttemptAt === null) {
+    // A failed row is never attempted again, so its next_attempt_at is free to
+    // record when the final attempt happened. summarizeFailedDispatches reads
+    // it as the failure time.
     db.update(webhookDispatches)
-      .set({ status: 'failed', lastError: result.error, lastResponseCode: result.statusCode })
+      .set({
+        status: 'failed',
+        nextAttemptAt: result.at,
+        lastError: result.error,
+        lastResponseCode: result.statusCode,
+      })
       .where(eq(webhookDispatches.id, id))
       .run();
     return;
@@ -102,4 +110,28 @@ export const markDispatchAttempt = (
     })
     .where(eq(webhookDispatches.id, id))
     .run();
+};
+
+export type FailedDispatchSummary = {
+  /** Dispatches that failed permanently and are still in the table. */
+  failed: number;
+  /** Epoch ms of the most recent permanent failure, or null when there is none. */
+  lastFailedAt: number | null;
+};
+
+/**
+ * Permanently failed webhook dispatches, read from the table so the figure
+ * survives a restart (the `uh_oh_webhook_failures_total` counter starts at 0 in
+ * every new process). The window is bounded by retention: pruneOldData deletes
+ * terminal rows 7 days after they were enqueued. A row marked failed before
+ * markDispatchAttempt recorded the failure time still holds the time its final
+ * attempt was scheduled for, which is within one poll of when it ran.
+ */
+export const summarizeFailedDispatches = (db: DbOrTx): FailedDispatchSummary => {
+  const row = db
+    .select({ failed: count(), lastFailedAt: max(webhookDispatches.nextAttemptAt) })
+    .from(webhookDispatches)
+    .where(eq(webhookDispatches.status, 'failed'))
+    .get();
+  return { failed: row?.failed ?? 0, lastFailedAt: row?.lastFailedAt ?? null };
 };
