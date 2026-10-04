@@ -529,6 +529,8 @@ pnpm format:check        # prettier --check
 pnpm test                # vitest run, all packages
 ```
 
+Line endings: blobs are LF. Git for Windows defaults to `core.autocrlf=true`, which leaves CRLF in a Windows working tree, so `.prettierrc` sets `endOfLine: "auto"` and `pnpm format:check` passes there on clean code. CI runs `pnpm format:check --end-of-line lf` on its LF checkout (the CLI flag outranks the config file), so a CRLF blob still fails the gate. `scripts/prettier-eol.test.mjs` pins both halves.
+
 Subtasks that touch HTTP endpoints must include integration tests using `app.inject()` (Fastify in-process testing).
 Subtasks that ship UI must run `pnpm --filter @uh-oh/web build` to verify production build succeeds.
 Subtasks must update §14 status column to `[done]` when complete, and commit + push.

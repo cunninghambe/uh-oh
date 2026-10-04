@@ -44,8 +44,12 @@ jobs:
       - name: Lint
         run: pnpm lint
 
+      # .prettierrc sets endOfLine 'auto' so the local gate passes on a Windows
+      # checkout (core.autocrlf=true leaves CRLF in the working tree). This
+      # runner checks out the LF blobs, and a CLI flag outranks the config
+      # file, so passing --end-of-line lf keeps CI strict: a CRLF blob fails.
       - name: Format check
-        run: pnpm format:check
+        run: pnpm format:check --end-of-line lf
 
       - name: Test
         run: pnpm test
@@ -54,7 +58,7 @@ jobs:
         run: pnpm --filter @uh-oh/web build
 
       - name: Unit test scripts/ (node:test — no vitest dep at the repo root)
-        run: node --test scripts/build-sdk-dist.test.mjs scripts/vendor-js-client.test.mjs scripts/build-js-dist.test.mjs scripts/build-mcp-dist.test.mjs scripts/vendor-sourcemap-uploader.test.mjs
+        run: node --test scripts/build-sdk-dist.test.mjs scripts/vendor-js-client.test.mjs scripts/build-js-dist.test.mjs scripts/build-mcp-dist.test.mjs scripts/vendor-sourcemap-uploader.test.mjs scripts/prettier-eol.test.mjs
 
       # shellcheck ships preinstalled on the ubuntu-latest runner image, but
       # install explicitly anyway so this step doesn't silently start
