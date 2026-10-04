@@ -1,12 +1,18 @@
 // The temporary guard against old @uh-oh/js clients' reports of their own
-// "Illegal invocation" timer bug (old-client-guard.ts). The fixtures are what
-// the clients really send: the 0.2.0 (bookforge), 0.5.0 (js-dist, vendored in
-// kanban, spoonworks, opening-bell and whitespace) and 0.6.0 (90d24af) sources,
-// plain and minified with esbuild, recorded in Chromium 149 on a harness page at
+// unbound-timer bug (old-client-guard.ts). The fixtures are what the clients
+// really send: the 0.2.0 (bookforge), 0.5.0 (js-dist, vendored in kanban,
+// spoonworks, opening-bell and whitespace) and 0.6.0 (90d24af) sources, plain
+// and minified with esbuild, recorded in Chromium 149 on a harness page at
 // http://localhost:34611 posting to a stub ingest that answered the credentialed
-// preflight. The BEACON_* strings are pagehide beacon bodies byte for byte; the
-// check-in and usage frames are the recorded ones down to the client's public
-// function (the harness's Playwright frames below that are left out).
+// preflight. The same harness recorded Firefox 151 and WebKit 26.5 (Playwright
+// 1.61.1) running the js-dist 0.5.0 file as shipped and the 0.2.0 and 0.6.0
+// sources with their types stripped, each plain and minified into an app
+// bundle (0.2.0 has no checkIn() or usage flush, so only its retry loop); the
+// page's own code (app.js) started each scenario. The BEACON_* strings are pagehide
+// beacon bodies byte for byte, and the APP_*_FIREFOX/WEBKIT strings the queued
+// envelope byte for byte; the other check-in, usage and retry-loop frames are
+// the recorded ones down to the client's public function (the harness's frames
+// below that are left out).
 import type { EventEnvelope, StackFrame } from '@uh-oh/types';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -25,10 +31,12 @@ import { captureLog, forwardLevel } from '../logging/test-utils.js';
 
 import { ingest as ingestFn } from './ingest.js';
 import {
+  CLIENT_TIMER_CALLERS,
   CLIENT_TIMER_METHODS,
   isBeforeFixedJsClient,
   isOldClientSelfReport,
   OLD_CLIENT_DROP_LOG_INTERVAL_MS,
+  TIMER_BUG_WORDINGS,
 } from './old-client-guard.js';
 import { createRateLimiter } from './rate-limit.js';
 
@@ -47,6 +55,40 @@ const BEACON_060_MIN =
 /** 0.2.0 (bookforge's vendored copy), minified: the class is `g`. */
 const BEACON_020_MIN =
   '{"sdk":{"name":"@uh-oh/js","version":"0.2.0"},"timestamp":"2026-10-04T03:14:52.232Z","platform":"web","release":{"version":"1.4.2","build":"37"},"level":"error","exception":{"type":"TypeError","value":"Illegal invocation","stacktrace":[{"inApp":true,"function":"g.ensureRetryTimer","filename":"http://localhost:34611/build/bundle-020.min.js","lineno":3,"colno":4678},{"inApp":true,"function":"g.updateRetryTimer","filename":"http://localhost:34611/build/bundle-020.min.js","lineno":3,"colno":4569},{"inApp":true,"function":"g.drainLoop","filename":"http://localhost:34611/build/bundle-020.min.js","lineno":3,"colno":3811}],"mechanism":"js-promise"},"breadcrumbs":[],"device":{"osName":"Windows","osVersion":"10.0","locale":"en-US","timezone":"America/New_York"},"context":{"environment":"production","eventId":"efe7c35b-aa3e-4f89-9e87-15bc282db520"}}';
+
+/**
+ * Firefox 151, 0.5.0 unminified: the retry-loop report, as beaconed. Firefox's
+ * stack has no header line, so the client's `slice(1)` dropped the throw site
+ * (`ensureRetryTimer@...:882:32`) and its caller is on top. `async*` marks the
+ * start of an async segment; the last frame is the stack's trailing newline.
+ */
+const BEACON_050_FIREFOX =
+  '{"sdk":{"name":"@uh-oh/js","version":"0.5.0"},"timestamp":"2026-10-04T03:40:49.778Z","platform":"web","release":{"version":"1.4.2","build":"37"},"level":"error","exception":{"type":"TypeError","value":"\'setInterval\' called on an object that does not implement interface Window.","stacktrace":[{"inApp":true,"function":"updateRetryTimer","filename":"http://localhost:34611/build/client-050.js","lineno":873,"colno":18},{"inApp":true,"function":"drainLoop","filename":"http://localhost:34611/build/client-050.js","lineno":821,"colno":14},{"inApp":true,"function":"async*drainQueue","filename":"http://localhost:34611/build/client-050.js","lineno":805,"colno":35},{"inApp":true,"function":"captureWithException","filename":"http://localhost:34611/build/client-050.js","lineno":548,"colno":23},{"inApp":true,"function":"onRejection","filename":"http://localhost:34611/build/client-050.js","lineno":379,"colno":22},{"inApp":true,"function":"EventListener.handleEvent*installBrowserHandlers","filename":"http://localhost:34611/build/client-050.js","lineno":382,"colno":20},{"inApp":true,"function":"install","filename":"http://localhost:34611/build/client-050.js","lineno":355,"colno":18},{"inApp":true,"function":"init","filename":"http://localhost:34611/build/client-050.js","lineno":1585,"colno":17},{"inApp":true,"filename":"http://localhost:34611/app.js","lineno":22,"colno":3},{"inApp":true}],"mechanism":"js-promise"},"breadcrumbs":[],"device":{"osName":"Windows","osVersion":"10.0","locale":"en-US","timezone":"America/New_York"},"context":{"environment":"production","eventId":"2a0b76e4-8ef5-4db9-a9b9-4b5d8afb43e5"}}';
+
+/** Firefox 151, 0.6.0 minified into an app bundle: the method names survive, the class is gone. */
+const BEACON_060_MIN_FIREFOX =
+  '{"sdk":{"name":"@uh-oh/js","version":"0.6.0"},"timestamp":"2026-10-04T03:41:39.858Z","platform":"web","release":{"version":"1.4.2","build":"37"},"level":"error","exception":{"type":"TypeError","value":"\'setInterval\' called on an object that does not implement interface Window.","stacktrace":[{"inApp":true,"function":"updateRetryTimer","filename":"http://localhost:34611/build/bundle-060.min.js","lineno":3,"colno":6738},{"inApp":true,"function":"drainLoop","filename":"http://localhost:34611/build/bundle-060.min.js","lineno":3,"colno":5980},{"inApp":true,"function":"async*drainQueue","filename":"http://localhost:34611/build/bundle-060.min.js","lineno":3,"colno":5734},{"inApp":true,"function":"captureWithException","filename":"http://localhost:34611/build/bundle-060.min.js","lineno":3,"colno":2010},{"inApp":true,"function":"n","filename":"http://localhost:34611/build/bundle-060.min.js","lineno":2,"colno":3680},{"inApp":true,"function":"EventListener.handleEvent*installBrowserHandlers","filename":"http://localhost:34611/build/bundle-060.min.js","lineno":2,"colno":3768},{"inApp":true,"function":"install","filename":"http://localhost:34611/build/bundle-060.min.js","lineno":2,"colno":3275},{"inApp":true,"function":"U","filename":"http://localhost:34611/build/bundle-060.min.js","lineno":3,"colno":15868},{"inApp":true,"filename":"http://localhost:34611/build/bundle-060.min.js","lineno":3,"colno":16472},{"inApp":true}],"mechanism":"js-promise"},"breadcrumbs":[],"device":{"osName":"Windows","osVersion":"10.0","locale":"en-US","timezone":"America/New_York"},"context":{"environment":"production","eventId":"cae8f070-ccbc-4792-9bab-0917e2deaeb2"}}';
+
+/**
+ * WebKit 26.5, 0.5.0 unminified: the retry-loop report, as beaconed. The stack
+ * starts with `setInterval@[native code]`, which the client's `slice(1)` dropped,
+ * so the throw site is on top as a bare method name. (Playwright's WebKit sends
+ * a macOS user agent on every host.)
+ */
+const BEACON_050_WEBKIT =
+  '{"sdk":{"name":"@uh-oh/js","version":"0.5.0"},"timestamp":"2026-10-04T03:42:29.731Z","platform":"web","release":{"version":"1.4.2","build":"37"},"level":"error","exception":{"type":"TypeError","value":"Can only call Window.setInterval on instances of Window","stacktrace":[{"inApp":true,"function":"ensureRetryTimer","filename":"http://localhost:34611/build/client-050.js","lineno":882,"colno":45},{"inApp":true,"function":"updateRetryTimer","filename":"http://localhost:34611/build/client-050.js","lineno":873,"colno":34},{"inApp":true,"function":"drainLoop","filename":"http://localhost:34611/build/client-050.js","lineno":821,"colno":30}],"mechanism":"js-promise"},"breadcrumbs":[],"device":{"osName":"macOS","osVersion":"10.15.7","locale":"en-US","timezone":"America/New_York"},"context":{"environment":"production","eventId":"fca9333b-9c0c-44e1-a135-650d9f4dbab5"}}';
+
+/** WebKit 26.5, 0.6.0 minified into an app bundle. */
+const BEACON_060_MIN_WEBKIT =
+  '{"sdk":{"name":"@uh-oh/js","version":"0.6.0"},"timestamp":"2026-10-04T03:42:59.270Z","platform":"web","release":{"version":"1.4.2","build":"37"},"level":"error","exception":{"type":"TypeError","value":"Can only call Window.setInterval on instances of Window","stacktrace":[{"inApp":true,"function":"ensureRetryTimer","filename":"http://localhost:34611/build/bundle-060.min.js","lineno":3,"colno":6860},{"inApp":true,"function":"updateRetryTimer","filename":"http://localhost:34611/build/bundle-060.min.js","lineno":3,"colno":6754},{"inApp":true,"function":"drainLoop","filename":"http://localhost:34611/build/bundle-060.min.js","lineno":3,"colno":5996}],"mechanism":"js-promise"},"breadcrumbs":[],"device":{"osName":"macOS","osVersion":"10.15.7","locale":"en-US","timezone":"America/New_York"},"context":{"environment":"production","eventId":"f48e4870-3c98-4d3b-a7fe-47bcd2882702"}}';
+
+/** Firefox 151 and WebKit 26.5 messages for the two timers the client's reports carried. */
+const FIREFOX_SET_TIMEOUT =
+  "'setTimeout' called on an object that does not implement interface Window.";
+const FIREFOX_SET_INTERVAL =
+  "'setInterval' called on an object that does not implement interface Window.";
+const WEBKIT_SET_TIMEOUT = 'Can only call Window.setTimeout on instances of Window';
+const WEBKIT_SET_INTERVAL = 'Can only call Window.setInterval on instances of Window';
 
 const parse = (raw: string): EventEnvelope => JSON.parse(raw) as EventEnvelope;
 
@@ -81,8 +123,8 @@ const oldClient = (
   context: { environment: 'production', eventId },
 });
 
-/** Every recorded shape of the bug: version x build x throw site. */
-const SELF_REPORTS: Array<[string, EventEnvelope]> = [
+/** Every recorded shape of the bug in Chromium 149: version x build x throw site. */
+const CHROMIUM_SELF_REPORTS: Array<[string, EventEnvelope]> = [
   ['0.5.0 retry loop, beacon body', parse(BEACON_050)],
   ['0.6.0 minified retry loop, beacon body', parse(BEACON_060_MIN)],
   ['0.2.0 minified retry loop, beacon body', parse(BEACON_020_MIN)],
@@ -196,6 +238,288 @@ const SELF_REPORTS: Array<[string, EventEnvelope]> = [
   ],
 ];
 
+/**
+ * Every recorded shape in Firefox 151. The top frame is the CALLER of the throw
+ * site (updateRetryTimer, checkIn, flushAnalytics), not the throw site.
+ */
+const FIREFOX_SELF_REPORTS: Array<[string, EventEnvelope]> = [
+  ['0.5.0 retry loop, beacon body', parse(BEACON_050_FIREFOX)],
+  ['0.6.0 minified retry loop, beacon body', parse(BEACON_060_MIN_FIREFOX)],
+  [
+    '0.2.0 minified retry loop',
+    oldClient('0.2.0', {
+      value: FIREFOX_SET_INTERVAL,
+      stacktrace: [
+        frame('updateRetryTimer', 'bundle-020.min.js', 3, 4569),
+        frame('drainLoop', 'bundle-020.min.js', 3, 3811),
+        frame('async*drainQueue', 'bundle-020.min.js', 3, 3565),
+      ],
+    }),
+  ],
+  [
+    '0.5.0 minified retry loop',
+    oldClient('0.5.0', {
+      value: FIREFOX_SET_INTERVAL,
+      stacktrace: [
+        frame('updateRetryTimer', 'bundle-050.min.js', 3, 5371),
+        frame('drainLoop', 'bundle-050.min.js', 3, 4613),
+        frame('async*drainQueue', 'bundle-050.min.js', 3, 4367),
+      ],
+    }),
+  ],
+  [
+    '0.6.0 retry loop',
+    oldClient('0.6.0', {
+      value: FIREFOX_SET_INTERVAL,
+      stacktrace: [
+        frame('updateRetryTimer', 'client-060.js', 822, 12),
+        frame('drainLoop', 'client-060.js', 776, 10),
+        frame('async*drainQueue', 'client-060.js', 761, 31),
+      ],
+    }),
+  ],
+  [
+    '0.5.0 checkIn()',
+    oldClient('0.5.0', {
+      value: FIREFOX_SET_TIMEOUT,
+      stacktrace: [
+        frame('checkIn', 'client-050.js', 695, 23),
+        frame('checkIn', 'client-050.js', 1659, 25),
+      ],
+    }),
+  ],
+  [
+    '0.5.0 minified checkIn()',
+    oldClient('0.5.0', {
+      value: FIREFOX_SET_TIMEOUT,
+      stacktrace: [
+        frame('checkIn', 'bundle-050.min.js', 3, 3147),
+        frame('k', 'bundle-050.min.js', 3, 14634),
+      ],
+    }),
+  ],
+  [
+    '0.6.0 checkIn()',
+    oldClient('0.6.0', {
+      value: FIREFOX_SET_TIMEOUT,
+      stacktrace: [
+        frame('checkIn', 'client-060.js', 674, 17),
+        frame('checkIn', 'client-060.js', 1478, 21),
+      ],
+    }),
+  ],
+  [
+    '0.6.0 minified checkIn()',
+    oldClient('0.6.0', {
+      value: FIREFOX_SET_TIMEOUT,
+      stacktrace: [
+        frame('checkIn', 'bundle-060.min.js', 3, 4514),
+        frame('M', 'bundle-060.min.js', 3, 16032),
+      ],
+    }),
+  ],
+  [
+    '0.5.0 usage flush at 20 events',
+    oldClient('0.5.0', {
+      value: FIREFOX_SET_TIMEOUT,
+      stacktrace: [
+        frame('flushAnalytics', 'client-050.js', 1338, 21),
+        frame('enqueueAnalytics', 'client-050.js', 1298, 23),
+        frame('trackEvent', 'client-050.js', 1201, 18),
+        frame('trackEvent', 'client-050.js', 1675, 28),
+      ],
+    }),
+  ],
+  [
+    '0.5.0 minified usage flush',
+    oldClient('0.5.0', {
+      value: FIREFOX_SET_TIMEOUT,
+      stacktrace: [
+        frame('flushAnalytics', 'bundle-050.min.js', 3, 11662),
+        frame('enqueueAnalytics', 'bundle-050.min.js', 3, 11073),
+        frame('trackEvent', 'bundle-050.min.js', 3, 9362),
+        frame('U', 'bundle-050.min.js', 3, 14681),
+      ],
+    }),
+  ],
+  [
+    '0.6.0 usage flush at 20 events',
+    oldClient('0.6.0', {
+      value: FIREFOX_SET_TIMEOUT,
+      stacktrace: [
+        frame('flushAnalytics', 'client-060.js', 1222, 17),
+        frame('enqueueAnalytics', 'client-060.js', 1190, 17),
+        frame('trackEvent', 'client-060.js', 1098, 12),
+        frame('trackEvent', 'client-060.js', 1490, 24),
+      ],
+    }),
+  ],
+  [
+    '0.6.0 minified usage flush',
+    oldClient('0.6.0', {
+      value: FIREFOX_SET_TIMEOUT,
+      stacktrace: [
+        frame('flushAnalytics', 'bundle-060.min.js', 3, 13060),
+        frame('enqueueAnalytics', 'bundle-060.min.js', 3, 12471),
+        frame('trackEvent', 'bundle-060.min.js', 3, 10729),
+        frame('F', 'bundle-060.min.js', 3, 16079),
+      ],
+    }),
+  ],
+];
+
+/**
+ * Every recorded shape in WebKit 26.5: the throw site on top, as in Chromium,
+ * with a bare method name. JavaScriptCore runs `return this.sendAnalyticsBatch(...)`
+ * as a tail call, so flushAnalytics is missing below the usage flush.
+ */
+const WEBKIT_SELF_REPORTS: Array<[string, EventEnvelope]> = [
+  ['0.5.0 retry loop, beacon body', parse(BEACON_050_WEBKIT)],
+  ['0.6.0 minified retry loop, beacon body', parse(BEACON_060_MIN_WEBKIT)],
+  [
+    '0.2.0 minified retry loop',
+    oldClient('0.2.0', {
+      value: WEBKIT_SET_INTERVAL,
+      stacktrace: [
+        frame('ensureRetryTimer', 'bundle-020.min.js', 3, 4691),
+        frame('updateRetryTimer', 'bundle-020.min.js', 3, 4585),
+        frame('drainLoop', 'bundle-020.min.js', 3, 3827),
+      ],
+    }),
+  ],
+  [
+    '0.5.0 minified retry loop',
+    oldClient('0.5.0', {
+      value: WEBKIT_SET_INTERVAL,
+      stacktrace: [
+        frame('ensureRetryTimer', 'bundle-050.min.js', 3, 5493),
+        frame('updateRetryTimer', 'bundle-050.min.js', 3, 5387),
+        frame('drainLoop', 'bundle-050.min.js', 3, 4629),
+      ],
+    }),
+  ],
+  [
+    '0.6.0 retry loop',
+    oldClient('0.6.0', {
+      value: WEBKIT_SET_INTERVAL,
+      stacktrace: [
+        frame('ensureRetryTimer', 'client-060.js', 829, 41),
+        frame('updateRetryTimer', 'client-060.js', 822, 28),
+        frame('drainLoop', 'client-060.js', 776, 26),
+      ],
+    }),
+  ],
+  [
+    '0.5.0 checkIn()',
+    oldClient('0.5.0', {
+      value: WEBKIT_SET_TIMEOUT,
+      stacktrace: [
+        frame('sendCheckIn', 'client-050.js', 719, 32),
+        frame('checkIn', 'client-050.js', 695, 34),
+        frame('checkIn', 'client-050.js', 1659, 25),
+      ],
+    }),
+  ],
+  [
+    '0.5.0 minified checkIn()',
+    oldClient('0.5.0', {
+      value: WEBKIT_SET_TIMEOUT,
+      stacktrace: [
+        frame('sendCheckIn', 'bundle-050.min.js', 3, 3360),
+        frame('checkIn', 'bundle-050.min.js', 3, 3158),
+        frame('k', 'bundle-050.min.js', 3, 14634),
+      ],
+    }),
+  ],
+  [
+    '0.6.0 checkIn()',
+    oldClient('0.6.0', {
+      value: WEBKIT_SET_TIMEOUT,
+      stacktrace: [
+        frame('sendCheckIn', 'client-060.js', 693, 49),
+        frame('checkIn', 'client-060.js', 674, 28),
+        frame('checkIn', 'client-060.js', 1478, 21),
+      ],
+    }),
+  ],
+  [
+    '0.6.0 minified checkIn()',
+    oldClient('0.6.0', {
+      value: WEBKIT_SET_TIMEOUT,
+      stacktrace: [
+        frame('sendCheckIn', 'bundle-060.min.js', 3, 4727),
+        frame('checkIn', 'bundle-060.min.js', 3, 4525),
+        frame('M', 'bundle-060.min.js', 3, 16032),
+      ],
+    }),
+  ],
+  [
+    '0.5.0 usage flush at 20 events',
+    oldClient('0.5.0', {
+      value: WEBKIT_SET_TIMEOUT,
+      stacktrace: [
+        frame('sendAnalyticsBatch', 'client-050.js', 1362, 32),
+        frame('enqueueAnalytics', 'client-050.js', 1298, 37),
+        frame('trackEvent', 'client-050.js', 1201, 34),
+        frame('trackEvent', 'client-050.js', 1675, 28),
+      ],
+    }),
+  ],
+  [
+    '0.5.0 minified usage flush',
+    oldClient('0.5.0', {
+      value: WEBKIT_SET_TIMEOUT,
+      stacktrace: [
+        frame('sendAnalyticsBatch', 'bundle-050.min.js', 3, 11846),
+        frame('enqueueAnalytics', 'bundle-050.min.js', 3, 11087),
+        frame('trackEvent', 'bundle-050.min.js', 3, 9378),
+        frame('U', 'bundle-050.min.js', 3, 14681),
+      ],
+    }),
+  ],
+  [
+    '0.6.0 usage flush at 20 events',
+    oldClient('0.6.0', {
+      value: WEBKIT_SET_TIMEOUT,
+      stacktrace: [
+        frame('sendAnalyticsBatch', 'client-060.js', 1242, 49),
+        frame('enqueueAnalytics', 'client-060.js', 1190, 31),
+        frame('trackEvent', 'client-060.js', 1098, 28),
+        frame('trackEvent', 'client-060.js', 1490, 24),
+      ],
+    }),
+  ],
+  [
+    '0.6.0 minified usage flush',
+    oldClient('0.6.0', {
+      value: WEBKIT_SET_TIMEOUT,
+      stacktrace: [
+        frame('sendAnalyticsBatch', 'bundle-060.min.js', 3, 13244),
+        frame('enqueueAnalytics', 'bundle-060.min.js', 3, 12485),
+        frame('trackEvent', 'bundle-060.min.js', 3, 10745),
+        frame('F', 'bundle-060.min.js', 3, 16079),
+      ],
+    }),
+  ],
+];
+
+const SELF_REPORTS: Array<[string, EventEnvelope]> = [
+  ...CHROMIUM_SELF_REPORTS.map(([l, e]): [string, EventEnvelope] => [`Chromium ${l}`, e]),
+  ...FIREFOX_SELF_REPORTS.map(([l, e]): [string, EventEnvelope] => [`Firefox ${l}`, e]),
+  ...WEBKIT_SELF_REPORTS.map(([l, e]): [string, EventEnvelope] => [`WebKit ${l}`, e]),
+];
+
+/** Every recorded beacon body: the full 50 at pagehide were this report in each engine. */
+const BEACONS: Array<[string, string]> = [
+  ['Chromium 0.5.0', BEACON_050],
+  ['Chromium 0.6.0', BEACON_060_MIN],
+  ['Chromium 0.2.0', BEACON_020_MIN],
+  ['Firefox 0.5.0', BEACON_050_FIREFOX],
+  ['Firefox 0.6.0', BEACON_060_MIN_FIREFOX],
+  ['WebKit 0.5.0', BEACON_050_WEBKIT],
+  ['WebKit 0.6.0', BEACON_060_MIN_WEBKIT],
+];
+
 /** A genuine app crash from a 0.5.0 page: the same envelope shape, the app's own frame. */
 const APP_TYPE_ERROR_050 = oldClient('0.5.0', {
   value: "Cannot read properties of undefined (reading 'id')",
@@ -225,6 +549,19 @@ const APP_PUSHSTATE_060 = oldClient('0.6.0', {
   mechanism: 'js-global',
 });
 
+/**
+ * The app's OWN unbound window timer (`appTimers.schedule(...)` in
+ * `scheduleAutosave`, called from `onCardDropped`) on a 0.5.0 page in Firefox
+ * 151, as queued: Firefox's wording, but the frame on top (the caller, as for
+ * the client's own reports) is app code, so it is stored.
+ */
+const APP_TIMER_050_FIREFOX =
+  '{"sdk":{"name":"@uh-oh/js","version":"0.5.0"},"timestamp":"2026-10-04T03:49:44.566Z","platform":"web","release":{"version":"1.4.2","build":"37"},"level":"error","exception":{"type":"TypeError","value":"\'setTimeout\' called on an object that does not implement interface Window.","stacktrace":[{"inApp":true,"function":"onCardDropped","filename":"http://localhost:34611/app.js","lineno":43,"colno":3},{"inApp":true,"function":"setTimeout handler*runScenario","filename":"http://localhost:34611/app.js","lineno":48,"colno":47},{"inApp":true,"function":"setTimeout handler*","filename":"http://localhost:34611/app.js","lineno":55,"colno":11},{"inApp":true}],"mechanism":"js-global"},"breadcrumbs":[],"device":{"osName":"Windows","osVersion":"10.0","locale":"en-US","timezone":"America/New_York"},"context":{"environment":"production","eventId":"cbc3648e-e94b-4e62-8cf9-77bd8fb4f30e"}}';
+
+/** The same app bug on a 0.6.0 page in WebKit 26.5, as queued: the app's throw site on top. */
+const APP_TIMER_060_WEBKIT =
+  '{"sdk":{"name":"@uh-oh/js","version":"0.6.0"},"timestamp":"2026-10-04T03:49:57.692Z","platform":"web","release":{"version":"1.4.2","build":"37"},"level":"error","exception":{"type":"TypeError","value":"Can only call Window.setTimeout on instances of Window","stacktrace":[{"inApp":true,"function":"scheduleAutosave","filename":"http://localhost:34611/app.js","lineno":40,"colno":21},{"inApp":true,"function":"onCardDropped","filename":"http://localhost:34611/app.js","lineno":43,"colno":19}],"mechanism":"js-global"},"breadcrumbs":[],"device":{"osName":"macOS","osVersion":"10.15.7","locale":"en-US","timezone":"America/New_York"},"context":{"environment":"production","eventId":"6d272ecf-8fc6-4d8b-a064-448270730f83"}}';
+
 // ---------------------------------------------------------------------------
 // The predicate.
 // ---------------------------------------------------------------------------
@@ -234,10 +571,37 @@ describe('isOldClientSelfReport', () => {
     expect(isOldClientSelfReport(env)).toBe(true);
   });
 
-  it('every recorded throw site is one of the listed client timer methods', () => {
-    for (const [, env] of SELF_REPORTS) {
-      const top = env.exception.stacktrace[0]?.function ?? '';
-      expect(CLIENT_TIMER_METHODS.has(top.slice(top.lastIndexOf('.') + 1))).toBe(true);
+  const topMethod = (env: EventEnvelope): string => {
+    const top = env.exception.stacktrace[0]?.function ?? '';
+    return top.slice(top.lastIndexOf('.') + 1);
+  };
+
+  it('in Chromium and WebKit every recorded top frame is the throw site, a client timer method', () => {
+    for (const [label, env] of [...CHROMIUM_SELF_REPORTS, ...WEBKIT_SELF_REPORTS]) {
+      expect(CLIENT_TIMER_METHODS.has(topMethod(env)), label).toBe(true);
+    }
+  });
+
+  it('in Firefox every recorded top frame is the client method that called the throw site', () => {
+    for (const [label, env] of FIREFOX_SELF_REPORTS) {
+      expect(CLIENT_TIMER_CALLERS.has(topMethod(env)), label).toBe(true);
+      expect(CLIENT_TIMER_METHODS.has(topMethod(env)), label).toBe(false);
+    }
+  });
+
+  it("pairs each wording with its engine's top frame, never another engine's", () => {
+    // Chromium's or Safari's wording over Firefox's frames: the caller is on top, not a timer method.
+    for (const value of ['Illegal invocation', WEBKIT_SET_INTERVAL]) {
+      const env = parse(BEACON_050_FIREFOX);
+      env.exception.value = value;
+      expect(isOldClientSelfReport(env), value).toBe(false);
+    }
+    // Firefox's wording over Chromium's or Safari's frames: a timer method on top is not
+    // what Firefox leaves there.
+    for (const raw of [BEACON_050, BEACON_050_WEBKIT]) {
+      const env = parse(raw);
+      env.exception.value = FIREFOX_SET_INTERVAL;
+      expect(isOldClientSelfReport(env)).toBe(false);
     }
   });
 
@@ -250,19 +614,32 @@ describe('isOldClientSelfReport', () => {
     expect(isOldClientSelfReport(APP_PUSHSTATE_060)).toBe(false);
   });
 
+  it("leaves the app's own unbound timer alone in Firefox and WebKit (recorded)", () => {
+    expect(isOldClientSelfReport(parse(APP_TIMER_050_FIREFOX))).toBe(false);
+    expect(isOldClientSelfReport(parse(APP_TIMER_060_WEBKIT))).toBe(false);
+  });
+
   it('needs the client method at the top: below an app frame it is not the client bug', () => {
-    const loop = parse(BEACON_050);
-    const env = oldClient('0.5.0', {
-      stacktrace: [frame('copyLink', 'assets/share-77aa.js', 1, 210), ...loop.exception.stacktrace],
-    });
-    expect(isOldClientSelfReport(env)).toBe(false);
+    for (const raw of [BEACON_050, BEACON_050_FIREFOX, BEACON_050_WEBKIT]) {
+      const loop = parse(raw);
+      const env = oldClient('0.5.0', {
+        value: loop.exception.value,
+        stacktrace: [
+          frame('copyLink', 'assets/share-77aa.js', 1, 210),
+          ...loop.exception.stacktrace,
+        ],
+      });
+      expect(isOldClientSelfReport(env), loop.exception.value).toBe(false);
+    }
   });
 
   it('never applies to a fixed client (0.6.1 and later, compared numerically)', () => {
-    for (const version of ['0.6.1', '0.6.2', '0.7.0', '0.10.0', '1.0.0']) {
-      const env = parse(BEACON_050);
-      env.sdk.version = version;
-      expect(isOldClientSelfReport(env), version).toBe(false);
+    for (const [label, raw] of BEACONS) {
+      for (const version of ['0.6.1', '0.6.2', '0.7.0', '0.10.0', '1.0.0']) {
+        const env = parse(raw);
+        env.sdk.version = version;
+        expect(isOldClientSelfReport(env), `${label} as ${version}`).toBe(false);
+      }
     }
   });
 
@@ -279,14 +656,49 @@ describe('isOldClientSelfReport', () => {
     expect(isOldClientSelfReport(env)).toBe(false);
   });
 
-  it('needs a TypeError whose message says "Illegal invocation"', () => {
-    const notType = parse(BEACON_050);
-    notType.exception.type = 'Error';
-    expect(isOldClientSelfReport(notType)).toBe(false);
+  it("needs a TypeError in one engine's wording for this error", () => {
+    for (const [label, raw] of BEACONS) {
+      const notType = parse(raw);
+      notType.exception.type = 'Error';
+      expect(isOldClientSelfReport(notType), label).toBe(false);
 
-    const otherMessage = parse(BEACON_050);
-    otherMessage.exception.value = 'Failed to fetch';
-    expect(isOldClientSelfReport(otherMessage)).toBe(false);
+      const otherMessage = parse(raw);
+      otherMessage.exception.value = 'Failed to fetch';
+      expect(isOldClientSelfReport(otherMessage), label).toBe(false);
+    }
+  });
+
+  it('matches each engine wording for all four window timers, as probed', () => {
+    const wordingOf = (value: string) =>
+      TIMER_BUG_WORDINGS.find((w) => w.message.test(value))?.engine;
+    for (const timer of ['setTimeout', 'setInterval', 'clearTimeout', 'clearInterval']) {
+      expect(wordingOf('Illegal invocation'), timer).toBe('chromium');
+      expect(
+        wordingOf(`'${timer}' called on an object that does not implement interface Window.`),
+        timer,
+      ).toBe('firefox');
+      expect(wordingOf(`Can only call Window.${timer} on instances of Window`), timer).toBe(
+        'webkit',
+      );
+    }
+  });
+
+  it('does not take the same template for another method or interface', () => {
+    for (const value of [
+      "'getComputedStyle' called on an object that does not implement interface Window.",
+      "'setTimeout' called on an object that does not implement interface WorkerGlobalScope.",
+      "'setTimeout' called on an object that does not implement interface Window. (in app.js)",
+      'Can only call Window.fetch on instances of Window',
+      'Can only call Document.createElement on instances of Document',
+      'Can only call Window.setTimeoutX on instances of Window',
+    ]) {
+      const env = parse(BEACON_050_FIREFOX);
+      env.exception.value = value;
+      expect(isOldClientSelfReport(env), value).toBe(false);
+      const wk = parse(BEACON_050_WEBKIT);
+      wk.exception.value = value;
+      expect(isOldClientSelfReport(wk), value).toBe(false);
+    }
   });
 
   it('needs a named top frame', () => {
@@ -308,6 +720,29 @@ describe('isOldClientSelfReport', () => {
     }
     for (const fn of ['Client.drainLoop', 'Client.ensureRetryTimerX', 'ensureRetryTimer.x']) {
       const env = oldClient('0.6.0', { stacktrace: [{ inApp: true, function: fn }] });
+      expect(isOldClientSelfReport(env), fn).toBe(false);
+    }
+  });
+
+  it("reads the method through Firefox's async-cause prefix", () => {
+    for (const fn of [
+      'updateRetryTimer',
+      'async*updateRetryTimer',
+      'promise callback*flushAnalytics',
+      'EventListener.handleEvent*checkIn',
+    ]) {
+      const env = oldClient('0.6.0', {
+        value: FIREFOX_SET_TIMEOUT,
+        stacktrace: [{ inApp: true, function: fn }],
+      });
+      expect(isOldClientSelfReport(env), fn).toBe(true);
+    }
+    // An arrow function inside a caller is not the caller, and a bare cause is no method.
+    for (const fn of ['updateRetryTimer/<', 'setTimeout handler*', 'async*drainLoop']) {
+      const env = oldClient('0.6.0', {
+        value: FIREFOX_SET_TIMEOUT,
+        stacktrace: [{ inApp: true, function: fn }],
+      });
       expect(isOldClientSelfReport(env), fn).toBe(false);
     }
   });
@@ -400,6 +835,28 @@ describe('POST /ingest/:publicKey drops old clients self-reports', () => {
     ['0.2.0, application/json (the old pagehide beacon)', BEACON_020_MIN, 'application/json'],
     ['0.5.0, text/plain', BEACON_050, 'text/plain;charset=UTF-8'],
     ['0.6.0, text/plain', BEACON_060_MIN, 'text/plain;charset=UTF-8'],
+    [
+      'Firefox 0.5.0, application/json (the old pagehide beacon)',
+      BEACON_050_FIREFOX,
+      'application/json',
+    ],
+    [
+      'Firefox 0.6.0, application/json (the old pagehide beacon)',
+      BEACON_060_MIN_FIREFOX,
+      'application/json',
+    ],
+    ['Firefox 0.5.0, text/plain', BEACON_050_FIREFOX, 'text/plain;charset=UTF-8'],
+    [
+      'WebKit 0.5.0, application/json (the old pagehide beacon)',
+      BEACON_050_WEBKIT,
+      'application/json',
+    ],
+    [
+      'WebKit 0.6.0, application/json (the old pagehide beacon)',
+      BEACON_060_MIN_WEBKIT,
+      'application/json',
+    ],
+    ['WebKit 0.6.0, text/plain', BEACON_060_MIN_WEBKIT, 'text/plain;charset=UTF-8'],
   ] as const) {
     it(`${label}: 202 like a stored event, nothing stored, no alert`, async () => {
       const before = await droppedFor(project.slug);
@@ -432,34 +889,46 @@ describe('POST /ingest/:publicKey drops old clients self-reports', () => {
     expect(res.statusCode).toBe(401);
   });
 
-  it("stores an old client's genuine errors, including a genuine Illegal invocation", async () => {
+  it("stores an old client's genuine errors, including a genuine unbound-timer TypeError", async () => {
     const server = app();
-    for (const env of [APP_TYPE_ERROR_050, APP_ILLEGAL_INVOCATION_050, APP_PUSHSTATE_060]) {
-      const res = await post(server, JSON.stringify(env), 'text/plain;charset=UTF-8');
+    for (const body of [
+      JSON.stringify(APP_TYPE_ERROR_050),
+      JSON.stringify(APP_ILLEGAL_INVOCATION_050),
+      JSON.stringify(APP_PUSHSTATE_060),
+      APP_TIMER_050_FIREFOX,
+      APP_TIMER_060_WEBKIT,
+    ]) {
+      const res = await post(server, body, 'text/plain;charset=UTF-8');
       expect(res.statusCode).toBe(202);
     }
-    expect(storedEventCount()).toBe(3);
-    expect(listIssues(db, { projectId: project.id }).total).toBe(3);
+    expect(storedEventCount()).toBe(5);
+    expect(listIssues(db, { projectId: project.id }).total).toBe(5);
     // Each one is a new issue with a webhook target, so each alerts.
-    expect(takeDueDispatches(db, Date.now() + 60_000, 10)).toHaveLength(3);
+    expect(takeDueDispatches(db, Date.now() + 60_000, 10)).toHaveLength(5);
   });
 
-  it('a full old queue at pagehide (49 self-reports and the real crash) stores only the crash', async () => {
-    const server = app();
-    const loop = parse(BEACON_050);
-    for (let i = 0; i < 49; i++) {
-      const env = { ...loop, context: { ...loop.context, eventId: `loop-${String(i)}` } };
-      expect((await post(server, JSON.stringify(env), 'application/json')).statusCode).toBe(202);
-    }
-    const crash = await post(server, JSON.stringify(APP_TYPE_ERROR_050), 'application/json');
-    expect(crash.statusCode).toBe(202);
+  for (const [engine, beacon] of [
+    ['Chromium', BEACON_050],
+    ['Firefox', BEACON_050_FIREFOX],
+    ['WebKit', BEACON_050_WEBKIT],
+  ] as const) {
+    it(`${engine}: a full old queue at pagehide (49 self-reports and the real crash) stores only the crash`, async () => {
+      const server = app();
+      const loop = parse(beacon);
+      for (let i = 0; i < 49; i++) {
+        const env = { ...loop, context: { ...loop.context, eventId: `loop-${String(i)}` } };
+        expect((await post(server, JSON.stringify(env), 'application/json')).statusCode).toBe(202);
+      }
+      const crash = await post(server, JSON.stringify(APP_TYPE_ERROR_050), 'application/json');
+      expect(crash.statusCode).toBe(202);
 
-    expect(storedEventCount()).toBe(1);
-    const issues = listIssues(db, { projectId: project.id });
-    expect(issues.total).toBe(1);
-    expect(issues.rows[0]?.title).toContain('Cannot read properties of undefined');
-    expect(takeDueDispatches(db, Date.now() + 60_000, 10)).toHaveLength(1);
-  });
+      expect(storedEventCount()).toBe(1);
+      const issues = listIssues(db, { projectId: project.id });
+      expect(issues.total).toBe(1);
+      expect(issues.rows[0]?.title).toContain('Cannot read properties of undefined');
+      expect(takeDueDispatches(db, Date.now() + 60_000, 10)).toHaveLength(1);
+    });
+  }
 
   it('counts drops per project', async () => {
     const other = createProject(db, { name: 'Spoonworks' });
@@ -485,7 +954,7 @@ describe('POST /ingest/:publicKey drops old clients self-reports', () => {
     } finally {
       info.mockRestore();
     }
-    const lines = log.lines.filter((l) => String(l['msg']).includes('Illegal invocation'));
+    const lines = log.lines.filter((l) => String(l['msg']).startsWith('dropped an @uh-oh/js'));
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatchObject({
       level: 30,

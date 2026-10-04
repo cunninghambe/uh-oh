@@ -74,9 +74,10 @@ export const ingest = (
 
   // Temporary guard, removable once every app is re-vendored (see
   // old-client-guard.ts): a @uh-oh/js client before 0.6.1 reporting its own
-  // "Illegal invocation" timer bug. Answered as stored so the client drops it
-  // from its queue; nothing is written, so no issue, no alert, and no token
-  // spent from the fingerprint rate limit. Counted per project instead.
+  // unbound-timer TypeError, in Chromium's, Firefox's or Safari's wording.
+  // Answered as stored so the client drops it from its queue; nothing is
+  // written, so no issue, no alert, and no token spent from the fingerprint
+  // rate limit. Counted per project instead.
   if (isOldClientSelfReport(envelope)) {
     recordOldClientDrop(project, envelope.sdk.version, now, deps.logger);
     return { kind: 'dropped', eventId: newId() };
