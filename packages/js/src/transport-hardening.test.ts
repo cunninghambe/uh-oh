@@ -18,6 +18,12 @@
 //    breadcrumb data never wedges the queue. Before, JSON.stringify threw
 //    inside sendOne, which read as a network error: the event stayed at the
 //    head of the queue forever and blocked every event behind it.
+// 4. Bodies over the 64 KiB keepalive quota still leave the browser. Chrome
+//    refuses a keepalive fetch whose body would take the in-flight keepalive
+//    bytes past 64 KiB with "TypeError: Failed to fetch" before any network
+//    activity, and sendBeacon returns false for the same body. A crash with
+//    100 breadcrumbs of 1 KB read as a network error on every retry, so it sat
+//    at the head of the queue and every crash behind it waited.
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { EventEnvelopeSchema } from '@uh-oh/types';
@@ -369,6 +375,295 @@ describe('values JSON cannot serialize never wedge the queue', () => {
       when: '1970-01-01T00:00:00.000Z',
       list: [1, null, 'x'],
     });
+    c.close();
+  });
+});
+
+describe('bodies over the 64 KiB keepalive quota still leave the browser', () => {
+  // What Chromium does with a keepalive request (the Fetch spec's keepalive
+  // quota): a body over 64 KiB is refused with "TypeError: Failed to fetch"
+  // before anything is sent, and sendBeacon returns false for it. Measured in
+  // Chromium 152 and 154: 60,000 bytes reached the server, 65,536 and 70,000
+  // bytes did not; without keepalive the 70,000-byte body arrived.
+  const KEEPALIVE_QUOTA = 65_536;
+  const utf8Bytes = (s: string): number => new TextEncoder().encode(s).length;
+
+  interface Attempt {
+    url: string;
+    keepalive: boolean;
+    bytes: number;
+  }
+  interface Delivered {
+    url: string;
+    init: FetchInitShape;
+    body: unknown;
+  }
+
+  /**
+   * A fetch that behaves like Chrome's. `refuseKeepalive` stands in for the
+   * quota being held by other keepalive requests still in flight; `offline`
+   * fails every attempt the way a dropped connection does (also a TypeError).
+   */
+  function chromeFetch(
+    opts: { refuseKeepalive?: boolean; offline?: boolean; status?: number } = {},
+  ) {
+    const attempts: Attempt[] = [];
+    const delivered: Delivered[] = [];
+    const fn = (url: string, init: FetchInitShape): Promise<{ ok: boolean; status: number }> => {
+      const bytes = utf8Bytes(init.body);
+      const keepalive = init.keepalive === true;
+      attempts.push({ url, keepalive, bytes });
+      if (keepalive && (opts.refuseKeepalive === true || bytes > KEEPALIVE_QUOTA)) {
+        return Promise.reject(new TypeError('Failed to fetch'));
+      }
+      if (opts.offline === true) return Promise.reject(new TypeError('Failed to fetch'));
+      delivered.push({ url, init, body: init.body ? (JSON.parse(init.body) as unknown) : null });
+      const status = opts.status ?? 202;
+      return Promise.resolve({ ok: status >= 200 && status < 300, status });
+    };
+    const crashes = (): Delivered[] => delivered.filter((d) => !d.url.endsWith('/usage'));
+    const usage = (): Delivered[] => delivered.filter((d) => d.url.endsWith('/usage'));
+    const values = (): string[] =>
+      crashes().map((d) => EventEnvelopeSchema.parse(d.body).exception.value);
+    return { fn, attempts, delivered, crashes, usage, values };
+  }
+
+  /** A navigator whose sendBeacon refuses a body over the quota, as Chrome's does. */
+  function chromeNavigator() {
+    const beaconCalls: Array<{ url: string; bytes: number; data: unknown }> = [];
+    const nav = {
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+      language: 'en-US',
+      sendBeacon: (url: string, data?: unknown): boolean => {
+        const bytes = typeof data === 'string' ? utf8Bytes(data) : (data as { size: number }).size;
+        beaconCalls.push({ url, bytes, data });
+        return bytes <= KEEPALIVE_QUOTA;
+      },
+    };
+    return { nav, beaconCalls };
+  }
+
+  // The follow-up crash carries no trail, as a crash on a fresh page would;
+  // the breadcrumb ring buffer is shared, so without this it would be big too.
+  const smallHasNoTrail = (e: EventEnvelope): EventEnvelope =>
+    e.exception.value === 'small' ? { ...e, breadcrumbs: [] } : e;
+
+  function browserClient(
+    fetchFn: ReturnType<typeof chromeFetch>['fn'],
+    deps: {
+      win?: ReturnType<typeof fakeWindow>['win'];
+      navigator?: ReturnType<typeof chromeNavigator>['nav'];
+      storage?: ReturnType<typeof fakeStorage>['storage'];
+      noTimeouts?: boolean;
+    } = {},
+  ): Client {
+    return new Client(
+      { dsn: DSN, release: '1.0.0+1', beforeSend: smallHasNoTrail },
+      {
+        fetchFn,
+        win: deps.win ?? fakeWindow().win,
+        doc: { visibilityState: 'visible', referrer: '' },
+        navigator: deps.navigator ?? fakeNavigator().nav,
+        storage: deps.storage ?? fakeStorage().storage,
+        setIntervalFn: () => 0,
+        clearIntervalFn: () => undefined,
+        ...(deps.noTimeouts === true
+          ? { setTimeoutFn: () => 0, clearTimeoutFn: () => undefined }
+          : {}),
+      },
+    );
+  }
+
+  /** 100 breadcrumbs (the default cap) of about 1 KB each. */
+  function addTrail(c: Client, unit = 'x', perCrumb = 1000): void {
+    for (let i = 0; i < 100; i += 1) {
+      c.addBreadcrumb({ category: 'log', message: `${String(i)} ${unit.repeat(perCrumb)}` });
+    }
+  }
+
+  // Ten props at the 256-char value cap. "é" is one UTF-16 unit but two UTF-8
+  // bytes, so a full batch of 20 is under 60,000 characters and over 100,000
+  // bytes: the check has to count bytes.
+  const heavyProps: Record<string, string> = Object.fromEntries(
+    Array.from({ length: 10 }, (_, i) => [`p${String(i)}`, 'é'.repeat(256)]),
+  );
+
+  it('a crash with 100 x 1 KB breadcrumbs and a small crash behind it are both delivered', async () => {
+    const f = chromeFetch();
+    const c = browserClient(f.fn);
+    addTrail(c);
+    c.captureException(new Error('big'));
+    c.captureException(new Error('small'));
+    await c.flush();
+
+    expect(f.values()).toEqual(['big', 'small']);
+    expect(c.size()).toBe(0);
+    const [big, small] = f.crashes();
+    expect(utf8Bytes(big?.init.body ?? '')).toBeGreaterThan(KEEPALIVE_QUOTA);
+    // Sent whole (no trimming) and without keepalive, which Chrome would refuse.
+    expect(EventEnvelopeSchema.parse(big?.body).breadcrumbs).toHaveLength(100);
+    expect(big?.init.keepalive).not.toBe(true);
+    // The small crash still gets keepalive, so it can outlive the page.
+    expect(small?.init.keepalive).toBe(true);
+    // No doomed keepalive attempt was made first: two crashes, two requests.
+    expect(f.attempts).toHaveLength(2);
+    expect(f.attempts.filter((a) => a.keepalive && a.bytes > 60_000)).toEqual([]);
+    c.close();
+  });
+
+  it('measures the body in UTF-8 bytes, not string length', async () => {
+    const f = chromeFetch();
+    const c = browserClient(f.fn);
+    addTrail(c, 'é', 400);
+    c.captureException(new Error('big'));
+    await c.flush();
+
+    const sent = f.crashes()[0];
+    expect(sent?.init.body.length).toBeLessThan(60_000);
+    expect(utf8Bytes(sent?.init.body ?? '')).toBeGreaterThan(KEEPALIVE_QUOTA);
+    expect(sent?.init.keepalive).not.toBe(true);
+    expect(f.values()).toEqual(['big']);
+    expect(c.size()).toBe(0);
+    c.close();
+  });
+
+  it('a keepalive send refused with a TypeError is retried once without keepalive', async () => {
+    // The quota is shared by every keepalive request in flight, so even a
+    // small body is refused while a large keepalive request is still going.
+    const f = chromeFetch({ refuseKeepalive: true });
+    const c = browserClient(f.fn);
+    c.captureException(new Error('small'));
+    await c.flush();
+
+    expect(f.attempts.map((a) => a.keepalive)).toEqual([true, false]);
+    expect(f.values()).toEqual(['small']);
+    expect(c.size()).toBe(0);
+    c.close();
+  });
+
+  // The next two watch a single drain pass (the one captureException starts):
+  // flush() would request a second pass and double the attempts.
+
+  it('offline, a crash gets exactly one plain retry and then stays queued', async () => {
+    const f = chromeFetch({ offline: true });
+    const c = browserClient(f.fn);
+    c.captureException(new Error('small'));
+    await tick();
+    await tick();
+
+    expect(f.attempts.map((a) => a.keepalive)).toEqual([true, false]);
+    expect(c.size()).toBe(1);
+    c.close();
+  });
+
+  it('a rejection that is not a TypeError (an abort) is not retried', async () => {
+    const attempts: FetchInitShape[] = [];
+    const aborting = (
+      _url: string,
+      init: FetchInitShape,
+    ): Promise<{ ok: boolean; status: number }> => {
+      attempts.push(init);
+      return Promise.reject(
+        Object.assign(new Error('The operation was aborted.'), { name: 'AbortError' }),
+      );
+    };
+    const c = browserClient(aborting);
+    c.captureException(new Error('small'));
+    await tick();
+    await tick();
+
+    expect(attempts.map((i) => i.keepalive)).toEqual([true]);
+    expect(c.size()).toBe(1);
+    c.close();
+  });
+
+  it('a usage batch over the quota is sent without keepalive instead of being dropped', async () => {
+    const f = chromeFetch();
+    const c = browserClient(f.fn, { noTimeouts: true });
+    // The 20th event fills the batch and sends it at once.
+    for (let i = 0; i < 20; i += 1) c.trackEvent('heavy', heavyProps);
+    await tick();
+    await tick();
+
+    const batch = f.usage()[0];
+    expect(batch?.init.body.length).toBeLessThan(60_000);
+    expect(utf8Bytes(batch?.init.body ?? '')).toBeGreaterThan(KEEPALIVE_QUOTA);
+    expect(batch?.init.keepalive).not.toBe(true);
+    expect((batch?.body as { events: unknown[] }).events).toHaveLength(20);
+    c.close();
+  });
+
+  it('pagehide keeps an oversized crash for the next page instead of beaconing it; the next page sends it', async () => {
+    const store = fakeStorage();
+    const w = fakeWindow();
+    const chrome = chromeNavigator();
+    const down = chromeFetch({ status: 503 });
+    const c = browserClient(down.fn, { win: w.win, navigator: chrome.nav, storage: store.storage });
+    c.install();
+    addTrail(c);
+    c.captureException(new Error('big'));
+    c.captureException(new Error('small'));
+    await c.flush();
+    expect(c.size()).toBe(2);
+
+    w.dispatch('pagehide', {});
+    // Only the crash that fits was handed to sendBeacon...
+    expect(chrome.beaconCalls).toHaveLength(1);
+    const beaconed = EventEnvelopeSchema.parse(
+      JSON.parse(await beaconText(chrome.beaconCalls[0]?.data)),
+    );
+    expect(beaconed.exception.value).toBe('small');
+    expect(chrome.beaconCalls[0]?.bytes).toBeLessThanOrEqual(60_000);
+    // ...and the oversized one stays queued and persisted.
+    expect(c.size()).toBe(1);
+    const spooled = JSON.parse(store.map.get(SPOOL_KEY) ?? '[]') as Array<{ env: EventEnvelope }>;
+    expect(spooled.map((item) => item.env.exception.value)).toEqual(['big']);
+    c.close();
+
+    // The next page load restores it and sends it by plain fetch.
+    const up = chromeFetch();
+    const next = browserClient(up.fn, { storage: store.storage });
+    next.install();
+    await next.flush();
+    expect(up.values()).toEqual(['big']);
+    expect(up.crashes()[0]?.init.keepalive).not.toBe(true);
+    expect(next.size()).toBe(0);
+    expect(store.map.has(SPOOL_KEY)).toBe(false);
+    next.close();
+  });
+
+  it('an oversized usage batch at pagehide goes by plain fetch, not a beacon Chrome would refuse', async () => {
+    const w = fakeWindow();
+    const chrome = chromeNavigator();
+    const f = chromeFetch();
+    const c = browserClient(f.fn, { win: w.win, navigator: chrome.nav, noTimeouts: true });
+    c.install();
+    // 19 events: one short of the batch cap, so nothing is sent yet.
+    for (let i = 0; i < 19; i += 1) c.trackEvent('heavy', heavyProps);
+    expect(f.attempts).toHaveLength(0);
+
+    w.dispatch('pagehide', {});
+    await tick();
+    await tick();
+    expect(chrome.beaconCalls).toHaveLength(0);
+    const batch = f.usage()[0];
+    expect(batch?.init.keepalive).not.toBe(true);
+    expect((batch?.body as { events: unknown[] }).events).toHaveLength(19);
+    c.close();
+  });
+
+  it('a small usage batch at pagehide still goes by beacon', () => {
+    const w = fakeWindow();
+    const chrome = chromeNavigator();
+    const f = chromeFetch();
+    const c = browserClient(f.fn, { win: w.win, navigator: chrome.nav, noTimeouts: true });
+    c.install();
+    c.trackEvent('light', { plan: 'pro' });
+
+    w.dispatch('pagehide', {});
+    expect(chrome.beaconCalls).toHaveLength(1);
+    expect(chrome.beaconCalls[0]?.url).toBe('https://errors.example.com/ingest/pk/usage');
+    expect(f.attempts).toHaveLength(0);
     c.close();
   });
 });

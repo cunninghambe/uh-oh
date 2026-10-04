@@ -384,6 +384,11 @@ const MESSAGE_MAX = 1024;
 const SLUG_RE = /^[a-z0-9-]{1,64}$/;
 // CORS-safelisted, so a beacon needs no preflight (see beaconBody).
 const BEACON_CONTENT_TYPE = 'text/plain;charset=UTF-8';
+// Largest body (UTF-8 bytes) sent with keepalive or by sendBeacon. The Fetch
+// spec's keepalive quota is 64 KiB summed over a page's in-flight keepalive
+// requests, sendBeacon included; Chrome refuses a body past it before anything
+// is sent. The margin leaves room for a small keepalive request in flight.
+const KEEPALIVE_BODY_MAX = 60_000;
 
 // -- usage analytics: batching + validation (mirrors CONTRACT U-IN server-side) --
 const ANALYTICS_MAX_QUEUE = 20;
@@ -406,6 +411,44 @@ const G: GlobalScope = globalThis as unknown as GlobalScope;
 // ---------------------------------------------------------------------------
 // Pure helpers.
 // ---------------------------------------------------------------------------
+
+/**
+ * True when `body` is at most KEEPALIVE_BODY_MAX bytes once UTF-8 encoded.
+ * Counted by hand: TextEncoder is not guaranteed on every host. A UTF-16 code
+ * unit encodes to 1 to 3 bytes (a surrogate pair is 4 bytes for 2 units, a
+ * lone surrogate becomes the 3-byte U+FFFD), so most bodies are decided by
+ * their length alone.
+ */
+function fitsKeepalive(body: string): boolean {
+  if (body.length > KEEPALIVE_BODY_MAX) return false;
+  if (body.length * 3 <= KEEPALIVE_BODY_MAX) return true;
+  let bytes = 0;
+  for (let i = 0; i < body.length; i += 1) {
+    const c = body.charCodeAt(i);
+    if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < body.length) {
+      const next = body.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i += 1;
+      } else {
+        bytes += 3;
+      }
+    } else bytes += 3;
+  }
+  return bytes <= KEEPALIVE_BODY_MAX;
+}
+
+/** A TypeError from this realm or another (fetch's network-error type). */
+function isTypeError(e: unknown): boolean {
+  try {
+    if (e instanceof TypeError) return true;
+    return typeof e === 'object' && e !== null && (e as { name?: unknown }).name === 'TypeError';
+  } catch {
+    return false;
+  }
+}
 
 function safeStr(v: unknown, max: number): string {
   let s: string;
@@ -1302,7 +1345,8 @@ export class Client {
   }
 
   /**
-   * Single-attempt POST for a check-in ping. Swallows every failure (network
+   * Single-attempt POST for a check-in ping (post() may repeat a refused
+   * keepalive send once without keepalive). Swallows every failure (network
    * error, timeout, non-2xx) - there is no queue or retry timer for check-ins.
    */
   private async sendCheckIn(url: string): Promise<void> {
@@ -1333,12 +1377,11 @@ export class Client {
         method: 'POST',
         headers: {},
         body: '',
-        ...(this.runtime === 'browser' ? { keepalive: true } : {}),
         ...(controller ? { signal: controller.signal } : {}),
       };
-      await fetchFn(url, init);
+      await this.post(fetchFn, url, init);
     } catch {
-      // one attempt only - never retried, never throws
+      // no queue, no retry timer - never throws
     } finally {
       this.stopTimer('timeout', timer);
     }
@@ -1386,15 +1429,37 @@ export class Client {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(env),
-        ...(this.runtime === 'browser' ? { keepalive: true } : {}),
         ...(controller ? { signal: controller.signal } : {}),
       };
-      const res = await fetchFn(this.dsn.ingestUrl, init);
+      const res = await this.post(fetchFn, this.dsn.ingestUrl, init);
       return { ok: res.ok, status: res.status };
     } catch {
       return { ok: false };
     } finally {
       this.stopTimer('timeout', timer);
+    }
+  }
+
+  /**
+   * One POST, with keepalive in the browser whenever the browser will take it,
+   * so the send can outlive the page. Chrome refuses a keepalive request past
+   * the 64 KiB quota with "TypeError: Failed to fetch" before anything is
+   * sent; drainOnce read that as a network error, so an envelope over 64 KiB
+   * (100 breadcrumbs of 1 KB) failed on every retry and held up every crash
+   * queued behind it. So a body over KEEPALIVE_BODY_MAX goes without
+   * keepalive, and a keepalive send that rejects with a TypeError (the quota
+   * is shared with other keepalive requests in flight) is retried once
+   * without it. Offline that costs one extra failed attempt. An abort is not
+   * a TypeError and is not retried. Rejects when the last attempt rejects.
+   */
+  private async post(fetchFn: FetchLike, url: string, init: FetchInit): Promise<FetchResponse> {
+    if (this.runtime !== 'browser' || !fitsKeepalive(init.body)) return fetchFn(url, init);
+    try {
+      return await fetchFn(url, { ...init, keepalive: true });
+    } catch (e) {
+      if (!isTypeError(e)) throw e;
+      this.log('debug', 'keepalive send refused; retrying once without keepalive', e);
+      return fetchFn(url, init);
     }
   }
 
@@ -1770,7 +1835,11 @@ export class Client {
     for (const item of this.queue) {
       let ok = false;
       try {
-        ok = beacon(this.dsn.ingestUrl, this.beaconBody(item.env));
+        const json = JSON.stringify(item.env);
+        // Over the keepalive quota sendBeacon can only refuse it: keep it
+        // queued (persisted below) for a plain fetch from this page's retry
+        // timer or from the next page load.
+        ok = fitsKeepalive(json) && beacon(this.dsn.ingestUrl, this.beaconBody(json));
       } catch {
         ok = false;
       }
@@ -1788,10 +1857,10 @@ export class Client {
    * so the POST is never sent (production showed only lone OPTIONS requests).
    * text/plain is a CORS "simple" request: no preflight. Both ingest routes
    * parse a text/plain body as JSON. A bare string body (no Blob) is sent by
-   * the browser as text/plain too.
+   * the browser as text/plain too. `json` is the already serialized payload,
+   * so callers can check its size first (fitsKeepalive).
    */
-  private beaconBody(payload: unknown): unknown {
-    const json = JSON.stringify(payload);
+  private beaconBody(json: string): unknown {
     try {
       const BlobCtorRef = G.Blob;
       if (BlobCtorRef) return new BlobCtorRef([json], { type: BEACON_CONTENT_TYPE });
@@ -2036,10 +2105,9 @@ export class Client {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ events }),
-        ...(this.runtime === 'browser' ? { keepalive: true } : {}),
         ...(controller ? { signal: controller.signal } : {}),
       };
-      const res = await fetchFn(`${dsn.ingestUrl}/usage`, init);
+      const res = await this.post(fetchFn, `${dsn.ingestUrl}/usage`, init);
       if (!res.ok) {
         this.log('debug', `analytics batch dropped on non-2xx response (${String(res.status)})`);
       }
@@ -2065,7 +2133,15 @@ export class Client {
       return;
     }
     try {
-      const ok = beacon(`${this.dsn.ingestUrl}/usage`, this.beaconBody({ events: batch }));
+      const json = JSON.stringify({ events: batch });
+      if (!fitsKeepalive(json)) {
+        // sendBeacon would refuse a batch over the keepalive quota. A plain
+        // fetch still lands while the page is only hidden; at unload it may
+        // be cut off, which analytics accepts.
+        void this.sendAnalyticsBatch(batch);
+        return;
+      }
+      const ok = beacon(`${this.dsn.ingestUrl}/usage`, this.beaconBody(json));
       if (!ok) this.log('debug', 'analytics beacon flush rejected by the browser; batch dropped');
     } catch {
       this.log('debug', 'analytics beacon flush failed; batch dropped');
