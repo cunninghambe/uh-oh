@@ -1,8 +1,15 @@
-import type { EventEnvelope, Level, BreadcrumbLevel, JsonValue, StackFrame } from '@uh-oh/types';
+import type {
+  EventEnvelope,
+  Level,
+  BreadcrumbLevel,
+  JsonValue,
+  Mechanism,
+  StackFrame,
+} from '@uh-oh/types';
 import { Scope } from './scope.js';
 import { BreadcrumbBuffer } from './breadcrumbs.js';
 import { Spool, type AsyncStorageLike } from './spool.js';
-import { sendEvent } from './transport.js';
+import { sendEvent, type SendResult } from './transport.js';
 import { parseDsn, type Dsn } from './dsn.js';
 import { platform, osVersion } from './platform.js';
 import {
@@ -11,6 +18,7 @@ import {
   type RejectionHandlerDeps,
 } from './handlers.js';
 import { nativeBridge } from './native-bridge.js';
+import { jsonSafeEnvelope } from './json-safe.js';
 
 export type InitOptions = {
   dsn: string;
@@ -50,11 +58,100 @@ function uuid(): string {
   return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
 }
 
-function parseRelease(release: string): { version: string; build: string } {
-  const parts = release.split('+');
+// Wire caps from EventEnvelopeSchema (@uh-oh/types). The server answers 400 to
+// anything over them and the spool drops a 4xx as permanent, so every field is
+// clamped here rather than costing the whole crash report.
+const TYPE_MAX = 256;
+const VALUE_MAX = 4096;
+const FRAMES_MAX = 500;
+const FILENAME_MAX = 1024;
+const SYMBOL_MAX = 512; // StackFrame function and module
+const RELEASE_PART_MAX = 64;
+const HEX_ADDR = /^0x[0-9a-fA-F]+$/;
+const MECHANISMS: ReadonlySet<string> = new Set<Mechanism>([
+  'js-global',
+  'js-promise',
+  'js-manual',
+  'android-java-ueh',
+  'android-ndk-signal',
+  'android-anr',
+]);
+
+function clamp(s: string, max: number): string {
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+function isMechanism(v: unknown): v is Mechanism {
+  return typeof v === 'string' && MECHANISMS.has(v);
+}
+
+/** A non-negative integer, as the schema requires for lineno and colno. */
+function isLineNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0;
+}
+
+/**
+ * One native stack frame, from untyped bridge data, fitted to StackFrameSchema.
+ * Java's StackTraceElement.getLineNumber() is -1 when unknown and -2 for a
+ * native method (`Method.invoke`, at the bottom of nearly every main-thread
+ * trace); such a lineno is left out rather than costing the report.
+ */
+function fitNativeFrame(raw: unknown): StackFrame {
+  const f = (raw !== null && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const frame: StackFrame = { inApp: typeof f['inApp'] === 'boolean' ? f['inApp'] : true };
+  const fn = f['function'];
+  if (typeof fn === 'string') frame.function = clamp(fn, SYMBOL_MAX);
+  const mod = f['module'];
+  if (typeof mod === 'string') frame.module = clamp(mod, SYMBOL_MAX);
+  const file = f['filename'];
+  if (typeof file === 'string') frame.filename = clamp(file, FILENAME_MAX);
+  if (isLineNumber(f['lineno'])) frame.lineno = f['lineno'];
+  if (isLineNumber(f['colno'])) frame.colno = f['colno'];
+  const ia = f['instructionAddr'];
+  if (typeof ia === 'string' && HEX_ADDR.test(ia)) frame.instructionAddr = ia;
+  const img = f['imageAddr'];
+  if (typeof img === 'string' && HEX_ADDR.test(img)) frame.imageAddr = img;
+  return frame;
+}
+
+/**
+ * The exception of a native report (CrashWriter.java), fitted to
+ * ExceptionSchema. A Java report puts `mechanism` on the report, not on the
+ * exception (CrashWriter.buildJavaReport), so it is taken from either place.
+ */
+function fitNativeException(partial: Partial<EventEnvelope>): EventEnvelope['exception'] {
+  const report = partial as Record<string, unknown>;
+  const rawEx = report['exception'];
+  const ex = (rawEx !== null && typeof rawEx === 'object' ? rawEx : {}) as Record<string, unknown>;
+  const mechanism = isMechanism(ex['mechanism'])
+    ? ex['mechanism']
+    : isMechanism(report['mechanism'])
+      ? report['mechanism']
+      : 'android-java-ueh';
+  const type = typeof ex['type'] === 'string' && ex['type'] ? ex['type'] : 'UnknownNativeCrash';
+  const value = typeof ex['value'] === 'string' ? ex['value'] : '';
+  const frames = Array.isArray(ex['stacktrace']) ? (ex['stacktrace'] as unknown[]) : [];
   return {
-    version: parts[0] ?? release,
-    build: parts[1] ?? '0',
+    type: clamp(type, TYPE_MAX),
+    value: clamp(value, VALUE_MAX),
+    stacktrace: frames.slice(0, FRAMES_MAX).map(fitNativeFrame),
+    mechanism,
+  };
+}
+
+/**
+ * Mirrors Spool._drainOnce: a failed send that carries a status the spool
+ * keeps (5xx, 429) rather than drops (any other 4xx).
+ */
+function isRetainedStatus(status: number): boolean {
+  return status === 429 || status < 400 || status >= 500;
+}
+
+function parseRelease(release: string): { version: string; build: string } {
+  const parts = (typeof release === 'string' ? release : '').split('+');
+  return {
+    version: clamp(parts[0] || '0.0.0', RELEASE_PART_MAX),
+    build: clamp(parts[1] || '0', RELEASE_PART_MAX),
   };
 }
 
@@ -72,7 +169,7 @@ function parseStackLine(line: string): StackFrame {
   if (withFn) {
     return {
       inApp: true,
-      filename: withFn[1] ?? '',
+      filename: clamp(withFn[1] ?? '', FILENAME_MAX),
       lineno: parseInt(withFn[2] ?? '0', 10),
       colno: parseInt(withFn[3] ?? '0', 10),
     };
@@ -83,7 +180,7 @@ function parseStackLine(line: string): StackFrame {
   if (anon) {
     return {
       inApp: true,
-      filename: anon[1] ?? '',
+      filename: clamp(anon[1] ?? '', FILENAME_MAX),
       lineno: parseInt(anon[2] ?? '0', 10),
       colno: parseInt(anon[3] ?? '0', 10),
     };
@@ -97,17 +194,20 @@ function errorToException(
   mechanism: 'js-global' | 'js-promise' | 'js-manual',
 ): EventEnvelope['exception'] {
   if (err instanceof Error) {
-    const frames = (err.stack ?? '').split('\n').slice(1).map(parseStackLine);
+    const frames = (err.stack ?? '')
+      .split('\n')
+      .slice(1, FRAMES_MAX + 1)
+      .map(parseStackLine);
     return {
-      type: err.name || 'Error',
-      value: err.message,
+      type: clamp(err.name || 'Error', TYPE_MAX),
+      value: clamp(err.message, VALUE_MAX),
       stacktrace: frames,
       mechanism,
     };
   }
   return {
     type: 'UnknownError',
-    value: String(err),
+    value: clamp(String(err), VALUE_MAX),
     stacktrace: [],
     mechanism,
   };
@@ -416,19 +516,22 @@ export class Client {
       ...(snap.fingerprint !== undefined ? { fingerprint: snap.fingerprint } : {}),
     };
 
+    // Every return is JSON-safe: a BigInt or a cycle in user, context or
+    // breadcrumb data used to make the spool's JSON.stringify throw, and the
+    // crash was silently dropped.
     if (this.opts.beforeSend) {
       try {
         const result = this.opts.beforeSend(env);
         if (result === null) return null;
-        return result;
+        return jsonSafeEnvelope(result);
       } catch (e) {
         // A throwing beforeSend must not drop the crash: send it unmodified (H3).
         if (this.opts.debug) console.debug('uh-oh: beforeSend threw; sending unmodified event', e);
-        return env;
+        return jsonSafeEnvelope(env);
       }
     }
 
-    return env;
+    return jsonSafeEnvelope(env);
   }
 
   /**
@@ -448,12 +551,9 @@ export class Client {
       platform: 'android',
       release: { version, build },
       level: partial.level ?? 'fatal',
-      exception: partial.exception ?? {
-        type: 'UnknownNativeCrash',
-        value: '',
-        stacktrace: [],
-        mechanism: 'android-java-ueh',
-      },
+      // Fitted to the wire schema: the server 400s a report that breaks it and
+      // the spool drops a 4xx as permanent, after the native file was acked.
+      exception: fitNativeException(partial),
       breadcrumbs: [],
       device: partial.device ?? { osName: 'Android', osVersion: 'unknown' },
       ...(snap.user !== undefined ? { user: snap.user } : {}),
@@ -462,13 +562,20 @@ export class Client {
       ...(snap.fingerprint !== undefined ? { fingerprint: snap.fingerprint } : {}),
     };
 
-    return env;
+    // Scope context can hold a BigInt or a cycle; the spool's JSON.stringify
+    // would throw, the report would never be acked, and it would fail the
+    // same way on every launch.
+    return jsonSafeEnvelope(env);
   }
 
   private async _drain(): Promise<void> {
     if (!this.dsn) return;
     const { baseUrl, publicKey } = this.dsn;
-    await this.spool.drain((env) => sendEvent(baseUrl, publicKey, env));
+    await this.spool.drain(async (env) => {
+      const result = await sendEvent(baseUrl, publicKey, env);
+      this._noteSendResult(result);
+      return result;
+    });
 
     // Manage the retry timer based on whether anything is still pending (M5).
     try {
@@ -482,9 +589,31 @@ export class Client {
     }
   }
 
-  private _ensureFlushTimer(): void {
-    // When NetInfo drives flushing we don't need a polling timer (battery).
-    if (this.netInfoUnsub) return;
+  /**
+   * With NetInfo subscribed, picks who retries a failed send. NetInfo only
+   * fires on a connectivity change, so it recovers a network error (no
+   * status) but never a 5xx or 429, which the server answers while the device
+   * stays online: those arm the 30 s retry timer, which `_drain` clears once
+   * the spool is empty. A network error stops the timer and leaves recovery
+   * to NetInfo, so an offline device does not poll (battery). Without NetInfo
+   * the timer already covers every retained failure.
+   */
+  private _noteSendResult(result: SendResult): void {
+    if (result.ok || !this.netInfoUnsub) return;
+    if (result.status === undefined) {
+      this._clearFlushTimer();
+    } else if (isRetainedStatus(result.status)) {
+      this._ensureFlushTimer(true);
+    }
+  }
+
+  /**
+   * Starts the 30 s retry timer if it is not running. With NetInfo subscribed
+   * only `force` (a retained status failure, see `_noteSendResult`) starts it;
+   * otherwise NetInfo's reconnect event drives flushing (battery).
+   */
+  private _ensureFlushTimer(force = false): void {
+    if (this.netInfoUnsub && !force) return;
     if (this.flushTimer) return;
     this.flushTimer = setInterval(() => {
       void this._drain().catch((e) => {

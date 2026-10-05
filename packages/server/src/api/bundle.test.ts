@@ -16,7 +16,7 @@ import { createAnnotation } from '../db/repos/annotations.js';
 import { upsertFixAttempt } from '../db/repos/fix-attempts.js';
 import { webSymbolMapPath } from '../symbolication/web-symbols.js';
 import { BUNDLE_MAX_BYTES, buildIssueBundle } from './bundle.js';
-import type { ProjectRow } from '../db/schema.js';
+import { symbolications, type ProjectRow } from '../db/schema.js';
 
 let db: Db;
 let close: () => void;
@@ -67,11 +67,11 @@ const seedIssue = () => {
   return issue;
 };
 
-const webPayload = (frames: object[]): string =>
+const webPayload = (frames: object[], platform: 'web' | 'node' = 'web'): string =>
   JSON.stringify({
     sdk: { name: '@uh-oh/js', version: '0.2.0' },
     timestamp: '2026-01-01T00:00:00.000Z',
-    platform: 'web',
+    platform,
     release: { version: '2.0.0', build: '9' },
     level: 'error',
     exception: { type: 'TypeError', value: 'boom', stacktrace: frames, mechanism: 'js-global' },
@@ -83,7 +83,7 @@ const seedEvent = (
   issueId: string,
   releaseId: string | null,
   frames: object[],
-  opts: { user?: object | null; ts?: number } = {},
+  opts: { user?: object | null; ts?: number; platform?: 'web' | 'node' } = {},
 ): string =>
   insertEvent(db, {
     projectId: project.id,
@@ -91,8 +91,8 @@ const seedEvent = (
     releaseId,
     fingerprint: 'fp',
     level: 'error',
-    platform: 'web',
-    payload: webPayload(frames),
+    platform: opts.platform ?? 'web',
+    payload: webPayload(frames, opts.platform),
     receivedAt: opts.ts ?? Date.now(),
     deviceInfo: JSON.stringify({ osName: 'linux', osVersion: '1', deviceModel: 'server' }),
     userInfo:
@@ -178,6 +178,75 @@ describe('buildIssueBundle', () => {
     const bundle = await buildIssueBundle(db, issue.id);
     expect(bundle?.latestEvent?.breadcrumbs).toHaveLength(20);
     expect(bundle?.latestEvent?.breadcrumbs[0]?.message).toBe('step 5');
+  });
+
+  it('keeps the raw line and column on frames that did not symbolicate', async () => {
+    // Production shape: a Node service with no source maps. Every frame comes
+    // back no_symbols, and the bundle used to drop the line entirely.
+    const issue = seedIssue();
+    seedEvent(
+      issue.id,
+      null,
+      [
+        {
+          filename: 'file:///opt/app/src/llm.ts',
+          function: 'ChildProcess.<anonymous>',
+          lineno: 557,
+          colno: 13,
+          inApp: true,
+        },
+        { filename: 'node:events', function: 'emit', lineno: 519, colno: 28, inApp: false },
+        { filename: 'native', function: 'noPosition', inApp: false },
+      ],
+      { platform: 'node' },
+    );
+    const expected = [
+      {
+        filename: 'file:///opt/app/src/llm.ts',
+        function: 'ChildProcess.<anonymous>',
+        lineno: 557,
+        colno: 13,
+        status: 'no_symbols',
+      },
+      { filename: 'node:events', function: 'emit', lineno: 519, colno: 28, status: 'no_symbols' },
+      { filename: 'native', function: 'noPosition', status: 'no_symbols' },
+    ];
+    const bundle = await buildIssueBundle(db, issue.id);
+    expect(bundle?.latestEvent?.platform).toBe('node');
+    expect(bundle?.latestEvent?.frames).toEqual(expected);
+    // The first build persisted the frames (without a line) to the
+    // symbolications cache; a second build is served from that cache, which is
+    // the path a production event that was already viewed takes.
+    expect(db.select().from(symbolications).all()).toHaveLength(3);
+    const again = await buildIssueBundle(db, issue.id);
+    expect(again?.latestEvent?.frames).toEqual(expected);
+  });
+
+  it('keeps the resolved line (and no raw column) on a frame that did symbolicate', async () => {
+    const release = newWebRelease();
+    await uploadMap(release.id, 'static/chunks/main.js');
+    const issue = seedIssue();
+    seedEvent(issue.id, release.id, [
+      frame(),
+      {
+        filename: 'https://h/static/chunks/other.js',
+        function: 'f',
+        lineno: 4,
+        colno: 9,
+        inApp: true,
+      },
+    ]);
+    const bundle = await buildIssueBundle(db, issue.id);
+    const [resolved, unmapped] = bundle?.latestEvent?.frames ?? [];
+    expect(resolved).toMatchObject({ filename: 'src/app.ts', lineno: 30, status: 'ok' });
+    expect(resolved?.colno).toBeUndefined();
+    expect(unmapped).toEqual({
+      filename: 'https://h/static/chunks/other.js',
+      function: 'f',
+      lineno: 4,
+      colno: 9,
+      status: 'no_symbols',
+    });
   });
 
   it('drops context first when over the size cap', async () => {

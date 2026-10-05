@@ -43,6 +43,7 @@ import { releaseHealth } from '../db/repos/release-health.js';
 import { listReleasesForProject } from '../db/repos/releases.js';
 import { topIssues } from '../db/repos/top-issues.js';
 import { usageSummary } from '../db/repos/usage-summary.js';
+import { summarizeFailedDispatches } from '../db/repos/webhook-dispatches.js';
 import type { Db } from '../db/index.js';
 import type { ProjectRow } from '../db/schema.js';
 import { metrics, registry } from '../metrics/registry.js';
@@ -177,7 +178,13 @@ export class InProcessBackend implements UhOhBackend {
     // the surfaced subset is identical to the HTTP backend's.
     const text = await registry.metrics();
     const subset = parseMetricsSubset(text);
-    return { ok: true, metricsAvailable: true, ...subset };
+    // The database half is the one GET /api/health serves to the HTTP backend.
+    return {
+      ok: true,
+      metricsAvailable: true,
+      ...subset,
+      failedWebhookDispatches: summarizeFailedDispatches(this.db),
+    };
   }
 
   getIssueBundle(input: { issueId: string }): Promise<IssueBundle | null> {

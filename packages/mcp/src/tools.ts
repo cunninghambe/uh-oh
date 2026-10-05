@@ -694,12 +694,13 @@ export const registerUhOhTools = (
     {
       title: 'Get server health',
       description:
-        'Report server health (/healthz) plus a parsed subset of /metrics: total events ingested, new issues, and permanent webhook failures.',
+        'Report server health (/healthz) plus a parsed subset of /metrics: total events ingested, new issues, and permanent webhook failures since the server last started (webhookFailures, in memory). failedWebhookDispatches and lastWebhookFailureAt come from the database and survive restarts: the alerts that failed permanently and are still stored (a failed row is pruned 7 days after the alert was raised), and when the latest one failed. A recent lastWebhookFailureAt means alerts are not reaching their webhook.',
       annotations: READ,
     },
     () =>
       run(async () => {
         const h = await backend.getHealth();
+        const failed = h.failedWebhookDispatches;
         return ok(
           clean({
             ok: h.ok,
@@ -707,6 +708,8 @@ export const registerUhOhTools = (
             eventsIngested: h.metricsAvailable ? h.eventsIngested : undefined,
             issuesNew: h.metricsAvailable ? h.issuesNew : undefined,
             webhookFailures: h.metricsAvailable ? h.webhookFailures : undefined,
+            failedWebhookDispatches: failed?.failed,
+            lastWebhookFailureAt: toIso(failed?.lastFailedAt),
           }),
         );
       }),

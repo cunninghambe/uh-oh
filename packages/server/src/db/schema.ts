@@ -215,6 +215,8 @@ export const webhookDispatches = sqliteTable(
       .notNull()
       .default('issue.new'),
     attempt: integer('attempt').notNull().default(0),
+    // Pending: when the next attempt is due. Failed: when the final attempt ran
+    // (get_server_health reports the latest one as the last webhook failure).
     nextAttemptAt: integer('next_attempt_at').notNull(),
     status: text('status', { enum: ['pending', 'succeeded', 'failed'] })
       .notNull()

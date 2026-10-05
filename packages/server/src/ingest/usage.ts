@@ -21,6 +21,7 @@ import {
 import type { Db } from '../db/index.js';
 import { metrics } from '../metrics/registry.js';
 import type { RateLimiter } from './rate-limit.js';
+import { addTextPlainJsonParser } from './browser-transport.js';
 
 // Batch cap: more than this and the whole batch is rejected (413). Individual
 // invalid events inside a within-cap batch are dropped, not fatal.
@@ -104,39 +105,18 @@ export const registerUsageIngestRoute = (
 ): void => {
   // Encapsulated plugin so the text/plain body parser is scoped to this route
   // only (content-type parsers are otherwise app-wide). The inherited JSON parser
-  // still handles application/json bodies.
+  // still handles application/json bodies. An unparseable text/plain body hands
+  // the handler `undefined`, which it turns into a clean 400 rather than
+  // Fastify's generic parser error.
+  //
+  // CORS (the preflight route and the response headers) is shared by the whole
+  // /ingest/* surface; see browser-transport.ts.
   void app.register((instance, _opts, done) => {
-    instance.addContentTypeParser('text/plain', { parseAs: 'string' }, (_req, body: string, cb) => {
-      if (body.trim() === '') {
-        cb(null, undefined);
-        return;
-      }
-      try {
-        cb(null, JSON.parse(body));
-      } catch {
-        // Hand a well-formed "not a batch" value to the handler, which turns it
-        // into a clean 400 rather than Fastify's generic parser error.
-        cb(null, undefined);
-      }
-    });
-
-    // CORS preflight for cross-origin fetch (application/json triggers one;
-    // sendBeacon with text/plain does not). Mirrors the event-ingest OPTIONS.
-    instance.options('/ingest/:publicKey/usage', (_req, reply) =>
-      reply
-        .header('Access-Control-Allow-Origin', '*')
-        .header('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        .header('Access-Control-Allow-Headers', 'content-type')
-        .header('Access-Control-Max-Age', '86400')
-        .code(204)
-        .send(),
-    );
+    addTextPlainJsonParser(instance);
 
     instance.post<{ Params: { publicKey: string }; Body: unknown }>(
       '/ingest/:publicKey/usage',
       (req, reply) => {
-        reply.header('Access-Control-Allow-Origin', '*');
-
         const project = getProjectByPublicKey(db, req.params.publicKey);
         if (!project) return reply.code(401).send({ error: 'unknown_public_key' });
 

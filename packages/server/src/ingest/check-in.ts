@@ -16,6 +16,7 @@ import {
 import { getProjectByPublicKey } from '../db/repos/projects.js';
 import { enqueueDispatch } from '../db/repos/webhook-dispatches.js';
 import { resolveWebhookUrl, warnNoWebhookTarget } from '../webhooks/resolve-url.js';
+import { toStructuredLogger } from '../logging/structured-logger.js';
 import type { Db } from '../db/index.js';
 import type { RateLimiter } from './rate-limit.js';
 
@@ -41,6 +42,29 @@ export const registerCheckInRoute = (
   /** Instance-level fallback webhook (UH_OH_DEFAULT_WEBHOOK_URL). */
   defaultWebhookUrl?: string,
 ): void => {
+  // A check-in carries everything in its URL; the body is ignored by contract.
+  // So the route accepts ANY content type (still under the global body cap)
+  // instead of Fastify's defaults, which 415 a form-encoded POST (curl -d,
+  // wget --post-data, Apps Script UrlFetchApp's default content type) and 400 an
+  // empty application/json one. Encapsulated so the catch-all stays scoped here.
+  void app.register((instance, _opts, done) => {
+    instance.removeAllContentTypeParsers();
+    instance.addContentTypeParser('*', { parseAs: 'buffer' }, (_req, _body, parsed) => {
+      parsed(null, undefined);
+    });
+    registerCheckInHandler(instance, db, limiter, defaultWebhookUrl);
+    done();
+  });
+};
+
+const registerCheckInHandler = (
+  app: FastifyInstance,
+  db: Db,
+  limiter: RateLimiter,
+  defaultWebhookUrl: string | undefined,
+): void => {
+  // warnNoWebhookTarget logs as (message, context); raw pino would drop the context.
+  const alertLog = toStructuredLogger(app.log);
   app.post<{
     Params: { publicKey: string; slug: string };
     Querystring: { intervalMinutes?: string };
@@ -96,7 +120,7 @@ export const registerCheckInRoute = (
       if (url) {
         enqueueDispatch(db, { monitorId: existing.id, url, type: 'monitor.recovered' }, now);
       } else {
-        warnNoWebhookTarget(app.log, project, 'monitor.recovered');
+        warnNoWebhookTarget(alertLog, project, 'monitor.recovered');
       }
     }
     return reply.code(202).send({ monitorId: existing.id });

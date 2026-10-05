@@ -366,7 +366,7 @@ export interface ClientDeps {
 // ---------------------------------------------------------------------------
 
 const SDK_NAME = '@uh-oh/js';
-const SDK_VERSION = '0.6.0';
+const SDK_VERSION = '0.6.1';
 const SPOOL_KEY = 'uh-oh:spool';
 const SPOOL_FILE = 'uh-oh-spool.json';
 const SPOOL_DEBOUNCE_MS = 1_000;
@@ -382,6 +382,13 @@ const VALUE_MAX = 4096;
 const CATEGORY_MAX = 64;
 const MESSAGE_MAX = 1024;
 const SLUG_RE = /^[a-z0-9-]{1,64}$/;
+// CORS-safelisted, so a beacon needs no preflight (see beaconBody).
+const BEACON_CONTENT_TYPE = 'text/plain;charset=UTF-8';
+// Largest body (UTF-8 bytes) sent with keepalive or by sendBeacon. The Fetch
+// spec's keepalive quota is 64 KiB summed over a page's in-flight keepalive
+// requests, sendBeacon included; Chrome refuses a body past it before anything
+// is sent. The margin leaves room for a small keepalive request in flight.
+const KEEPALIVE_BODY_MAX = 60_000;
 
 // -- usage analytics: batching + validation (mirrors CONTRACT U-IN server-side) --
 const ANALYTICS_MAX_QUEUE = 20;
@@ -404,6 +411,44 @@ const G: GlobalScope = globalThis as unknown as GlobalScope;
 // ---------------------------------------------------------------------------
 // Pure helpers.
 // ---------------------------------------------------------------------------
+
+/**
+ * True when `body` is at most KEEPALIVE_BODY_MAX bytes once UTF-8 encoded.
+ * Counted by hand: TextEncoder is not guaranteed on every host. A UTF-16 code
+ * unit encodes to 1 to 3 bytes (a surrogate pair is 4 bytes for 2 units, a
+ * lone surrogate becomes the 3-byte U+FFFD), so most bodies are decided by
+ * their length alone.
+ */
+function fitsKeepalive(body: string): boolean {
+  if (body.length > KEEPALIVE_BODY_MAX) return false;
+  if (body.length * 3 <= KEEPALIVE_BODY_MAX) return true;
+  let bytes = 0;
+  for (let i = 0; i < body.length; i += 1) {
+    const c = body.charCodeAt(i);
+    if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    else if (c >= 0xd800 && c <= 0xdbff && i + 1 < body.length) {
+      const next = body.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i += 1;
+      } else {
+        bytes += 3;
+      }
+    } else bytes += 3;
+  }
+  return bytes <= KEEPALIVE_BODY_MAX;
+}
+
+/** A TypeError from this realm or another (fetch's network-error type). */
+function isTypeError(e: unknown): boolean {
+  try {
+    if (e instanceof TypeError) return true;
+    return typeof e === 'object' && e !== null && (e as { name?: unknown }).name === 'TypeError';
+  } catch {
+    return false;
+  }
+}
 
 function safeStr(v: unknown, max: number): string {
   let s: string;
@@ -535,6 +580,88 @@ function parseStackLine(line: string): StackFrame {
   return { inApp: true };
 }
 
+const JSON_SAFE_MAX_DEPTH = 32;
+
+/**
+ * Converts any value into plain JSON data, never throwing. Mirrors
+ * JSON.stringify (toJSON honoured, undefined/functions/symbols dropped from
+ * objects and nulled in arrays, non-finite numbers become null) and also
+ * survives what JSON.stringify throws on: a BigInt becomes its decimal string,
+ * a true cycle (an object inside itself) becomes "[Circular]", a throwing
+ * toJSON or getter becomes "[unserializable]", and nesting past 32 levels
+ * becomes "[Truncated]". A value shared by two keys is NOT a cycle and is kept
+ * on both.
+ */
+function toJsonSafe(value: unknown, ancestors: object[] = []): JsonValue | undefined {
+  if (value === null) return null;
+  switch (typeof value) {
+    case 'string':
+    case 'boolean':
+      return value;
+    case 'number':
+      return Number.isFinite(value) ? value : null;
+    case 'bigint':
+      return value.toString();
+    case 'object':
+      break;
+    default:
+      return undefined; // undefined, function, symbol
+  }
+  const obj = value;
+  if (ancestors.includes(obj)) return '[Circular]';
+  if (ancestors.length >= JSON_SAFE_MAX_DEPTH) return '[Truncated]';
+  try {
+    const toJSON = (obj as { toJSON?: unknown }).toJSON;
+    if (typeof toJSON === 'function') {
+      return toJsonSafe((toJSON as () => unknown).call(obj), ancestors);
+    }
+    ancestors.push(obj);
+    try {
+      if (Array.isArray(obj)) {
+        return obj.map((item: unknown) => {
+          try {
+            return toJsonSafe(item, ancestors) ?? null;
+          } catch {
+            return '[unserializable]';
+          }
+        });
+      }
+      const out: Record<string, JsonValue> = {};
+      for (const key of Object.keys(obj)) {
+        let v: JsonValue | undefined;
+        try {
+          v = toJsonSafe((obj as Record<string, unknown>)[key], ancestors);
+        } catch {
+          v = '[unserializable]';
+        }
+        if (v !== undefined) out[key] = v;
+      }
+      return out;
+    } finally {
+      ancestors.pop();
+    }
+  } catch {
+    return '[unserializable]';
+  }
+}
+
+/**
+ * Returns the envelope as plain JSON data so it can always be stringified for
+ * sending and persisting. Fast path: an ordinary envelope is just round-tripped
+ * through JSON (identical to what was sent before). Only when JSON.stringify
+ * throws (a BigInt or a cycle in user, context or breadcrumb data, a throwing
+ * toJSON) does the tolerant walk run. Without this, the throw happened inside
+ * sendOne and read as a network failure, so the event sat at the head of the
+ * queue forever and blocked every later event.
+ */
+function jsonSafeEnvelope(env: EventEnvelope): EventEnvelope {
+  try {
+    return JSON.parse(JSON.stringify(env)) as EventEnvelope;
+  } catch {
+    return toJsonSafe(env) as unknown as EventEnvelope;
+  }
+}
+
 function isErrorLike(err: unknown): err is { name?: unknown; message?: unknown; stack?: unknown } {
   return typeof err === 'object' && err !== null && 'message' in err;
 }
@@ -594,6 +721,22 @@ interface QueueItem {
   env: EventEnvelope;
 }
 
+/**
+ * The queue item whose POST drainOnce is waiting on. `keepalive` is whether
+ * that request went with keepalive, so it outlives the page. `handedOff` is
+ * set by beaconFlush when the page hides during the send: the item is not
+ * beaconed (the request already carries it), and while that request is a
+ * keepalive one it is left out of the spool, or the next page load would send
+ * it a second time. `unloaded` is set by post() when that keepalive request
+ * then rejects with a TypeError (see sendQueued).
+ */
+interface InFlight {
+  id: string;
+  keepalive: boolean;
+  handedOff: boolean;
+  unloaded: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Client.
 // ---------------------------------------------------------------------------
@@ -635,6 +778,7 @@ export class Client {
 
   // Queue + guards.
   private queue: QueueItem[] = [];
+  private inFlight: InFlight | null = null;
   private capturing = false;
   private drainInFlight: Promise<void> | null = null;
   private drainRequested = false;
@@ -691,10 +835,13 @@ export class Client {
           : undefined;
 
     this.now = deps.now ?? (() => Date.now());
-    this.setTimeoutFn = deps.setTimeoutFn ?? G.setTimeout ?? (() => 0);
-    this.clearTimeoutFn = deps.clearTimeoutFn ?? G.clearTimeout ?? (() => undefined);
-    this.setIntervalFn = deps.setIntervalFn ?? G.setInterval ?? (() => 0);
-    this.clearIntervalFn = deps.clearIntervalFn ?? G.clearInterval ?? (() => undefined);
+    // The global timers are bound to globalThis: they are called as methods
+    // (`this.setTimeoutFn(...)`), and a browser throws "Illegal invocation"
+    // when window.setTimeout & co. run with a `this` that is not the window.
+    this.setTimeoutFn = deps.setTimeoutFn ?? bindGlobal(G.setTimeout) ?? (() => 0);
+    this.clearTimeoutFn = deps.clearTimeoutFn ?? bindGlobal(G.clearTimeout) ?? (() => undefined);
+    this.setIntervalFn = deps.setIntervalFn ?? bindGlobal(G.setInterval) ?? (() => 0);
+    this.clearIntervalFn = deps.clearIntervalFn ?? bindGlobal(G.clearInterval) ?? (() => undefined);
 
     const detected = this.win !== undefined && this.doc !== undefined ? 'browser' : 'node';
     this.runtime = opts.runtime ?? detected;
@@ -881,15 +1028,23 @@ export class Client {
   }
 
   private writeStderr(err: unknown): void {
-    let msg: string;
-    if (err instanceof Error || isErrorLike(err)) {
-      const e = err as { stack?: unknown; message?: unknown };
-      msg =
-        typeof e.stack === 'string'
-          ? e.stack
-          : `${SDK_NAME} uncaughtException: ${String(e.message)}`;
-    } else {
-      msg = `${SDK_NAME} uncaughtException: ${String(err)}`;
+    // Building the message must not throw either: onUncaughtException calls
+    // this right before exit(1), and a throw here (String() on a message with
+    // no toString, a throwing stack getter) used to skip the exit and leave
+    // the process running after an uncaught exception.
+    let msg = `${SDK_NAME} uncaughtException: [unprintable value]`;
+    try {
+      if (err instanceof Error || isErrorLike(err)) {
+        const e = err as { stack?: unknown; message?: unknown };
+        msg =
+          typeof e.stack === 'string'
+            ? e.stack
+            : `${SDK_NAME} uncaughtException: ${String(e.message)}`;
+      } else {
+        msg = `${SDK_NAME} uncaughtException: ${String(err)}`;
+      }
+    } catch {
+      // keep the placeholder
     }
     try {
       const w = this.proc?.stderr?.write;
@@ -1052,7 +1207,7 @@ export class Client {
       const env = this.buildEnvelope(exception, level, id);
       const finalEnv = this.applyBeforeSend(env);
       if (finalEnv === null) return '';
-      this.enqueue(finalEnv);
+      this.enqueue(jsonSafeEnvelope(finalEnv));
       void this.drainQueue();
       return id;
     } catch (e) {
@@ -1207,7 +1362,8 @@ export class Client {
   }
 
   /**
-   * Single-attempt POST for a check-in ping. Swallows every failure (network
+   * Single-attempt POST for a check-in ping (post() may repeat a refused
+   * keepalive send once without keepalive). Swallows every failure (network
    * error, timeout, non-2xx) - there is no queue or retry timer for check-ins.
    */
   private async sendCheckIn(url: string): Promise<void> {
@@ -1221,27 +1377,30 @@ export class Client {
       controller = undefined;
     }
     const timer = controller
-      ? this.setTimeoutFn(() => {
-          try {
-            controller?.abort();
-          } catch {
-            // ignore
-          }
-        }, SEND_TIMEOUT_MS)
+      ? this.startTimer(
+          'timeout',
+          () => {
+            try {
+              controller?.abort();
+            } catch {
+              // ignore
+            }
+          },
+          SEND_TIMEOUT_MS,
+        )
       : null;
     try {
       const init: FetchInit = {
         method: 'POST',
         headers: {},
         body: '',
-        ...(this.runtime === 'browser' ? { keepalive: true } : {}),
         ...(controller ? { signal: controller.signal } : {}),
       };
-      await fetchFn(url, init);
+      await this.post(fetchFn, url, init);
     } catch {
-      // one attempt only - never retried, never throws
+      // no queue, no retry timer - never throws
     } finally {
-      if (timer !== null) this.clearTimeoutFn(timer);
+      this.stopTimer('timeout', timer);
     }
   }
 
@@ -1256,7 +1415,40 @@ export class Client {
     this.persist();
   }
 
-  private async sendOne(env: EventEnvelope): Promise<{ ok: boolean; status?: number }> {
+  /**
+   * sendOne for a queue item, recorded in `inFlight` until it settles so that
+   * beaconFlush leaves it alone. For an item beaconFlush handed to its
+   * keepalive request (and so left out of the spool):
+   * - a TypeError is treated like a sent beacon and the item is dropped.
+   *   Chromium rejects an in-flight keepalive fetch with "TypeError: Failed to
+   *   fetch" as the page unloads while the request itself goes on to the
+   *   server (Chromium 149: the rejection came 1 ms after pagehide and the
+   *   POST still arrived). Retrying or re-spooling it would send it twice.
+   * - any other outcome (an HTTP answer, or our own timeout's abort, which
+   *   does cancel the request) goes back into the spool and drainOnce handles
+   *   it as usual: a 202 removes it, a 503 keeps it for a retry.
+   */
+  private async sendQueued(
+    item: QueueItem,
+    env: EventEnvelope,
+  ): Promise<{ ok: boolean; status?: number }> {
+    const flight: InFlight = { id: item.id, keepalive: false, handedOff: false, unloaded: false };
+    this.inFlight = flight;
+    let res: { ok: boolean; status?: number } = { ok: false };
+    try {
+      res = await this.sendOne(env, flight);
+    } finally {
+      if (this.inFlight === flight) this.inFlight = null;
+    }
+    if (flight.unloaded) this.removeQueued(item.id);
+    else if (flight.handedOff && flight.keepalive) this.persist();
+    return res;
+  }
+
+  private async sendOne(
+    env: EventEnvelope,
+    flight?: InFlight,
+  ): Promise<{ ok: boolean; status?: number }> {
     if (!this.dsn) return { ok: false };
     const fetchFn = this.fetchFn;
     if (!fetchFn) return { ok: false };
@@ -1269,13 +1461,17 @@ export class Client {
       controller = undefined;
     }
     const timer = controller
-      ? this.setTimeoutFn(() => {
-          try {
-            controller?.abort();
-          } catch {
-            // ignore
-          }
-        }, SEND_TIMEOUT_MS)
+      ? this.startTimer(
+          'timeout',
+          () => {
+            try {
+              controller?.abort();
+            } catch {
+              // ignore
+            }
+          },
+          SEND_TIMEOUT_MS,
+        )
       : null;
 
     try {
@@ -1283,27 +1479,114 @@ export class Client {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(env),
-        ...(this.runtime === 'browser' ? { keepalive: true } : {}),
         ...(controller ? { signal: controller.signal } : {}),
       };
-      const res = await fetchFn(this.dsn.ingestUrl, init);
+      const res = await this.post(fetchFn, this.dsn.ingestUrl, init, flight);
       return { ok: res.ok, status: res.status };
     } catch {
       return { ok: false };
     } finally {
-      if (timer !== null) this.clearTimeoutFn(timer);
+      this.stopTimer('timeout', timer);
     }
   }
 
-  /** Coalescing drain: at most one runs; a request mid-drain triggers one more. */
+  /**
+   * One POST, with keepalive in the browser whenever the browser will take it,
+   * so the send can outlive the page. Chrome refuses a keepalive request past
+   * the 64 KiB quota with "TypeError: Failed to fetch" before anything is
+   * sent; drainOnce read that as a network error, so an envelope over 64 KiB
+   * (100 breadcrumbs of 1 KB) failed on every retry and held up every crash
+   * queued behind it. So a body over KEEPALIVE_BODY_MAX goes without
+   * keepalive, and a keepalive send that rejects with a TypeError (the quota
+   * is shared with other keepalive requests in flight) is retried once
+   * without it. Offline that costs one extra failed attempt. An abort is not
+   * a TypeError and is not retried. Rejects when the last attempt rejects.
+   * `flight` (a queued crash's send) records which kind of request is going.
+   */
+  private async post(
+    fetchFn: FetchLike,
+    url: string,
+    init: FetchInit,
+    flight?: InFlight,
+  ): Promise<FetchResponse> {
+    if (this.runtime !== 'browser' || !fitsKeepalive(init.body)) return fetchFn(url, init);
+    try {
+      if (flight) flight.keepalive = true;
+      return await fetchFn(url, { ...init, keepalive: true });
+    } catch (e) {
+      if (!isTypeError(e)) throw e;
+      if (flight?.handedOff === true) {
+        // After the page hid, a TypeError is the page unloading, not the
+        // quota: the request goes on without us (see sendQueued).
+        flight.unloaded = true;
+        throw e;
+      }
+      this.log('debug', 'keepalive send refused; retrying once without keepalive', e);
+      if (flight) flight.keepalive = false;
+      return fetchFn(url, init);
+    }
+  }
+
+  /**
+   * Starts a host timer and never throws. A host timer that throws (an unbound
+   * browser setTimeout raises "Illegal invocation") yields null and the caller
+   * degrades: no abort timeout, no retry tick, no debounce. It must not reject
+   * instead, because a rejection out of this pipeline reaches the client's own
+   * unhandledrejection handler, which captures it, fails to send it, and
+   * captures that failure again: an endless loop. `unref` keeps a Node event
+   * loop from being held open by uh-oh alone.
+   */
+  private startTimer(
+    kind: 'timeout' | 'interval',
+    cb: () => void,
+    ms: number,
+    unref = false,
+  ): unknown {
+    let handle: unknown;
+    try {
+      handle = kind === 'interval' ? this.setIntervalFn(cb, ms) : this.setTimeoutFn(cb, ms);
+    } catch (e) {
+      this.log('debug', `could not start a ${kind} timer`, e);
+      return null;
+    }
+    if (unref) {
+      try {
+        const t = handle as { unref?: () => void };
+        if (t && typeof t.unref === 'function') t.unref();
+      } catch {
+        // unref unavailable (browser); harmless
+      }
+    }
+    return handle === undefined ? null : handle;
+  }
+
+  /** Clears a timer from startTimer and never throws. */
+  private stopTimer(kind: 'timeout' | 'interval', handle: unknown): void {
+    if (handle === null) return;
+    try {
+      if (kind === 'interval') this.clearIntervalFn(handle);
+      else this.clearTimeoutFn(handle);
+    } catch {
+      // best-effort
+    }
+  }
+
+  /**
+   * Coalescing drain: at most one runs; a request mid-drain triggers one more.
+   * The returned promise never rejects (callers fire it with `void`).
+   */
   private drainQueue(): Promise<void> {
     if (this.drainInFlight) {
       this.drainRequested = true;
       return this.drainInFlight;
     }
-    this.drainInFlight = this.drainLoop().finally(() => {
-      this.drainInFlight = null;
-    });
+    this.drainInFlight = this.drainLoop()
+      .catch((e: unknown) => {
+        this.log('debug', 'drain failed', e);
+      })
+      .finally(() => {
+        this.drainInFlight = null;
+      });
     return this.drainInFlight;
   }
 
@@ -1320,16 +1603,22 @@ export class Client {
     this.updateRetryTimer();
   }
 
+  /**
+   * Sends the queue head by head. While a send is in flight the queue can
+   * change under it (beaconFlush rebuilds it, a capture appends, the 50-event
+   * cap evicts the oldest), so the head that was sent is removed by id, never
+   * by position: shift() used to drop whichever crash had become the head,
+   * unsent.
+   */
   private async drainOnce(): Promise<void> {
     if (!this.dsn) return;
     while (this.queue.length > 0 && !this.closed) {
       const item = this.queue[0];
       if (!item) break;
-      const res = await this.sendOne(item.env);
+      const res = await this.sendQueued(item, item.env);
 
       if (res.ok) {
-        this.queue.shift();
-        this.persist();
+        this.removeQueued(item.id);
         continue;
       }
 
@@ -1339,21 +1628,19 @@ export class Client {
           ...item.env,
           breadcrumbs: item.env.breadcrumbs.slice(-50),
         };
-        const retry = await this.sendOne(trimmed);
+        const retry = await this.sendQueued(item, trimmed);
         if (retry.ok) {
-          this.queue.shift();
-          this.persist();
+          this.removeQueued(item.id);
           continue;
         }
         if (retry.status === 413) {
           this.log('debug', 'event dropped after second 413');
-          this.queue.shift();
-          this.persist();
+          this.removeQueued(item.id);
           continue;
         }
         // Transient failure after trimming: keep the TRIMMED event and stop.
+        // `item` is the queued object itself (if it is still queued).
         item.env = trimmed;
-        this.queue[0] = item;
         this.persist();
         break;
       }
@@ -1361,14 +1648,20 @@ export class Client {
       // Other 4xx (not 429): permanent, drop and continue.
       if (res.status !== undefined && res.status >= 400 && res.status < 500 && res.status !== 429) {
         this.log('debug', `event dropped on ${String(res.status)} response`);
-        this.queue.shift();
-        this.persist();
+        this.removeQueued(item.id);
         continue;
       }
 
       // Network error, 5xx, or 429: retain and stop; the retry timer picks up.
       break;
     }
+  }
+
+  /** Removes a sent (or permanently refused) item, wherever it now sits. */
+  private removeQueued(id: string): void {
+    const i = this.queue.findIndex((q) => q.id === id);
+    if (i !== -1) this.queue.splice(i, 1);
+    this.persist();
   }
 
   private updateRetryTimer(): void {
@@ -1381,16 +1674,15 @@ export class Client {
 
   private ensureRetryTimer(): void {
     if (this.retryTimer !== null) return;
-    this.retryTimer = this.setIntervalFn(() => {
-      void this.drainQueue();
-    }, RETRY_INTERVAL_MS);
-    // Do not keep a Node event loop alive purely for retries.
-    try {
-      const t = this.retryTimer as { unref?: () => void };
-      if (t && typeof t.unref === 'function') t.unref();
-    } catch {
-      // unref unavailable (browser); harmless
-    }
+    // Unref'd: do not keep a Node event loop alive purely for retries.
+    this.retryTimer = this.startTimer(
+      'interval',
+      () => {
+        void this.drainQueue();
+      },
+      RETRY_INTERVAL_MS,
+      true,
+    );
   }
 
   private clearRetryTimer(): void {
@@ -1418,7 +1710,12 @@ export class Client {
     const storage = this.storage;
     if (!storage) return;
     try {
-      let items = this.queue.slice(-MAX_QUEUE);
+      // A crash handed to a keepalive request at pagehide is on its way
+      // already (see InFlight); spooling it would send it again next page.
+      const f = this.inFlight;
+      const queued =
+        f && f.handedOff && f.keepalive ? this.queue.filter((q) => q.id !== f.id) : this.queue;
+      let items = queued.slice(-MAX_QUEUE);
       let serialized = JSON.stringify(items);
       while (serialized.length > MAX_SPOOL_BYTES && items.length > 1) {
         items = items.slice(1);
@@ -1504,17 +1801,18 @@ export class Client {
     if (this.runtime !== 'node' || !this.fs || !this.spoolFile) return;
     this.spoolDirty = true;
     if (this.spoolTimer !== null) return;
-    this.spoolTimer = this.setTimeoutFn(() => {
-      this.spoolTimer = null;
-      this.flushSpool();
-    }, SPOOL_DEBOUNCE_MS);
-    // Do not keep a Node event loop alive purely for a pending spool write.
-    try {
-      const t = this.spoolTimer as { unref?: () => void };
-      if (t && typeof t.unref === 'function') t.unref();
-    } catch {
-      // unref unavailable; harmless
-    }
+    // Unref'd: do not keep a Node event loop alive purely for a spool write.
+    this.spoolTimer = this.startTimer(
+      'timeout',
+      () => {
+        this.spoolTimer = null;
+        this.flushSpool();
+      },
+      SPOOL_DEBOUNCE_MS,
+      true,
+    );
+    // No timer available: write now rather than never.
+    if (this.spoolTimer === null) this.flushSpool();
   }
 
   /**
@@ -1613,10 +1911,25 @@ export class Client {
       return;
     }
     const remaining: QueueItem[] = [];
+    const flight = this.inFlight;
     for (const item of this.queue) {
+      if (flight && item.id === flight.id) {
+        // Its POST is in flight: a beacon too would deliver it twice. It stays
+        // queued until that POST settles (see sendQueued). A keepalive POST
+        // outlives the page, so persist() leaves it out of the spool; a plain
+        // one (over the quota, or refused) dies with the page, so the spool
+        // keeps it for the next page load.
+        flight.handedOff = true;
+        remaining.push(item);
+        continue;
+      }
       let ok = false;
       try {
-        ok = beacon(this.dsn.ingestUrl, this.beaconBody(item.env));
+        const json = JSON.stringify(item.env);
+        // Over the keepalive quota sendBeacon can only refuse it: keep it
+        // queued (persisted below) for a plain fetch from this page's retry
+        // timer or from the next page load.
+        ok = fitsKeepalive(json) && beacon(this.dsn.ingestUrl, this.beaconBody(json));
       } catch {
         ok = false;
       }
@@ -1626,11 +1939,21 @@ export class Client {
     this.persist();
   }
 
-  private beaconBody(payload: unknown): unknown {
-    const json = JSON.stringify(payload);
+  /**
+   * Beacon bodies are text/plain on purpose. navigator.sendBeacon always sends
+   * with credentials mode "include"; a body typed application/json is not a
+   * CORS-safelisted type, so the browser preflights it, and a preflight
+   * answered "Access-Control-Allow-Origin: *" fails for a credentialed request,
+   * so the POST is never sent (production showed only lone OPTIONS requests).
+   * text/plain is a CORS "simple" request: no preflight. Both ingest routes
+   * parse a text/plain body as JSON. A bare string body (no Blob) is sent by
+   * the browser as text/plain too. `json` is the already serialized payload,
+   * so callers can check its size first (fitsKeepalive).
+   */
+  private beaconBody(json: string): unknown {
     try {
       const BlobCtorRef = G.Blob;
-      if (BlobCtorRef) return new BlobCtorRef([json], { type: 'application/json' });
+      if (BlobCtorRef) return new BlobCtorRef([json], { type: BEACON_CONTENT_TYPE });
     } catch {
       // fall through to string
     }
@@ -1800,17 +2123,18 @@ export class Client {
 
   private ensureAnalyticsTimer(): void {
     if (this.analyticsTimer !== null) return;
-    this.analyticsTimer = this.setTimeoutFn(() => {
-      this.analyticsTimer = null;
-      void this.flushAnalytics();
-    }, ANALYTICS_DEBOUNCE_MS);
-    // Do not keep a Node event loop alive purely for a pending analytics batch.
-    try {
-      const t = this.analyticsTimer as { unref?: () => void };
-      if (t && typeof t.unref === 'function') t.unref();
-    } catch {
-      // unref unavailable (browser); harmless
-    }
+    // Unref'd: do not keep a Node event loop alive purely for an analytics
+    // batch. With no timer the batch waits for the 20-event cap, flush(),
+    // close() or the pagehide beacon instead of throwing.
+    this.analyticsTimer = this.startTimer(
+      'timeout',
+      () => {
+        this.analyticsTimer = null;
+        void this.flushAnalytics();
+      },
+      ANALYTICS_DEBOUNCE_MS,
+      true,
+    );
   }
 
   private clearAnalyticsTimer(): void {
@@ -1853,13 +2177,17 @@ export class Client {
       controller = undefined;
     }
     const timer = controller
-      ? this.setTimeoutFn(() => {
-          try {
-            controller?.abort();
-          } catch {
-            // ignore
-          }
-        }, SEND_TIMEOUT_MS)
+      ? this.startTimer(
+          'timeout',
+          () => {
+            try {
+              controller?.abort();
+            } catch {
+              // ignore
+            }
+          },
+          SEND_TIMEOUT_MS,
+        )
       : null;
 
     try {
@@ -1867,17 +2195,16 @@ export class Client {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ events }),
-        ...(this.runtime === 'browser' ? { keepalive: true } : {}),
         ...(controller ? { signal: controller.signal } : {}),
       };
-      const res = await fetchFn(`${dsn.ingestUrl}/usage`, init);
+      const res = await this.post(fetchFn, `${dsn.ingestUrl}/usage`, init);
       if (!res.ok) {
         this.log('debug', `analytics batch dropped on non-2xx response (${String(res.status)})`);
       }
     } catch {
       this.log('debug', 'analytics batch dropped: send failed (no retry, no spool)');
     } finally {
-      if (timer !== null) this.clearTimeoutFn(timer);
+      this.stopTimer('timeout', timer);
     }
   }
 
@@ -1896,7 +2223,15 @@ export class Client {
       return;
     }
     try {
-      const ok = beacon(`${this.dsn.ingestUrl}/usage`, this.beaconBody({ events: batch }));
+      const json = JSON.stringify({ events: batch });
+      if (!fitsKeepalive(json)) {
+        // sendBeacon would refuse a batch over the keepalive quota. A plain
+        // fetch still lands while the page is only hidden; at unload it may
+        // be cut off, which analytics accepts.
+        void this.sendAnalyticsBatch(batch);
+        return;
+      }
+      const ok = beacon(`${this.dsn.ingestUrl}/usage`, this.beaconBody(json));
       if (!ok) this.log('debug', 'analytics beacon flush rejected by the browser; batch dropped');
     } catch {
       this.log('debug', 'analytics beacon flush failed; batch dropped');
@@ -2015,10 +2350,12 @@ export class Client {
       const finish = (): void => {
         if (settled) return;
         settled = true;
-        if (timer !== null) this.clearTimeoutFn(timer);
+        this.stopTimer('timeout', timer);
         resolve();
       };
-      timer = this.setTimeoutFn(finish, ms);
+      // No usable timer (startTimer returned null): the flush is then bounded
+      // only by the sends themselves, which never reject.
+      timer = this.startTimer('timeout', finish, ms);
       Promise.all([this.drainQueue(), this.flushAnalytics()]).then(finish, finish);
     });
   }
@@ -2054,20 +2391,85 @@ function pick<T>(dep: T | null | undefined, fromGlobal: T | undefined): T | unde
   return dep;
 }
 
+/**
+ * Binds a host function taken off globalThis (setTimeout, clearInterval, ...)
+ * back to globalThis. Browser globals are WebIDL operations that throw
+ * "TypeError: Illegal invocation" when called with any other `this`, which is
+ * exactly what storing one on the Client and calling `this.setTimeoutFn(...)`
+ * does. Node's timers ignore `this`, so the unbound version passed every Node
+ * and injected-fake test while the real browser client never sent anything.
+ */
+function bindGlobal<F extends (...args: never[]) => unknown>(fn: F | undefined): F | undefined {
+  return typeof fn === 'function' ? (fn.bind(globalThis) as F) : undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Functional singleton API - what consumer apps import. Every entry point is
 // wrapped so it can never throw out of the public surface.
 // ---------------------------------------------------------------------------
 
-let current: Client | null = null;
+// The live client is kept in a global slot keyed by Symbol.for, not only in
+// this module. A bundler can evaluate this file more than once in one process:
+// Next.js (Turbopack) builds instrumentation.ts and each route handler as
+// separate module graphs, so init() in instrumentation set a client that route
+// code never saw, and the minifier folded the route copy's captureException
+// down to `return ""`. Every copy reads the same Symbol.for key, so the copy
+// that called init() serves them all.
+//
+// Contract: one functional-API client per global scope (a page, a Node
+// process, a worker; workers have their own globalThis). A second init() from
+// any copy closes and replaces the first, as a second init() always did within
+// one copy. Two independent apps on one page that each need their own DSN
+// should construct `new Client()` directly. close() from any copy clears the
+// slot, so a test that resets modules should still call close(). When the slot
+// cannot be written (a frozen global), each copy keeps its own client.
+const CLIENT_SLOT = Symbol.for('uh-oh.client');
+let moduleClient: Client | null = null;
+
+function isClientLike(v: unknown): v is Client {
+  return (
+    typeof v === 'object' &&
+    v !== null &&
+    typeof (v as { captureException?: unknown }).captureException === 'function'
+  );
+}
+
+/** The client every copy shares, else this copy's own (slot unwritable). */
+function liveClient(): Client | null {
+  try {
+    const held = (G as unknown as Record<symbol, unknown>)[CLIENT_SLOT];
+    if (isClientLike(held)) return held;
+    if (held === null) return null; // cleared by some copy's close()
+  } catch {
+    // unreadable global: fall back to this copy's own client
+  }
+  return moduleClient;
+}
+
+function setLiveClient(c: Client | null): void {
+  moduleClient = c;
+  try {
+    (G as unknown as Record<symbol, unknown>)[CLIENT_SLOT] = c;
+  } catch {
+    // frozen or locked-down global: this copy keeps its own client
+  }
+}
 
 export function init(opts: InitOptions): void {
+  let next: Client | null = null;
   try {
-    if (current) current.close();
-    current = new Client(opts);
-    current.install();
+    const previous = liveClient();
+    if (previous) previous.close();
+    next = new Client(opts);
+    setLiveClient(next);
+    next.install();
   } catch (e) {
-    current = null;
+    try {
+      next?.close();
+    } catch {
+      // never throw
+    }
+    setLiveClient(null);
     try {
       if (opts && opts.debug) {
         const c = G.console;
@@ -2081,7 +2483,8 @@ export function init(opts: InitOptions): void {
 
 export function captureException(err: unknown, opts?: CaptureOptions): string {
   try {
-    return current ? current.captureException(err, opts) : '';
+    const c = liveClient();
+    return c ? c.captureException(err, opts) : '';
   } catch {
     return '';
   }
@@ -2089,7 +2492,8 @@ export function captureException(err: unknown, opts?: CaptureOptions): string {
 
 export function captureMessage(msg: string, level?: Level): string {
   try {
-    return current ? current.captureMessage(msg, level) : '';
+    const c = liveClient();
+    return c ? c.captureMessage(msg, level) : '';
   } catch {
     return '';
   }
@@ -2097,7 +2501,7 @@ export function captureMessage(msg: string, level?: Level): string {
 
 export function addBreadcrumb(b: BreadcrumbInput): void {
   try {
-    current?.addBreadcrumb(b);
+    liveClient()?.addBreadcrumb(b);
   } catch {
     // never throw
   }
@@ -2105,7 +2509,7 @@ export function addBreadcrumb(b: BreadcrumbInput): void {
 
 export function setUser(u: UserInfo | null): void {
   try {
-    current?.setUser(u);
+    liveClient()?.setUser(u);
   } catch {
     // never throw
   }
@@ -2113,7 +2517,7 @@ export function setUser(u: UserInfo | null): void {
 
 export function setContext(key: string, value: Record<string, unknown> | null): void {
   try {
-    current?.setContext(key, value);
+    liveClient()?.setContext(key, value);
   } catch {
     // never throw
   }
@@ -2121,7 +2525,7 @@ export function setContext(key: string, value: Record<string, unknown> | null): 
 
 export function setTag(key: string, value: string | null): void {
   try {
-    current?.setTag(key, value);
+    liveClient()?.setTag(key, value);
   } catch {
     // never throw
   }
@@ -2129,7 +2533,7 @@ export function setTag(key: string, value: string | null): void {
 
 export function setFingerprint(parts: string[] | null): void {
   try {
-    current?.setFingerprint(parts);
+    liveClient()?.setFingerprint(parts);
   } catch {
     // never throw
   }
@@ -2137,7 +2541,7 @@ export function setFingerprint(parts: string[] | null): void {
 
 export function checkIn(slug: string, opts?: CheckInOptions): void {
   try {
-    current?.checkIn(slug, opts);
+    liveClient()?.checkIn(slug, opts);
   } catch {
     // never throw
   }
@@ -2145,7 +2549,7 @@ export function checkIn(slug: string, opts?: CheckInOptions): void {
 
 export function trackPageview(path?: string): void {
   try {
-    current?.trackPageview(path);
+    liveClient()?.trackPageview(path);
   } catch {
     // never throw
   }
@@ -2153,7 +2557,7 @@ export function trackPageview(path?: string): void {
 
 export function trackEvent(name: string, props?: Record<string, string | number | boolean>): void {
   try {
-    current?.trackEvent(name, props);
+    liveClient()?.trackEvent(name, props);
   } catch {
     // never throw
   }
@@ -2161,7 +2565,8 @@ export function trackEvent(name: string, props?: Record<string, string | number 
 
 export function flush(timeoutMs?: number): Promise<void> {
   try {
-    return current ? current.flush(timeoutMs) : Promise.resolve();
+    const c = liveClient();
+    return c ? c.flush(timeoutMs) : Promise.resolve();
   } catch {
     return Promise.resolve();
   }
@@ -2169,10 +2574,10 @@ export function flush(timeoutMs?: number): Promise<void> {
 
 export function close(): void {
   try {
-    current?.close();
+    liveClient()?.close();
   } catch {
     // never throw
   } finally {
-    current = null;
+    setLiveClient(null);
   }
 }

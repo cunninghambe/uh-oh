@@ -584,5 +584,88 @@ describe('Client', () => {
       expect(await new Spool(storage).size()).toBe(0); // flushed on reconnect
       client.stop();
     });
+
+    // NetInfo only fires on a connectivity change. A 5xx or 429 arrives while
+    // the device is online, so no NetInfo event follows it: before this fix
+    // the event sat in AsyncStorage until the next capture, launch or network
+    // change, because `_ensureFlushTimer` returned early whenever NetInfo was
+    // subscribed.
+    it.each([503, 429])(
+      'with NetInfo present, a %i is retried on the 30 s timer while online',
+      async (status) => {
+        vi.useFakeTimers();
+        const netInfo = { addEventListener: () => () => undefined }; // never fires
+        const answers = [status, 202];
+        const fetchMock = vi.fn(() => {
+          const s = answers.shift() ?? 202;
+          return Promise.resolve({ ok: s >= 200 && s < 300, status: s });
+        });
+        origFetch = globalThis.fetch;
+        globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+        const client = new Client(
+          { dsn: VALID_DSN, release: '1.0.0+1', enableNative: false },
+          storage,
+          { loadRejectionTracking: () => null, loadNetInfo: () => netInfo },
+        );
+        client.start();
+        client.captureException(new Error('server blip'));
+        await vi.advanceTimersByTimeAsync(5);
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(await new Spool(storage).size()).toBe(1); // retained, not dropped
+
+        await vi.advanceTimersByTimeAsync(30_000);
+        expect(fetchMock).toHaveBeenCalledTimes(2); // the timer retried
+        expect(await new Spool(storage).size()).toBe(0);
+
+        // Spool empty: the timer is cleared, so nothing polls any more.
+        await vi.advanceTimersByTimeAsync(120_000);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        client.stop();
+      },
+    );
+
+    it('with NetInfo present, a network error leaves recovery to NetInfo (no polling)', async () => {
+      vi.useFakeTimers();
+      let cb: ((s: { isConnected: boolean | null }) => void) | undefined;
+      const netInfo = {
+        addEventListener: (fn: (s: { isConnected: boolean | null }) => void) => {
+          cb = fn;
+          return () => undefined;
+        },
+      };
+      // 503 arms the timer; the timer's retry then hits a network error (the
+      // device went offline), which hands recovery back to NetInfo.
+      const answers: Array<number | 'offline'> = [503, 'offline'];
+      const fetchMock = vi.fn(() => {
+        const a = answers.shift() ?? 202;
+        return a === 'offline'
+          ? Promise.reject(new Error('offline'))
+          : Promise.resolve({ ok: a >= 200 && a < 300, status: a });
+      });
+      origFetch = globalThis.fetch;
+      globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+      const client = new Client(
+        { dsn: VALID_DSN, release: '1.0.0+1', enableNative: false },
+        storage,
+        { loadRejectionTracking: () => null, loadNetInfo: () => netInfo },
+      );
+      client.start();
+      client.captureException(new Error('blip then offline'));
+      await vi.advanceTimersByTimeAsync(5);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2); // 503, then the timed retry
+      expect(await new Spool(storage).size()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(300_000);
+      expect(fetchMock).toHaveBeenCalledTimes(2); // offline: no battery-draining polls
+
+      cb?.({ isConnected: true }); // NetInfo reports the network is back
+      await vi.advanceTimersByTimeAsync(5);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(await new Spool(storage).size()).toBe(0);
+      client.stop();
+    });
   });
 });

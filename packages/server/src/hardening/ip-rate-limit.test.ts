@@ -1,6 +1,51 @@
 import { describe, expect, it } from 'vitest';
 
-import { createIpRateLimiter } from './ip-rate-limit.js';
+import {
+  createIpRateLimiter,
+  DEFAULT_IP_RATE_BURST,
+  DEFAULT_IP_RATE_PER_MINUTE,
+  resolveIpRateSetting,
+} from './ip-rate-limit.js';
+
+describe('resolveIpRateSetting (UH_OH_IP_RATE_PER_MIN / _BURST)', () => {
+  const resolve = (raw: string | undefined) => {
+    const errors: string[] = [];
+    const value = resolveIpRateSetting('UH_OH_IP_RATE_PER_MIN', raw, 600, (m) => errors.push(m));
+    return { value, errors };
+  };
+
+  it('the production defaults are 600/min with a burst of 100', () => {
+    expect(DEFAULT_IP_RATE_PER_MINUTE).toBe(600);
+    expect(DEFAULT_IP_RATE_BURST).toBe(100);
+  });
+
+  it('unset or blank uses the default silently', () => {
+    expect(resolve(undefined)).toEqual({ value: 600, errors: [] });
+    expect(resolve('')).toEqual({ value: 600, errors: [] });
+    expect(resolve('  ')).toEqual({ value: 600, errors: [] });
+  });
+
+  it('a valid positive number is used as-is', () => {
+    expect(resolve('120')).toEqual({ value: 120, errors: [] });
+    expect(resolve('1.5')).toEqual({ value: 1.5, errors: [] });
+  });
+
+  it('an invalid value falls back to the default and is reported', () => {
+    for (const bad of ['12O', 'abc', '0', '-5', 'Infinity', 'NaN']) {
+      const { value, errors } = resolve(bad);
+      expect(value, bad).toBe(600);
+      expect(errors, bad).toHaveLength(1);
+      expect(errors[0]).toContain('UH_OH_IP_RATE_PER_MIN');
+    }
+  });
+
+  it('regression: a NaN setting would otherwise deny every request after the first', () => {
+    const broken = createIpRateLimiter({ perMinute: Number('12O'), burst: Number('2O') });
+    expect(broken.consume('1.2.3.4', 0)).toBe(true);
+    // NaN tokens never compare >= 1, even an hour later.
+    expect(broken.consume('1.2.3.4', 60 * 60 * 1000)).toBe(false);
+  });
+});
 
 describe('createIpRateLimiter', () => {
   describe('consume — token bucket math', () => {

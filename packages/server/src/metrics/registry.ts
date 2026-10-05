@@ -70,6 +70,14 @@ export const metrics = {
     registers: [registry],
   }),
 
+  // Temporary, with ingest/old-client-guard.ts: remove both together.
+  oldClientReportsDropped: new Counter({
+    name: 'uh_oh_old_client_reports_dropped_total',
+    help: 'Reports of their own unbound-timer bug from @uh-oh/js clients before 0.6.1, dropped at ingest, by project slug',
+    labelNames: ['project'] as const,
+    registers: [registry],
+  }),
+
   requestDuration: new Histogram({
     name: 'uh_oh_request_duration_seconds',
     help: 'HTTP request duration',

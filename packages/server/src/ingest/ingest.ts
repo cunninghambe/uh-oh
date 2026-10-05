@@ -19,14 +19,26 @@ import {
   mostRecentlyDeployedAttempt,
 } from '../db/repos/fix-attempts.js';
 import type { ProjectRow } from '../db/schema.js';
+import { newId } from '../db/ids.js';
 
 import { computeFingerprint, computeTitle } from './fingerprint.js';
+import {
+  isOldClientSelfReport,
+  recordOldClientDrop,
+  type OldClientDropLogger,
+} from './old-client-guard.js';
 import type { RateLimiter } from './rate-limit.js';
 import { metrics } from '../metrics/registry.js';
 
 export type IngestResult =
   | { kind: 'stored'; eventId: string; issueId: string; isNewIssue: boolean; regressed: boolean }
   | { kind: 'rate-limited'; issueId: string; isNewIssue: boolean }
+  /**
+   * Temporary (old-client-guard.ts): an old browser client's report of its own
+   * timer bug, answered like a stored event but not stored. `eventId` is fresh
+   * and names no row.
+   */
+  | { kind: 'dropped'; eventId: string }
   | { kind: 'unknown-key' };
 
 export type IngestDeps = {
@@ -38,8 +50,11 @@ export type IngestDeps = {
    * its own. Threaded from UH_OH_DEFAULT_WEBHOOK_URL at startup.
    */
   defaultWebhookUrl?: string | undefined;
-  /** Used to warn when an alert-worthy transition has nowhere to go. */
-  logger?: WebhookTargetLogger | undefined;
+  /**
+   * Used to warn when an alert-worthy transition has nowhere to go, and for the
+   * info line about dropped old-client reports (old-client-guard.ts).
+   */
+  logger?: (WebhookTargetLogger & OldClientDropLogger) | undefined;
 };
 
 const isoToMs = (iso: string): number => {
@@ -56,6 +71,18 @@ export const ingest = (
   if (!project) return { kind: 'unknown-key' };
 
   const now = deps.now?.() ?? Date.now();
+
+  // Temporary guard, removable once every app is re-vendored (see
+  // old-client-guard.ts): a @uh-oh/js client before 0.6.1 reporting its own
+  // unbound-timer TypeError, in Chromium's, Firefox's or Safari's wording.
+  // Answered as stored so the client drops it from its queue; nothing is
+  // written, so no issue, no alert, and no token spent from the fingerprint
+  // rate limit. Counted per project instead.
+  if (isOldClientSelfReport(envelope)) {
+    recordOldClientDrop(project, envelope.sdk.version, now, deps.logger);
+    return { kind: 'dropped', eventId: newId() };
+  }
+
   const fingerprint = computeFingerprint(envelope);
   const title = computeTitle(envelope);
 

@@ -13,6 +13,7 @@ import type { ProjectRow } from '../db/schema.js';
 import { buildServer } from '../server.js';
 import { TEST_SECRET } from '../auth/test-utils.js';
 import { metrics } from '../metrics/registry.js';
+import { captureLog, forwardLevel } from '../logging/test-utils.js';
 
 import { ingest as ingestFn } from './ingest.js';
 import { createRateLimiter, type RateLimiter } from './rate-limit.js';
@@ -201,6 +202,32 @@ describe('POST /ingest/:publicKey', () => {
     expect(first.json<{ eventId: string | null }>().eventId).not.toBeNull();
     expect(second.statusCode).toBe(202);
     expect(second.json()).toEqual({ eventId: null, rateLimited: true });
+  });
+
+  it('logs a new issue with nowhere to go as a structured warn line', async () => {
+    const app = buildServer({ db, secret: TEST_SECRET, password: TEST_PASSWORD });
+    // Assert on the emitted pino line, not the call: pino silently drops a
+    // context object passed after the message.
+    const log = captureLog();
+    const warn = forwardLevel(app.log, 'warn', log.logger);
+    try {
+      const res = await app.inject({
+        method: 'POST',
+        url: `/ingest/${project.publicKey}`,
+        payload: validEnv,
+      });
+      expect(res.statusCode).toBe(202);
+    } finally {
+      warn.mockRestore();
+    }
+    expect(log.lines).toHaveLength(1);
+    expect(log.lines[0]).toMatchObject({
+      level: 40,
+      projectId: project.id,
+      project: 'App',
+      type: 'issue.new',
+    });
+    expect(String(log.lines[0]?.['msg'])).toContain('UH_OH_DEFAULT_WEBHOOK_URL');
   });
 
   it('healthz returns ok', async () => {

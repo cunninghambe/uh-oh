@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import type { Db } from '../db/index.js';
+import { captureLog, forwardLevel } from '../logging/test-utils.js';
 import { makeTestDb } from '../db/test-utils.js';
 import { createProject, updateProject } from '../db/repos/projects.js';
 import {
@@ -145,19 +146,32 @@ describe('POST /ingest/:publicKey/check-in/:slug', () => {
 
   it('warns instead of silently dropping a recovery with nowhere to go', async () => {
     const server = app();
-    const warn = vi.spyOn(server.log, 'warn');
-    await checkIn(server, 'cron', project.publicKey, '?intervalMinutes=10');
-    const monitor = getMonitorBySlug(db, project.id, 'cron');
-    setMonitorStatus(db, monitor!.id, 'missed');
+    // The real pino line, not the call: pino drops a context object passed
+    // after the message, so only the emitted JSON proves the fields survive.
+    const log = captureLog();
+    const warn = forwardLevel(server.log, 'warn', log.logger);
+    try {
+      await checkIn(server, 'cron', project.publicKey, '?intervalMinutes=10');
+      const monitor = getMonitorBySlug(db, project.id, 'cron');
+      setMonitorStatus(db, monitor!.id, 'missed');
 
-    await checkIn(server, 'cron');
+      await checkIn(server, 'cron');
+    } finally {
+      warn.mockRestore();
+    }
     expect(takeDueDispatches(db, Date.now() + 1000, 10)).toHaveLength(0);
-    expect(warn).toHaveBeenCalledOnce();
-    const msg = String(warn.mock.calls[0]?.[0]);
+    expect(log.lines).toHaveLength(1);
+    const line = log.lines[0];
+    expect(line).toMatchObject({
+      level: 40,
+      projectId: project.id,
+      project: 'App',
+      type: 'monitor.recovered',
+    });
+    const msg = String(line?.['msg']);
     expect(msg).toContain('monitor.recovered');
     expect(msg).toContain('App');
     expect(msg).toContain('UH_OH_DEFAULT_WEBHOOK_URL');
-    warn.mockRestore();
   });
 
   it('rate-limits excessive pings to one monitor', async () => {

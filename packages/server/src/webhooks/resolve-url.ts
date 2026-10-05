@@ -32,9 +32,11 @@ export type WebhookTargetProject = {
 };
 
 /**
- * Logger shape for the "nowhere to go" warning. Structurally satisfied by
- * `app.log` and by the sweeps' `SweepLogger`; optional everywhere so tests and
- * library callers can omit it (matching the dispatcher's own logger type).
+ * Logger shape for the "nowhere to go" warning: `(message, context)`. Satisfied
+ * by the sweeps' `SweepLogger` and by `toStructuredLogger(app.log)`. Fastify's
+ * pino `app.log` also type-checks here, but pino reads `(context, message)` and
+ * silently drops the context, so never pass it raw. Optional everywhere so tests
+ * and library callers can omit it (matching the dispatcher's own logger type).
  */
 export type WebhookTargetLogger = {
   warn?: (msg: string, meta?: object) => void;

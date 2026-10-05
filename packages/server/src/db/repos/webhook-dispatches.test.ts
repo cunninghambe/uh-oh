@@ -5,7 +5,12 @@ import { makeTestDb } from '../test-utils.js';
 import { createProject } from './projects.js';
 import { upsertIssue } from './issues.js';
 import { insertEvent } from './events.js';
-import { enqueueDispatch, takeDueDispatches, markDispatchAttempt } from './webhook-dispatches.js';
+import {
+  enqueueDispatch,
+  markDispatchAttempt,
+  summarizeFailedDispatches,
+  takeDueDispatches,
+} from './webhook-dispatches.js';
 
 let db: Db;
 let close: () => void;
@@ -138,5 +143,45 @@ describe('markDispatchAttempt', () => {
     expect(due[0]?.attempt).toBe(1);
     expect(due[0]?.lastError).toBe('unavailable');
     expect(due[0]?.lastResponseCode).toBe(503);
+  });
+});
+
+describe('summarizeFailedDispatches', () => {
+  const fail = (id: string, at: number): void =>
+    markDispatchAttempt(db, id, {
+      ok: false,
+      statusCode: 404,
+      error: 'HTTP 404',
+      at,
+      nextAttemptAt: null,
+    });
+
+  it('reports no failures on an empty table', () => {
+    expect(summarizeFailedDispatches(db)).toEqual({ failed: 0, lastFailedAt: null });
+  });
+
+  it('counts only failed rows and reports when the latest final attempt ran', () => {
+    const a = enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);
+    const b = enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);
+    const ok = enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);
+    enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW); // stays pending
+    // The final attempt runs well after the row was enqueued (retries, a slow poll).
+    fail(a.id, NOW + 42_000);
+    fail(b.id, NOW + 90_000);
+    markDispatchAttempt(db, ok.id, { ok: true, statusCode: 204, at: NOW + 120_000 });
+
+    expect(summarizeFailedDispatches(db)).toEqual({ failed: 2, lastFailedAt: NOW + 90_000 });
+  });
+
+  it('a retry that is scheduled does not count as a failure', () => {
+    const row = enqueueDispatch(db, { issueId, eventId, url: WEBHOOK_URL }, NOW);
+    markDispatchAttempt(db, row.id, {
+      ok: false,
+      statusCode: 503,
+      error: 'unavailable',
+      at: NOW,
+      nextAttemptAt: NOW + 2000,
+    });
+    expect(summarizeFailedDispatches(db)).toEqual({ failed: 0, lastFailedAt: null });
   });
 });
