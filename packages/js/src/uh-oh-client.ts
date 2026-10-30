@@ -366,7 +366,7 @@ export interface ClientDeps {
 // ---------------------------------------------------------------------------
 
 const SDK_NAME = '@uh-oh/js';
-const SDK_VERSION = '0.6.1';
+const SDK_VERSION = '0.6.2';
 const SPOOL_KEY = 'uh-oh:spool';
 const SPOOL_FILE = 'uh-oh-spool.json';
 const SPOOL_DEBOUNCE_MS = 1_000;
@@ -564,8 +564,9 @@ function makeFrame(
 
 /**
  * Parses one stack line into a StackFrame. Handles V8/Node (`at fn (f:l:c)`
- * and `at f:l:c`, plus Hermes `address at`) and Firefox/Safari (`fn@f:l:c`).
- * Unmatched lines yield a location-less in-app frame.
+ * and `at f:l:c`, plus Hermes `address at`) and Firefox/Safari (`fn@f:l:c`,
+ * and Safari's `fn@[native code]`, which is not in-app). Unmatched lines yield
+ * a location-less in-app frame.
  */
 function parseStackLine(line: string): StackFrame {
   const v8Fn = /^\s*at\s+(.+?)\s+\((?:address at\s+)?(.+):(\d+):(\d+)\)\s*$/.exec(line);
@@ -577,7 +578,65 @@ function parseStackLine(line: string): StackFrame {
     const fn = (ff[1] ?? '').trim();
     return makeFrame(fn || undefined, ff[2], toInt(ff[3]), toInt(ff[4]));
   }
+  const native = /^\s*([^@]*)@\[native code\]\s*$/.exec(line);
+  if (native) {
+    const fn = (native[1] ?? '').trim();
+    return { ...makeFrame(fn || undefined, '[native code]', undefined, undefined), inApp: false };
+  }
   return { inApp: true };
+}
+
+const V8_FRAME_LINE = /^\s*at\s/;
+
+/**
+ * The frame lines of a stack, without its header. V8 (Chrome, Node, Hermes)
+ * starts a stack with the error's "Name: message", over several lines when
+ * the message has them. JavaScriptCore (Safari) and SpiderMonkey (Firefox)
+ * have no header, so their first line is the top frame. Up to 0.6.1 the first
+ * line was always dropped, which threw that frame away: a one-frame Safari
+ * error arrived with no frames at all.
+ *
+ * A stack that starts with one of `headers` (what the error says it is) loses
+ * exactly that. Any line still ahead of the first frame is a header that did
+ * not match (V8 writes it when `.stack` is first read, so a message changed
+ * later differs; a wrapper's own "Error" line) and goes too: with V8 frames in
+ * the stack, every line before the first of them; otherwise every line before
+ * the first one with an "@", as every JavaScriptCore and SpiderMonkey frame
+ * has. Blank lines (SpiderMonkey ends a stack with a newline) are not frames.
+ */
+function stackFrameLines(stack: string, headers: string[]): string[] {
+  let rest = stack;
+  for (const h of headers) {
+    if (h && (rest === h || rest.startsWith(h + '\n'))) {
+      rest = rest.slice(h.length + 1);
+      break;
+    }
+  }
+  const lines = rest.split('\n').filter((l) => l.trim() !== '');
+  const isFrame = lines.some((l) => V8_FRAME_LINE.test(l))
+    ? (l: string): boolean => V8_FRAME_LINE.test(l)
+    : (l: string): boolean => l.includes('@');
+  const first = lines.findIndex(isFrame);
+  return first === -1 ? [] : lines.slice(first);
+}
+
+/**
+ * What a stack's header would say for `e`: "name: message" as V8 (and
+ * Error.prototype.toString) builds it, and the error's own toString(), which a
+ * wrapper may have used instead. A throwing toString() is skipped.
+ */
+function stackHeaders(e: { name?: unknown; message?: unknown; toString?: unknown }): string[] {
+  const name = typeof e.name === 'string' ? e.name : 'Error';
+  const message = typeof e.message === 'string' ? e.message : '';
+  const headers = [!name ? message : !message ? name : `${name}: ${message}`];
+  try {
+    const toString = e.toString;
+    const s: unknown = typeof toString === 'function' ? toString.call(e) : undefined;
+    if (typeof s === 'string') headers.push(s);
+  } catch {
+    // the fallback in stackFrameLines covers this header too
+  }
+  return headers;
 }
 
 const JSON_SAFE_MAX_DEPTH = 32;
@@ -670,7 +729,7 @@ function errorToException(err: unknown, mechanism: Mechanism): ExceptionInfo {
   if (err instanceof Error || isErrorLike(err)) {
     const e = err as { name?: unknown; message?: unknown; stack?: unknown };
     const stack = typeof e.stack === 'string' ? e.stack : '';
-    const frames = stack ? stack.split('\n').slice(1).map(parseStackLine) : [];
+    const frames = stack ? stackFrameLines(stack, stackHeaders(e)).map(parseStackLine) : [];
     return {
       type: safeStr(typeof e.name === 'string' && e.name ? e.name : 'Error', TYPE_MAX),
       value: safeStr(e.message, VALUE_MAX),
@@ -1580,27 +1639,36 @@ export class Client {
       this.drainRequested = true;
       return this.drainInFlight;
     }
-    this.drainInFlight = this.drainLoop()
-      .catch((e: unknown) => {
-        this.log('debug', 'drain failed', e);
-      })
-      .finally(() => {
-        this.drainInFlight = null;
-      });
+    // drainLoop awaits before it can let go, so drainInFlight is set first.
+    this.drainInFlight = this.drainLoop().catch((e: unknown) => {
+      this.log('debug', 'drain failed', e);
+    });
     return this.drainInFlight;
   }
 
+  /**
+   * Lets go of the drain in the same step as its last look at the queue, so a
+   * capture after that starts a drain of its own. 0.6.1 let go in a .finally
+   * on the drain's promise, a few microtasks later: a capture in between only
+   * set drainRequested, which nothing read again, and with the queue empty no
+   * retry timer ran either, so the event waited for another capture or a page
+   * hide (and a flush() in between returned without it).
+   */
   private async drainLoop(): Promise<void> {
-    do {
-      this.drainRequested = false;
-      try {
-        await this.drainOnce();
-      } catch (e) {
-        this.log('debug', 'drain failed', e);
-        break;
-      }
-    } while (this.drainRequested && this.queue.length > 0);
-    this.updateRetryTimer();
+    try {
+      do {
+        this.drainRequested = false;
+        try {
+          await this.drainOnce();
+        } catch (e) {
+          this.log('debug', 'drain failed', e);
+          break;
+        }
+      } while (this.drainRequested && this.queue.length > 0);
+      this.updateRetryTimer();
+    } finally {
+      this.drainInFlight = null;
+    }
   }
 
   /**

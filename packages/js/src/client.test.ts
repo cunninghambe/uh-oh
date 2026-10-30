@@ -15,6 +15,7 @@ import {
   checkIn,
   flush,
   close,
+  type EventEnvelope,
 } from './uh-oh-client.js';
 import { fakeProcess, mockFetch, mockRawFetch } from './test-support.js';
 
@@ -80,7 +81,7 @@ describe('Client - envelope + runtime', () => {
     expect(f.calls[0]?.url).toBe(INGEST);
     const env = EventEnvelopeSchema.parse(firstCallEnv(f.calls));
     expect(env.platform).toBe('node');
-    expect(env.sdk).toEqual({ name: '@uh-oh/js', version: '0.6.1' });
+    expect(env.sdk).toEqual({ name: '@uh-oh/js', version: '0.6.2' });
     expect(env.release).toEqual({ version: '1.4.2', build: '37' });
     expect(env.device.osName).toBe('linux');
     expect(env.device.osVersion).toBe('v20.3.1');
@@ -373,6 +374,107 @@ describe('Client - queue policy', () => {
     expect(f.calls[0]?.env.breadcrumbs).toHaveLength(60);
     expect(f.calls[1]?.env.breadcrumbs).toHaveLength(50);
     expect(f.calls[2]?.env.breadcrumbs).toHaveLength(50);
+    expect(c.size()).toBe(0);
+    c.close();
+  });
+});
+
+describe('Client - a capture during or just after a send loop', () => {
+  // 0.6.1 let go of a finished drain a few microtasks after its last look at
+  // the queue (in a .finally on the drain's promise). A capture in between
+  // found the drain still running, so it only set drainRequested, which
+  // nothing read again; the queue had been empty, so no retry timer ran
+  // either. The event stayed queued until another capture or a page hide.
+  const OFFSETS = 20;
+
+  /** A client whose retry interval is recorded, never run. */
+  function raceClient() {
+    const f = mockFetch();
+    const intervals = new Set<number>();
+    let next = 0;
+    const c = new Client(
+      { dsn: DSN, release: '1.0.0' },
+      {
+        fetchFn: f.fn,
+        proc: null,
+        setIntervalFn: () => {
+          next += 1;
+          intervals.add(next);
+          return next;
+        },
+        clearIntervalFn: (h) => {
+          intervals.delete(h as number);
+        },
+      },
+    );
+    return { c, f, intervals };
+  }
+
+  const microtasks = async (n: number): Promise<void> => {
+    for (let i = 0; i < n; i++) await Promise.resolve();
+  };
+  const tick = (): Promise<void> => new Promise((r) => setTimeout(r, 0));
+
+  it('sends an event captured in any of the microtasks after a send', async () => {
+    const stranded: number[] = [];
+    for (let k = 0; k <= OFFSETS; k++) {
+      const { c, f, intervals } = raceClient();
+      c.captureException(new Error('first'));
+      await microtasks(k);
+      c.captureException(new Error('second'));
+      await tick();
+      await tick();
+      const sent = f.calls.map((call) => call.env.exception.value);
+      if (sent.join() !== 'first,second') {
+        // Still queued, and nothing is going to send it.
+        expect(c.size()).toBe(1);
+        expect(intervals.size).toBe(0);
+        stranded.push(k);
+      }
+      c.close();
+    }
+    expect(stranded).toEqual([]);
+  });
+
+  it('a flush() right after such a capture waits for it', async () => {
+    const missed: number[] = [];
+    for (let k = 0; k <= OFFSETS; k++) {
+      const { c, f } = raceClient();
+      c.captureException(new Error('first'));
+      await microtasks(k);
+      c.captureException(new Error('second'));
+      await c.flush(1_000);
+      if (f.calls.length !== 2) missed.push(k);
+      c.close();
+    }
+    expect(missed).toEqual([]);
+  });
+
+  it('sends an event captured while a send is in flight in the same loop', async () => {
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const calls: string[] = [];
+    const c = new Client(
+      { dsn: DSN, release: '1.0.0' },
+      {
+        fetchFn: async (_url, init) => {
+          calls.push((JSON.parse(init.body) as EventEnvelope).exception.value);
+          if (calls.length === 1) await held;
+          return { ok: true, status: 202 };
+        },
+        proc: null,
+        setIntervalFn: () => 0,
+        clearIntervalFn: () => undefined,
+      },
+    );
+    c.captureException(new Error('first'));
+    await microtasks(3);
+    c.captureException(new Error('second'));
+    release();
+    await tick();
+    expect(calls).toEqual(['first', 'second']);
     expect(c.size()).toBe(0);
     c.close();
   });
