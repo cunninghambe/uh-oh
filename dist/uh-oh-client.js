@@ -1,0 +1,2291 @@
+// @uh-oh/js - self-contained browser + Node crash-reporting client.
+//
+// This is ONE dependency-free TypeScript file by design: a vendor script
+// copies it verbatim into consumer repos (see scripts/vendor-js-client.mjs).
+// Constraints that shape the code below:
+//   * ZERO imports. The minimal envelope wire types are inlined as local
+//     interfaces (the real Zod schemas live in @uh-oh/types; the TESTS import
+//     them to validate what this file produces).
+//   * Must compile under strict TS in foreign repos where the DOM lib AND the
+//     Node lib may both be absent, so every runtime global (window, process,
+//     fetch, localStorage, ...) is reached through a locally-typed view of
+//     globalThis rather than by referencing an ambient global type.
+//   * The public API must NEVER throw. Every entry point is wrapped, handler
+//     installs are guarded, the internal pipeline has a re-entrancy guard, and
+//     async work is catch-all'd so it can never surface an unhandled rejection
+//     (which our own promise handler would otherwise re-capture in a loop).
+//   * Usage analytics (trackPageview/trackEvent) is a second, INDEPENDENT
+//     pipeline from the crash queue above: its own bounded queue, its own
+//     batching timer, and no retry/spool on send failure. It is lossy by
+//     design - low-value, high-volume data - and, per privacy requirements,
+//     this file never mints, stores, or sends any identifier of its own (no
+//     cookies, no localStorage id); it only ships the event payloads the
+//     caller/browser hands it, and identity is established server-side.
+//
+// NOTE: this file must contain no U+2014 (em dash) characters - one consumer
+// repo lints for them and the file is vendored in verbatim. Use hyphens.
+// ---------------------------------------------------------------------------
+// Constants.
+// ---------------------------------------------------------------------------
+const SDK_NAME = '@uh-oh/js';
+const SDK_VERSION = '0.6.2';
+const SPOOL_KEY = 'uh-oh:spool';
+const SPOOL_FILE = 'uh-oh-spool.json';
+const SPOOL_DEBOUNCE_MS = 1_000;
+const MAX_QUEUE = 50;
+const MAX_SPOOL_BYTES = 500_000;
+const WIRE_BREADCRUMB_MAX = 100;
+const DEFAULT_MAX_BREADCRUMBS = 100;
+const RETRY_INTERVAL_MS = 30_000;
+const SEND_TIMEOUT_MS = 10_000;
+const UNCAUGHT_FLUSH_MS = 2_000;
+const TYPE_MAX = 256;
+const VALUE_MAX = 4096;
+const CATEGORY_MAX = 64;
+const MESSAGE_MAX = 1024;
+const SLUG_RE = /^[a-z0-9-]{1,64}$/;
+// CORS-safelisted, so a beacon needs no preflight (see beaconBody).
+const BEACON_CONTENT_TYPE = 'text/plain;charset=UTF-8';
+// Largest body (UTF-8 bytes) sent with keepalive or by sendBeacon. The Fetch
+// spec's keepalive quota is 64 KiB summed over a page's in-flight keepalive
+// requests, sendBeacon included; Chrome refuses a body past it before anything
+// is sent. The margin leaves room for a small keepalive request in flight.
+const KEEPALIVE_BODY_MAX = 60_000;
+// -- usage analytics: batching + validation (mirrors CONTRACT U-IN server-side) --
+const ANALYTICS_MAX_QUEUE = 20;
+const ANALYTICS_DEBOUNCE_MS = 5_000;
+const USAGE_NAME_RE = /^[a-zA-Z0-9_-]{1,64}$/;
+const USAGE_PATH_MAX = 512;
+const USAGE_REFERRER_MAX = 512;
+const USAGE_PROPS_MAX_KEYS = 10;
+const USAGE_PROP_KEY_MAX = 64;
+const USAGE_PROP_VALUE_MAX = 256;
+const USAGE_RELEASE_MAX = 128;
+// -- console breadcrumbs (opts.consoleBreadcrumbs) --
+const CONSOLE_BREADCRUMB_MESSAGE_MAX = 500;
+const CONSOLE_METHODS = ['debug', 'log', 'info', 'warn', 'error'];
+const G = globalThis;
+// ---------------------------------------------------------------------------
+// Pure helpers.
+// ---------------------------------------------------------------------------
+/**
+ * True when `body` is at most KEEPALIVE_BODY_MAX bytes once UTF-8 encoded.
+ * Counted by hand: TextEncoder is not guaranteed on every host. A UTF-16 code
+ * unit encodes to 1 to 3 bytes (a surrogate pair is 4 bytes for 2 units, a
+ * lone surrogate becomes the 3-byte U+FFFD), so most bodies are decided by
+ * their length alone.
+ */
+function fitsKeepalive(body) {
+    if (body.length > KEEPALIVE_BODY_MAX)
+        return false;
+    if (body.length * 3 <= KEEPALIVE_BODY_MAX)
+        return true;
+    let bytes = 0;
+    for (let i = 0; i < body.length; i += 1) {
+        const c = body.charCodeAt(i);
+        if (c < 0x80)
+            bytes += 1;
+        else if (c < 0x800)
+            bytes += 2;
+        else if (c >= 0xd800 && c <= 0xdbff && i + 1 < body.length) {
+            const next = body.charCodeAt(i + 1);
+            if (next >= 0xdc00 && next <= 0xdfff) {
+                bytes += 4;
+                i += 1;
+            }
+            else {
+                bytes += 3;
+            }
+        }
+        else
+            bytes += 3;
+    }
+    return bytes <= KEEPALIVE_BODY_MAX;
+}
+/** A TypeError from this realm or another (fetch's network-error type). */
+function isTypeError(e) {
+    try {
+        if (e instanceof TypeError)
+            return true;
+        return typeof e === 'object' && e !== null && e.name === 'TypeError';
+    }
+    catch {
+        return false;
+    }
+}
+function safeStr(v, max) {
+    let s;
+    try {
+        s = typeof v === 'string' ? v : String(v);
+    }
+    catch {
+        s = '';
+    }
+    return s.length > max ? s.slice(0, max) : s;
+}
+function genId(cryptoObj) {
+    try {
+        if (cryptoObj && typeof cryptoObj.randomUUID === 'function')
+            return cryptoObj.randomUUID();
+    }
+    catch {
+        // fall through to the manual id
+    }
+    return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}`;
+}
+/**
+ * Resolves a usable `node:fs` via a guarded `require`, reached through the
+ * globalThis view (same discipline as every other runtime global here). Returns
+ * undefined - never throws - when `require` or the module is unavailable
+ * (browsers, or an ESM host with no reachable `require`), which disables the
+ * disk spool silently.
+ */
+function loadFs() {
+    try {
+        const req = G.require;
+        if (typeof req !== 'function')
+            return undefined;
+        const mod = req('node:fs');
+        if (mod &&
+            typeof mod.mkdirSync === 'function' &&
+            typeof mod.writeFileSync === 'function' &&
+            typeof mod.renameSync === 'function' &&
+            typeof mod.readFileSync === 'function') {
+            return mod;
+        }
+    }
+    catch {
+        // node:fs unavailable; the disk spool stays disabled.
+    }
+    return undefined;
+}
+/**
+ * Parses `http(s)://<publicKey>@<host>[:port][/path]`. Returns null (never
+ * throws) for absent, empty, or malformed input so the caller can no-op.
+ */
+export function parseDsn(dsn) {
+    if (!dsn || typeof dsn !== 'string' || dsn.trim() === '')
+        return null;
+    const UrlCtor = G.URL;
+    if (!UrlCtor)
+        return null;
+    let u;
+    try {
+        u = new UrlCtor(dsn);
+    }
+    catch {
+        return null;
+    }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:')
+        return null;
+    const publicKey = u.username;
+    if (!publicKey)
+        return null;
+    const port = u.port ? `:${u.port}` : '';
+    let path = u.pathname || '';
+    if (path === '/')
+        path = '';
+    if (path.endsWith('/'))
+        path = path.slice(0, -1);
+    const baseUrl = `${u.protocol}//${u.hostname}${port}${path}`;
+    return { publicKey, baseUrl, ingestUrl: `${baseUrl}/ingest/${publicKey}` };
+}
+function parseRelease(release) {
+    const raw = typeof release === 'string' ? release : '';
+    const plus = raw.indexOf('+');
+    const version = plus >= 0 ? raw.slice(0, plus) : raw;
+    const build = plus >= 0 ? raw.slice(plus + 1) : '';
+    return {
+        version: safeStr(version || raw || '0.0.0', 64),
+        build: safeStr(build || '0', 64),
+    };
+}
+function toInt(s) {
+    if (s === undefined)
+        return undefined;
+    const n = parseInt(s, 10);
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
+}
+function makeFrame(fn, file, ln, col) {
+    const inApp = !(file && file.includes('node_modules'));
+    return {
+        inApp,
+        ...(fn ? { function: safeStr(fn, 512) } : {}),
+        ...(file ? { filename: safeStr(file, 1024) } : {}),
+        ...(ln !== undefined ? { lineno: ln } : {}),
+        ...(col !== undefined ? { colno: col } : {}),
+    };
+}
+/**
+ * Parses one stack line into a StackFrame. Handles V8/Node (`at fn (f:l:c)`
+ * and `at f:l:c`, plus Hermes `address at`) and Firefox/Safari (`fn@f:l:c`,
+ * and Safari's `fn@[native code]`, which is not in-app). Unmatched lines yield
+ * a location-less in-app frame.
+ */
+function parseStackLine(line) {
+    const v8Fn = /^\s*at\s+(.+?)\s+\((?:address at\s+)?(.+):(\d+):(\d+)\)\s*$/.exec(line);
+    if (v8Fn)
+        return makeFrame(v8Fn[1], v8Fn[2], toInt(v8Fn[3]), toInt(v8Fn[4]));
+    const v8Anon = /^\s*at\s+(?:address at\s+)?(.+):(\d+):(\d+)\s*$/.exec(line);
+    if (v8Anon)
+        return makeFrame(undefined, v8Anon[1], toInt(v8Anon[2]), toInt(v8Anon[3]));
+    const ff = /^\s*([^@]*)@(.+):(\d+):(\d+)\s*$/.exec(line);
+    if (ff) {
+        const fn = (ff[1] ?? '').trim();
+        return makeFrame(fn || undefined, ff[2], toInt(ff[3]), toInt(ff[4]));
+    }
+    const native = /^\s*([^@]*)@\[native code\]\s*$/.exec(line);
+    if (native) {
+        const fn = (native[1] ?? '').trim();
+        return { ...makeFrame(fn || undefined, '[native code]', undefined, undefined), inApp: false };
+    }
+    return { inApp: true };
+}
+const V8_FRAME_LINE = /^\s*at\s/;
+/**
+ * The frame lines of a stack, without its header. V8 (Chrome, Node, Hermes)
+ * starts a stack with the error's "Name: message", over several lines when
+ * the message has them. JavaScriptCore (Safari) and SpiderMonkey (Firefox)
+ * have no header, so their first line is the top frame. Up to 0.6.1 the first
+ * line was always dropped, which threw that frame away: a one-frame Safari
+ * error arrived with no frames at all.
+ *
+ * A stack that starts with one of `headers` (what the error says it is) loses
+ * exactly that. Any line still ahead of the first frame is a header that did
+ * not match (V8 writes it when `.stack` is first read, so a message changed
+ * later differs; a wrapper's own "Error" line) and goes too: with V8 frames in
+ * the stack, every line before the first of them; otherwise every line before
+ * the first one with an "@", as every JavaScriptCore and SpiderMonkey frame
+ * has. Blank lines (SpiderMonkey ends a stack with a newline) are not frames.
+ */
+function stackFrameLines(stack, headers) {
+    let rest = stack;
+    for (const h of headers) {
+        if (h && (rest === h || rest.startsWith(h + '\n'))) {
+            rest = rest.slice(h.length + 1);
+            break;
+        }
+    }
+    const lines = rest.split('\n').filter((l) => l.trim() !== '');
+    const isFrame = lines.some((l) => V8_FRAME_LINE.test(l))
+        ? (l) => V8_FRAME_LINE.test(l)
+        : (l) => l.includes('@');
+    const first = lines.findIndex(isFrame);
+    return first === -1 ? [] : lines.slice(first);
+}
+/**
+ * What a stack's header would say for `e`: "name: message" as V8 (and
+ * Error.prototype.toString) builds it, and the error's own toString(), which a
+ * wrapper may have used instead. A throwing toString() is skipped.
+ */
+function stackHeaders(e) {
+    const name = typeof e.name === 'string' ? e.name : 'Error';
+    const message = typeof e.message === 'string' ? e.message : '';
+    const headers = [!name ? message : !message ? name : `${name}: ${message}`];
+    try {
+        const toString = e.toString;
+        const s = typeof toString === 'function' ? toString.call(e) : undefined;
+        if (typeof s === 'string')
+            headers.push(s);
+    }
+    catch {
+        // the fallback in stackFrameLines covers this header too
+    }
+    return headers;
+}
+const JSON_SAFE_MAX_DEPTH = 32;
+/**
+ * Converts any value into plain JSON data, never throwing. Mirrors
+ * JSON.stringify (toJSON honoured, undefined/functions/symbols dropped from
+ * objects and nulled in arrays, non-finite numbers become null) and also
+ * survives what JSON.stringify throws on: a BigInt becomes its decimal string,
+ * a true cycle (an object inside itself) becomes "[Circular]", a throwing
+ * toJSON or getter becomes "[unserializable]", and nesting past 32 levels
+ * becomes "[Truncated]". A value shared by two keys is NOT a cycle and is kept
+ * on both.
+ */
+function toJsonSafe(value, ancestors = []) {
+    if (value === null)
+        return null;
+    switch (typeof value) {
+        case 'string':
+        case 'boolean':
+            return value;
+        case 'number':
+            return Number.isFinite(value) ? value : null;
+        case 'bigint':
+            return value.toString();
+        case 'object':
+            break;
+        default:
+            return undefined; // undefined, function, symbol
+    }
+    const obj = value;
+    if (ancestors.includes(obj))
+        return '[Circular]';
+    if (ancestors.length >= JSON_SAFE_MAX_DEPTH)
+        return '[Truncated]';
+    try {
+        const toJSON = obj.toJSON;
+        if (typeof toJSON === 'function') {
+            return toJsonSafe(toJSON.call(obj), ancestors);
+        }
+        ancestors.push(obj);
+        try {
+            if (Array.isArray(obj)) {
+                return obj.map((item) => {
+                    try {
+                        return toJsonSafe(item, ancestors) ?? null;
+                    }
+                    catch {
+                        return '[unserializable]';
+                    }
+                });
+            }
+            const out = {};
+            for (const key of Object.keys(obj)) {
+                let v;
+                try {
+                    v = toJsonSafe(obj[key], ancestors);
+                }
+                catch {
+                    v = '[unserializable]';
+                }
+                if (v !== undefined)
+                    out[key] = v;
+            }
+            return out;
+        }
+        finally {
+            ancestors.pop();
+        }
+    }
+    catch {
+        return '[unserializable]';
+    }
+}
+/**
+ * Returns the envelope as plain JSON data so it can always be stringified for
+ * sending and persisting. Fast path: an ordinary envelope is just round-tripped
+ * through JSON (identical to what was sent before). Only when JSON.stringify
+ * throws (a BigInt or a cycle in user, context or breadcrumb data, a throwing
+ * toJSON) does the tolerant walk run. Without this, the throw happened inside
+ * sendOne and read as a network failure, so the event sat at the head of the
+ * queue forever and blocked every later event.
+ */
+function jsonSafeEnvelope(env) {
+    try {
+        return JSON.parse(JSON.stringify(env));
+    }
+    catch {
+        return toJsonSafe(env);
+    }
+}
+function isErrorLike(err) {
+    return typeof err === 'object' && err !== null && 'message' in err;
+}
+function errorToException(err, mechanism) {
+    if (err instanceof Error || isErrorLike(err)) {
+        const e = err;
+        const stack = typeof e.stack === 'string' ? e.stack : '';
+        const frames = stack ? stackFrameLines(stack, stackHeaders(e)).map(parseStackLine) : [];
+        return {
+            type: safeStr(typeof e.name === 'string' && e.name ? e.name : 'Error', TYPE_MAX),
+            value: safeStr(e.message, VALUE_MAX),
+            stacktrace: frames.slice(0, 500),
+            mechanism,
+        };
+    }
+    return {
+        type: 'UnknownError',
+        value: safeStr(err, VALUE_MAX),
+        stacktrace: [],
+        mechanism,
+    };
+}
+function parseUserAgent(ua) {
+    if (!ua)
+        return { osName: 'browser', osVersion: 'unknown' };
+    const win = /Windows NT ([0-9._]+)/.exec(ua);
+    if (win)
+        return { osName: 'Windows', osVersion: safeStr(win[1] ?? 'unknown', 64) };
+    const mac = /Mac OS X ([0-9_.]+)/.exec(ua);
+    if (mac)
+        return {
+            osName: 'macOS',
+            osVersion: safeStr((mac[1] ?? '').replace(/_/g, '.') || 'unknown', 64),
+        };
+    const android = /Android ([0-9._]+)/.exec(ua);
+    if (android)
+        return { osName: 'Android', osVersion: safeStr(android[1] ?? 'unknown', 64) };
+    const ios = /(?:iPhone|iPad|iPod).*?OS ([0-9_]+)/.exec(ua);
+    if (ios)
+        return {
+            osName: 'iOS',
+            osVersion: safeStr((ios[1] ?? '').replace(/_/g, '.') || 'unknown', 64),
+        };
+    if (/Linux/.test(ua))
+        return { osName: 'Linux', osVersion: 'unknown' };
+    return { osName: 'browser', osVersion: 'unknown' };
+}
+/** Console-breadcrumbs level mapping: debug->debug, log/info->info, warn->warning, error->error. */
+function consoleBreadcrumbLevel(method) {
+    if (method === 'debug')
+        return 'debug';
+    if (method === 'warn')
+        return 'warning';
+    if (method === 'error')
+        return 'error';
+    return 'info'; // log, info
+}
+// ---------------------------------------------------------------------------
+// Client.
+// ---------------------------------------------------------------------------
+export class Client {
+    opts;
+    runtime;
+    maxBreadcrumbs;
+    /** Raw init release, capped, stamped onto every usage event (usage release attribution). */
+    usageRelease;
+    // Resolved runtime seams.
+    fetchFn;
+    proc;
+    win;
+    doc;
+    nav;
+    storage;
+    cryptoObj;
+    location;
+    history;
+    consoleObj;
+    now;
+    setTimeoutFn;
+    clearTimeoutFn;
+    setIntervalFn;
+    clearIntervalFn;
+    dsn = null;
+    noop;
+    closed = false;
+    // Scope.
+    user = null;
+    tags = {};
+    ctx = {};
+    fingerprint = null;
+    breadcrumbs = [];
+    // Queue + guards.
+    queue = [];
+    inFlight = null;
+    capturing = false;
+    drainInFlight = null;
+    drainRequested = false;
+    retryTimer = null;
+    // Teardown + node exit semantics.
+    uninstallers = [];
+    wasOnlyUncaughtListener = false;
+    // Console breadcrumbs (opts.consoleBreadcrumbs). consoleOriginals doubles as
+    // the double-init guard (installConsoleBreadcrumbs no-ops once it is set)
+    // and as the exact-restore record for close(). consoleRecording is the
+    // re-entrancy guard: true for the entire duration of recordConsoleBreadcrumb,
+    // so any console call it triggers (a toJSON that logs, or our own debug
+    // logging) is detected and skipped without recursing.
+    consoleOriginals = null;
+    consoleRecording = false;
+    // Usage analytics: independent queue, batching timer, and state - see the
+    // "analytics (usage tracking)" section below.
+    analyticsQueue = [];
+    analyticsTimer = null;
+    referrerSent = false;
+    lastAutoPath;
+    // Node disk spool (opts.spoolDir; node runtime only). All undefined unless a
+    // spoolDir was given on a node runtime AND a node:fs was resolved.
+    fs;
+    spoolDir;
+    spoolFile;
+    spoolTmp;
+    spoolTimer = null;
+    spoolDirty = false;
+    constructor(opts, deps = {}) {
+        this.opts = opts;
+        this.fetchFn = pick(deps.fetchFn, G.fetch);
+        this.proc = pick(deps.proc, G.process);
+        this.doc = pick(deps.doc, G.document);
+        this.nav = pick(deps.navigator, G.navigator);
+        this.storage = pick(deps.storage, G.localStorage);
+        this.cryptoObj = pick(deps.cryptoObj, G.crypto);
+        this.location = pick(deps.location, G.location);
+        this.history = pick(deps.history, G.history);
+        this.consoleObj = pick(deps.consoleObj, G.console);
+        this.win =
+            deps.win !== undefined
+                ? deps.win === null
+                    ? undefined
+                    : deps.win
+                : G.window !== undefined && typeof G.addEventListener === 'function'
+                    ? globalThis
+                    : undefined;
+        this.now = deps.now ?? (() => Date.now());
+        // The global timers are bound to globalThis: they are called as methods
+        // (`this.setTimeoutFn(...)`), and a browser throws "Illegal invocation"
+        // when window.setTimeout & co. run with a `this` that is not the window.
+        this.setTimeoutFn = deps.setTimeoutFn ?? bindGlobal(G.setTimeout) ?? (() => 0);
+        this.clearTimeoutFn = deps.clearTimeoutFn ?? bindGlobal(G.clearTimeout) ?? (() => undefined);
+        this.setIntervalFn = deps.setIntervalFn ?? bindGlobal(G.setInterval) ?? (() => 0);
+        this.clearIntervalFn = deps.clearIntervalFn ?? bindGlobal(G.clearInterval) ?? (() => undefined);
+        const detected = this.win !== undefined && this.doc !== undefined ? 'browser' : 'node';
+        this.runtime = opts.runtime ?? detected;
+        const spoolDir = typeof opts.spoolDir === 'string' && opts.spoolDir.length > 0 ? opts.spoolDir : undefined;
+        if (this.runtime === 'node' && spoolDir !== undefined) {
+            this.spoolDir = spoolDir;
+            // Node accepts forward slashes on every platform, so a POSIX join is safe
+            // here and avoids pulling in node:path.
+            const sep = /[\\/]$/.test(spoolDir) ? '' : '/';
+            this.spoolFile = `${spoolDir}${sep}${SPOOL_FILE}`;
+            this.spoolTmp = `${this.spoolFile}.tmp`;
+            this.fs = deps.fs !== undefined ? (deps.fs === null ? undefined : deps.fs) : loadFs();
+        }
+        else {
+            this.spoolDir = undefined;
+            this.spoolFile = undefined;
+            this.spoolTmp = undefined;
+            this.fs = undefined;
+        }
+        const max = opts.maxBreadcrumbs;
+        this.maxBreadcrumbs =
+            typeof max === 'number' && max >= 0 ? Math.floor(max) : DEFAULT_MAX_BREADCRUMBS;
+        // CONTRACT RH-STAMP: usage events carry the CANONICAL release string
+        // "version+build" exactly as parseRelease canonicalizes the envelope's
+        // release (a buildless init release becomes "1.2.3+0"). The server
+        // attributes pageviews to a release row by comparing this string against
+        // version+'+'+build, so the two sides must canonicalize identically.
+        const usageRel = parseRelease(opts.release);
+        this.usageRelease = safeStr(usageRel.version + '+' + usageRel.build, USAGE_RELEASE_MAX);
+        this.dsn = parseDsn(opts.dsn);
+        this.noop = this.dsn === null;
+    }
+    log(level, msg, err) {
+        if (!this.opts.debug && level === 'debug')
+            return;
+        try {
+            const c = this.consoleObj;
+            const line = `uh-oh: ${msg}`;
+            if (level === 'error' && c && typeof c.error === 'function')
+                c.error(line, err);
+            else if (level === 'warn' && c && typeof c.warn === 'function')
+                c.warn(line, err);
+            else if (c && typeof c.debug === 'function')
+                c.debug(line, err);
+        }
+        catch {
+            // logging must never throw
+        }
+    }
+    install() {
+        if (this.noop) {
+            if (this.opts.debug)
+                this.log('debug', 'no dsn provided; SDK disabled (no-op)');
+            return;
+        }
+        this.restore();
+        if (this.runtime === 'browser') {
+            this.installBrowserHandlers();
+            this.installLifecycleFlush();
+            this.installAutoAnalytics();
+        }
+        else {
+            this.installNodeHandlers();
+        }
+        this.installConsoleBreadcrumbs();
+        // Restored spool may already hold events.
+        void this.drainQueue();
+    }
+    // ---- handlers ----------------------------------------------------------
+    installBrowserHandlers() {
+        const target = this.win;
+        if (!target || typeof target.addEventListener !== 'function')
+            return;
+        try {
+            const onError = (ev) => {
+                const e = ev;
+                const err = e.error !== undefined && e.error !== null ? e.error : (e.message ?? 'Error');
+                this.captureWithException(errorToException(err, 'js-global'), 'error');
+                // Never preventDefault: coexist with the app's own handlers.
+            };
+            const onRejection = (ev) => {
+                const e = ev;
+                this.captureWithException(errorToException(e.reason, 'js-promise'), 'error');
+            };
+            target.addEventListener('error', onError);
+            target.addEventListener('unhandledrejection', onRejection);
+            this.uninstallers.push(() => {
+                try {
+                    target.removeEventListener?.('error', onError);
+                    target.removeEventListener?.('unhandledrejection', onRejection);
+                }
+                catch {
+                    // best-effort teardown
+                }
+            });
+        }
+        catch (e) {
+            this.log('debug', 'failed to install browser handlers', e);
+        }
+    }
+    installLifecycleFlush() {
+        const target = this.win;
+        if (!target || typeof target.addEventListener !== 'function')
+            return;
+        try {
+            const onHide = () => {
+                this.beaconFlush();
+                this.beaconFlushAnalytics();
+            };
+            const onVisibility = () => {
+                if (this.doc && this.doc.visibilityState === 'hidden') {
+                    this.beaconFlush();
+                    this.beaconFlushAnalytics();
+                }
+            };
+            target.addEventListener('pagehide', onHide);
+            target.addEventListener('visibilitychange', onVisibility);
+            this.uninstallers.push(() => {
+                try {
+                    target.removeEventListener?.('pagehide', onHide);
+                    target.removeEventListener?.('visibilitychange', onVisibility);
+                }
+                catch {
+                    // best-effort teardown
+                }
+            });
+        }
+        catch (e) {
+            this.log('debug', 'failed to install lifecycle flush', e);
+        }
+    }
+    installNodeHandlers() {
+        const p = this.proc;
+        if (!p || typeof p.on !== 'function')
+            return;
+        try {
+            // Capture how many userland uncaughtException listeners exist BEFORE we
+            // add ours. If none, Node would have crashed the process on an uncaught
+            // error; our listener suppresses that default, so we must replicate it
+            // (log + exit 1) after a best-effort flush. If other listeners exist,
+            // they own the decision - we only capture and never exit (never steal
+            // another handler's choice, never keep a corrupted process alive).
+            const existing = typeof p.listeners === 'function' ? p.listeners('uncaughtException') : [];
+            this.wasOnlyUncaughtListener = existing.length === 0;
+            const onUncaught = (err) => this.onUncaughtException(err);
+            const onRejection = (reason) => {
+                this.captureWithException(errorToException(reason, 'js-promise'), 'error');
+                void this.drainQueue();
+            };
+            p.on('uncaughtException', onUncaught);
+            p.on('unhandledRejection', onRejection);
+            this.uninstallers.push(() => {
+                const remove = p.off ?? p.removeListener;
+                try {
+                    remove?.call(p, 'uncaughtException', onUncaught);
+                    remove?.call(p, 'unhandledRejection', onRejection);
+                }
+                catch {
+                    // best-effort teardown
+                }
+            });
+        }
+        catch (e) {
+            this.log('debug', 'failed to install node handlers', e);
+        }
+    }
+    async onUncaughtException(err) {
+        try {
+            this.captureWithException(errorToException(err, 'js-global'), 'error');
+        }
+        catch {
+            // capture guarded internally; nothing to do
+        }
+        try {
+            await this.flushWithTimeout(UNCAUGHT_FLUSH_MS);
+        }
+        catch {
+            // best-effort flush
+        }
+        // Anything that could not be sent gets spooled so the next start drains it.
+        this.flushSpool(true);
+        if (this.wasOnlyUncaughtListener && !this.closed) {
+            this.writeStderr(err);
+            try {
+                this.proc?.exit?.(1);
+            }
+            catch {
+                // exit unavailable; nothing else we can safely do
+            }
+        }
+    }
+    writeStderr(err) {
+        // Building the message must not throw either: onUncaughtException calls
+        // this right before exit(1), and a throw here (String() on a message with
+        // no toString, a throwing stack getter) used to skip the exit and leave
+        // the process running after an uncaught exception.
+        let msg = `${SDK_NAME} uncaughtException: [unprintable value]`;
+        try {
+            if (err instanceof Error || isErrorLike(err)) {
+                const e = err;
+                msg =
+                    typeof e.stack === 'string'
+                        ? e.stack
+                        : `${SDK_NAME} uncaughtException: ${String(e.message)}`;
+            }
+            else {
+                msg = `${SDK_NAME} uncaughtException: ${String(err)}`;
+            }
+        }
+        catch {
+            // keep the placeholder
+        }
+        try {
+            const w = this.proc?.stderr?.write;
+            if (typeof w === 'function') {
+                w.call(this.proc?.stderr, msg + '\n');
+                return;
+            }
+        }
+        catch {
+            // fall through to console
+        }
+        this.log('error', msg);
+    }
+    // ---- console breadcrumbs -----------------------------------------------
+    /**
+     * Wraps console.debug/log/info/warn/error (whichever exist as functions).
+     * Guarded against double-init (consoleOriginals already set => no-op, so a
+     * second install() on the same instance never nests wrappers). Each wrapped
+     * method always calls the original with unchanged arguments and `this` -
+     * mirroring installHistoryHooks's call-through-then-rethrow shape - and
+     * records regardless of whether the original threw.
+     */
+    installConsoleBreadcrumbs() {
+        if (!this.opts.consoleBreadcrumbs)
+            return;
+        if (this.consoleOriginals)
+            return;
+        const c = this.consoleObj;
+        if (!c)
+            return;
+        try {
+            const originals = {};
+            for (const method of CONSOLE_METHODS) {
+                const original = c[method];
+                if (typeof original !== 'function')
+                    continue;
+                originals[method] = original;
+                const level = consoleBreadcrumbLevel(method);
+                const record = (args) => this.recordConsoleBreadcrumb(level, args);
+                const wrapped = function (...args) {
+                    let threw = false;
+                    let err;
+                    let result;
+                    try {
+                        result = original.apply(this, args);
+                    }
+                    catch (e) {
+                        threw = true;
+                        err = e;
+                    }
+                    try {
+                        record(args);
+                    }
+                    catch {
+                        // recording must never affect the original call's outcome
+                    }
+                    if (threw)
+                        throw err;
+                    return result;
+                };
+                c[method] = wrapped;
+            }
+            this.consoleOriginals = originals;
+            this.uninstallers.push(() => this.restoreConsole());
+        }
+        catch (e) {
+            this.log('debug', 'failed to install console breadcrumbs', e);
+        }
+    }
+    /** Restores the exact original console functions. Idempotent. */
+    restoreConsole() {
+        const c = this.consoleObj;
+        const originals = this.consoleOriginals;
+        this.consoleOriginals = null;
+        if (!c || !originals)
+            return;
+        try {
+            for (const method of CONSOLE_METHODS) {
+                const original = originals[method];
+                if (original)
+                    c[method] = original;
+            }
+        }
+        catch {
+            // best-effort teardown
+        }
+    }
+    /**
+     * Records one console breadcrumb. Re-entrancy guard: a console call made
+     * WHILE this runs (a toJSON invoked by stringifyConsoleArgs's JSON.stringify,
+     * or a nested this.log() debug call from the catch block below) sees
+     * consoleRecording already true and returns immediately - the original still
+     * ran (the wrapper calls it unconditionally before reaching here), it is
+     * simply not recorded, and there is no recursion.
+     */
+    recordConsoleBreadcrumb(level, args) {
+        if (this.consoleRecording)
+            return;
+        this.consoleRecording = true;
+        try {
+            const crumb = {
+                category: 'console',
+                message: this.stringifyConsoleArgs(args),
+                level,
+                ts: new Date(this.now()).toISOString(),
+            };
+            this.breadcrumbs.push(crumb);
+            while (this.breadcrumbs.length > this.maxBreadcrumbs)
+                this.breadcrumbs.shift();
+        }
+        catch (e) {
+            this.log('debug', 'console breadcrumb recording failed', e);
+        }
+        finally {
+            this.consoleRecording = false;
+        }
+    }
+    /** Primitives via String, objects via JSON.stringify (fallback below), space-joined, 500-char cap. */
+    stringifyConsoleArgs(args) {
+        const parts = args.map((a) => this.stringifyConsoleArg(a));
+        return safeStr(parts.join(' '), CONSOLE_BREADCRUMB_MESSAGE_MAX);
+    }
+    stringifyConsoleArg(arg) {
+        if (arg === null || typeof arg !== 'object') {
+            try {
+                return String(arg);
+            }
+            catch {
+                return '[unserializable]';
+            }
+        }
+        try {
+            const json = JSON.stringify(arg);
+            return typeof json === 'string' ? json : '[unserializable]';
+        }
+        catch {
+            return '[unserializable]';
+        }
+    }
+    // ---- capture pipeline --------------------------------------------------
+    captureException(err, opts) {
+        if (this.noop || this.closed)
+            return '';
+        const mechanism = opts?.mechanism ?? 'js-manual';
+        const level = opts?.level ?? 'error';
+        return this.captureWithException(errorToException(err, mechanism), level);
+    }
+    captureMessage(msg, level = 'info') {
+        if (this.noop || this.closed)
+            return '';
+        const exception = {
+            type: 'Message',
+            value: safeStr(msg, VALUE_MAX),
+            stacktrace: [],
+            mechanism: 'js-manual',
+        };
+        return this.captureWithException(exception, level);
+    }
+    captureWithException(exception, level) {
+        if (this.noop || this.closed)
+            return '';
+        // Re-entrancy guard: an error thrown by our own pipeline must be dropped,
+        // not fed back through capture (which would loop).
+        if (this.capturing) {
+            this.log('debug', 'dropped re-entrant capture');
+            return '';
+        }
+        this.capturing = true;
+        try {
+            const id = genId(this.cryptoObj);
+            const env = this.buildEnvelope(exception, level, id);
+            const finalEnv = this.applyBeforeSend(env);
+            if (finalEnv === null)
+                return '';
+            this.enqueue(jsonSafeEnvelope(finalEnv));
+            void this.drainQueue();
+            return id;
+        }
+        catch (e) {
+            this.log('debug', 'capture failed internally', e);
+            return '';
+        }
+        finally {
+            this.capturing = false;
+        }
+    }
+    applyBeforeSend(env) {
+        const bs = this.opts.beforeSend;
+        if (!bs)
+            return env;
+        try {
+            const r = bs(env);
+            return r === null ? null : r;
+        }
+        catch (e) {
+            // A throwing beforeSend must not drop the crash: send it unmodified.
+            this.log('debug', 'beforeSend threw; sending unmodified event', e);
+            return env;
+        }
+    }
+    buildEnvelope(exception, level, id) {
+        const ctx = { ...this.ctx };
+        if (this.opts.environment !== undefined)
+            ctx['environment'] = this.opts.environment;
+        ctx['eventId'] = id;
+        const hasTags = Object.keys(this.tags).length > 0;
+        const hasCtx = Object.keys(ctx).length > 0;
+        return {
+            sdk: { name: SDK_NAME, version: SDK_VERSION },
+            timestamp: new Date(this.now()).toISOString(),
+            platform: this.runtime === 'browser' ? 'web' : 'node',
+            release: parseRelease(this.opts.release),
+            level,
+            exception,
+            breadcrumbs: this.breadcrumbs.slice(-WIRE_BREADCRUMB_MAX),
+            device: this.buildDevice(),
+            ...(this.user ? { user: this.user } : {}),
+            ...(hasTags ? { tags: { ...this.tags } } : {}),
+            ...(hasCtx ? { context: ctx } : {}),
+            ...(this.fingerprint ? { fingerprint: this.fingerprint.slice(0, 8) } : {}),
+        };
+    }
+    buildDevice() {
+        if (this.runtime === 'node') {
+            const p = this.proc;
+            const osName = p && typeof p.platform === 'string' && p.platform ? p.platform : 'node';
+            const osVersion = p && typeof p.version === 'string' && p.version ? p.version : 'unknown';
+            const arch = p && typeof p.arch === 'string' && p.arch ? p.arch : undefined;
+            return {
+                osName: safeStr(osName, CATEGORY_MAX),
+                osVersion: safeStr(osVersion, CATEGORY_MAX),
+                ...(arch ? { arch: safeStr(arch, 32) } : {}),
+            };
+        }
+        const nav = this.nav;
+        const ua = nav && typeof nav.userAgent === 'string' ? nav.userAgent : '';
+        const { osName, osVersion } = parseUserAgent(ua);
+        const locale = nav && typeof nav.language === 'string' && nav.language ? nav.language : undefined;
+        const timezone = this.resolveTimezone();
+        return {
+            osName: safeStr(osName, CATEGORY_MAX),
+            osVersion: safeStr(osVersion, CATEGORY_MAX),
+            ...(locale ? { locale: safeStr(locale, 32) } : {}),
+            ...(timezone ? { timezone: safeStr(timezone, CATEGORY_MAX) } : {}),
+        };
+    }
+    resolveTimezone() {
+        try {
+            const intl = G.Intl;
+            if (intl && typeof intl.DateTimeFormat === 'function') {
+                const tz = new intl.DateTimeFormat().resolvedOptions().timeZone;
+                return tz || undefined;
+            }
+        }
+        catch {
+            // Intl unavailable
+        }
+        return undefined;
+    }
+    // ---- scope -------------------------------------------------------------
+    addBreadcrumb(b) {
+        if (this.noop || this.closed)
+            return;
+        try {
+            const crumb = {
+                category: safeStr(b.category || 'default', CATEGORY_MAX),
+                message: safeStr(b.message ?? '', MESSAGE_MAX),
+                level: b.level ?? 'info',
+                ts: new Date(this.now()).toISOString(),
+                ...(b.data !== undefined ? { data: b.data } : {}),
+            };
+            this.breadcrumbs.push(crumb);
+            while (this.breadcrumbs.length > this.maxBreadcrumbs)
+                this.breadcrumbs.shift();
+        }
+        catch (e) {
+            this.log('debug', 'addBreadcrumb failed', e);
+        }
+    }
+    setUser(u) {
+        this.user = u;
+    }
+    setContext(key, value) {
+        if (value === null)
+            delete this.ctx[key];
+        else
+            this.ctx[key] = value;
+    }
+    setTag(key, value) {
+        if (value === null)
+            delete this.tags[key];
+        else
+            this.tags[key] = value;
+    }
+    setFingerprint(parts) {
+        this.fingerprint = parts;
+    }
+    // ---- check-in (dead-man's-switch monitors) ------------------------------
+    /**
+     * Fire-and-forget check-in ping for a named monitor. One attempt only -
+     * never queued, spooled, or retried, since a late check-in is worthless.
+     * Silent no-op when uninitialised/no dsn; an invalid slug is dropped (debug
+     * log only). Never throws. No re-entrancy guard needed: unlike capture,
+     * this has no pipeline for a failure to loop back through.
+     */
+    checkIn(slug, opts) {
+        if (this.noop || this.closed)
+            return;
+        try {
+            const dsn = this.dsn;
+            const fetchFn = this.fetchFn;
+            if (!dsn || !fetchFn)
+                return;
+            if (typeof slug !== 'string' || !SLUG_RE.test(slug)) {
+                this.log('debug', `checkIn: invalid slug ${JSON.stringify(safeStr(slug, 80))}; dropped`);
+                return;
+            }
+            let url = `${dsn.ingestUrl}/check-in/${slug}`;
+            const interval = opts?.intervalMinutes;
+            if (typeof interval === 'number' && Number.isFinite(interval) && interval > 0) {
+                url += `?intervalMinutes=${String(Math.floor(interval))}`;
+            }
+            void this.sendCheckIn(url);
+        }
+        catch (e) {
+            this.log('debug', 'checkIn failed internally', e);
+        }
+    }
+    /**
+     * Single-attempt POST for a check-in ping (post() may repeat a refused
+     * keepalive send once without keepalive). Swallows every failure (network
+     * error, timeout, non-2xx) - there is no queue or retry timer for check-ins.
+     */
+    async sendCheckIn(url) {
+        const fetchFn = this.fetchFn;
+        if (!fetchFn)
+            return;
+        let controller;
+        try {
+            const Ctor = G.AbortController;
+            if (Ctor)
+                controller = new Ctor();
+        }
+        catch {
+            controller = undefined;
+        }
+        const timer = controller
+            ? this.startTimer('timeout', () => {
+                try {
+                    controller?.abort();
+                }
+                catch {
+                    // ignore
+                }
+            }, SEND_TIMEOUT_MS)
+            : null;
+        try {
+            const init = {
+                method: 'POST',
+                headers: {},
+                body: '',
+                ...(controller ? { signal: controller.signal } : {}),
+            };
+            await this.post(fetchFn, url, init);
+        }
+        catch {
+            // no queue, no retry timer - never throws
+        }
+        finally {
+            this.stopTimer('timeout', timer);
+        }
+    }
+    // ---- queue + transport -------------------------------------------------
+    enqueue(env) {
+        this.queue.push({ id: genId(this.cryptoObj), env });
+        while (this.queue.length > MAX_QUEUE) {
+            this.queue.shift();
+            this.log('debug', 'queue over cap (50); dropped oldest event');
+        }
+        this.persist();
+    }
+    /**
+     * sendOne for a queue item, recorded in `inFlight` until it settles so that
+     * beaconFlush leaves it alone. For an item beaconFlush handed to its
+     * keepalive request (and so left out of the spool):
+     * - a TypeError is treated like a sent beacon and the item is dropped.
+     *   Chromium rejects an in-flight keepalive fetch with "TypeError: Failed to
+     *   fetch" as the page unloads while the request itself goes on to the
+     *   server (Chromium 149: the rejection came 1 ms after pagehide and the
+     *   POST still arrived). Retrying or re-spooling it would send it twice.
+     * - any other outcome (an HTTP answer, or our own timeout's abort, which
+     *   does cancel the request) goes back into the spool and drainOnce handles
+     *   it as usual: a 202 removes it, a 503 keeps it for a retry.
+     */
+    async sendQueued(item, env) {
+        const flight = { id: item.id, keepalive: false, handedOff: false, unloaded: false };
+        this.inFlight = flight;
+        let res = { ok: false };
+        try {
+            res = await this.sendOne(env, flight);
+        }
+        finally {
+            if (this.inFlight === flight)
+                this.inFlight = null;
+        }
+        if (flight.unloaded)
+            this.removeQueued(item.id);
+        else if (flight.handedOff && flight.keepalive)
+            this.persist();
+        return res;
+    }
+    async sendOne(env, flight) {
+        if (!this.dsn)
+            return { ok: false };
+        const fetchFn = this.fetchFn;
+        if (!fetchFn)
+            return { ok: false };
+        let controller;
+        try {
+            const Ctor = G.AbortController;
+            if (Ctor)
+                controller = new Ctor();
+        }
+        catch {
+            controller = undefined;
+        }
+        const timer = controller
+            ? this.startTimer('timeout', () => {
+                try {
+                    controller?.abort();
+                }
+                catch {
+                    // ignore
+                }
+            }, SEND_TIMEOUT_MS)
+            : null;
+        try {
+            const init = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(env),
+                ...(controller ? { signal: controller.signal } : {}),
+            };
+            const res = await this.post(fetchFn, this.dsn.ingestUrl, init, flight);
+            return { ok: res.ok, status: res.status };
+        }
+        catch {
+            return { ok: false };
+        }
+        finally {
+            this.stopTimer('timeout', timer);
+        }
+    }
+    /**
+     * One POST, with keepalive in the browser whenever the browser will take it,
+     * so the send can outlive the page. Chrome refuses a keepalive request past
+     * the 64 KiB quota with "TypeError: Failed to fetch" before anything is
+     * sent; drainOnce read that as a network error, so an envelope over 64 KiB
+     * (100 breadcrumbs of 1 KB) failed on every retry and held up every crash
+     * queued behind it. So a body over KEEPALIVE_BODY_MAX goes without
+     * keepalive, and a keepalive send that rejects with a TypeError (the quota
+     * is shared with other keepalive requests in flight) is retried once
+     * without it. Offline that costs one extra failed attempt. An abort is not
+     * a TypeError and is not retried. Rejects when the last attempt rejects.
+     * `flight` (a queued crash's send) records which kind of request is going.
+     */
+    async post(fetchFn, url, init, flight) {
+        if (this.runtime !== 'browser' || !fitsKeepalive(init.body))
+            return fetchFn(url, init);
+        try {
+            if (flight)
+                flight.keepalive = true;
+            return await fetchFn(url, { ...init, keepalive: true });
+        }
+        catch (e) {
+            if (!isTypeError(e))
+                throw e;
+            if (flight?.handedOff === true) {
+                // After the page hid, a TypeError is the page unloading, not the
+                // quota: the request goes on without us (see sendQueued).
+                flight.unloaded = true;
+                throw e;
+            }
+            this.log('debug', 'keepalive send refused; retrying once without keepalive', e);
+            if (flight)
+                flight.keepalive = false;
+            return fetchFn(url, init);
+        }
+    }
+    /**
+     * Starts a host timer and never throws. A host timer that throws (an unbound
+     * browser setTimeout raises "Illegal invocation") yields null and the caller
+     * degrades: no abort timeout, no retry tick, no debounce. It must not reject
+     * instead, because a rejection out of this pipeline reaches the client's own
+     * unhandledrejection handler, which captures it, fails to send it, and
+     * captures that failure again: an endless loop. `unref` keeps a Node event
+     * loop from being held open by uh-oh alone.
+     */
+    startTimer(kind, cb, ms, unref = false) {
+        let handle;
+        try {
+            handle = kind === 'interval' ? this.setIntervalFn(cb, ms) : this.setTimeoutFn(cb, ms);
+        }
+        catch (e) {
+            this.log('debug', `could not start a ${kind} timer`, e);
+            return null;
+        }
+        if (unref) {
+            try {
+                const t = handle;
+                if (t && typeof t.unref === 'function')
+                    t.unref();
+            }
+            catch {
+                // unref unavailable (browser); harmless
+            }
+        }
+        return handle === undefined ? null : handle;
+    }
+    /** Clears a timer from startTimer and never throws. */
+    stopTimer(kind, handle) {
+        if (handle === null)
+            return;
+        try {
+            if (kind === 'interval')
+                this.clearIntervalFn(handle);
+            else
+                this.clearTimeoutFn(handle);
+        }
+        catch {
+            // best-effort
+        }
+    }
+    /**
+     * Coalescing drain: at most one runs; a request mid-drain triggers one more.
+     * The returned promise never rejects (callers fire it with `void`).
+     */
+    drainQueue() {
+        if (this.drainInFlight) {
+            this.drainRequested = true;
+            return this.drainInFlight;
+        }
+        // drainLoop awaits before it can let go, so drainInFlight is set first.
+        this.drainInFlight = this.drainLoop().catch((e) => {
+            this.log('debug', 'drain failed', e);
+        });
+        return this.drainInFlight;
+    }
+    /**
+     * Lets go of the drain in the same step as its last look at the queue, so a
+     * capture after that starts a drain of its own. 0.6.1 let go in a .finally
+     * on the drain's promise, a few microtasks later: a capture in between only
+     * set drainRequested, which nothing read again, and with the queue empty no
+     * retry timer ran either, so the event waited for another capture or a page
+     * hide (and a flush() in between returned without it).
+     */
+    async drainLoop() {
+        try {
+            do {
+                this.drainRequested = false;
+                try {
+                    await this.drainOnce();
+                }
+                catch (e) {
+                    this.log('debug', 'drain failed', e);
+                    break;
+                }
+            } while (this.drainRequested && this.queue.length > 0);
+            this.updateRetryTimer();
+        }
+        finally {
+            this.drainInFlight = null;
+        }
+    }
+    /**
+     * Sends the queue head by head. While a send is in flight the queue can
+     * change under it (beaconFlush rebuilds it, a capture appends, the 50-event
+     * cap evicts the oldest), so the head that was sent is removed by id, never
+     * by position: shift() used to drop whichever crash had become the head,
+     * unsent.
+     */
+    async drainOnce() {
+        if (!this.dsn)
+            return;
+        while (this.queue.length > 0 && !this.closed) {
+            const item = this.queue[0];
+            if (!item)
+                break;
+            const res = await this.sendQueued(item, item.env);
+            if (res.ok) {
+                this.removeQueued(item.id);
+                continue;
+            }
+            if (res.status === 413) {
+                // Payload too large: trim breadcrumbs to last 50 and retry once.
+                const trimmed = {
+                    ...item.env,
+                    breadcrumbs: item.env.breadcrumbs.slice(-50),
+                };
+                const retry = await this.sendQueued(item, trimmed);
+                if (retry.ok) {
+                    this.removeQueued(item.id);
+                    continue;
+                }
+                if (retry.status === 413) {
+                    this.log('debug', 'event dropped after second 413');
+                    this.removeQueued(item.id);
+                    continue;
+                }
+                // Transient failure after trimming: keep the TRIMMED event and stop.
+                // `item` is the queued object itself (if it is still queued).
+                item.env = trimmed;
+                this.persist();
+                break;
+            }
+            // Other 4xx (not 429): permanent, drop and continue.
+            if (res.status !== undefined && res.status >= 400 && res.status < 500 && res.status !== 429) {
+                this.log('debug', `event dropped on ${String(res.status)} response`);
+                this.removeQueued(item.id);
+                continue;
+            }
+            // Network error, 5xx, or 429: retain and stop; the retry timer picks up.
+            break;
+        }
+    }
+    /** Removes a sent (or permanently refused) item, wherever it now sits. */
+    removeQueued(id) {
+        const i = this.queue.findIndex((q) => q.id === id);
+        if (i !== -1)
+            this.queue.splice(i, 1);
+        this.persist();
+    }
+    updateRetryTimer() {
+        if (this.queue.length > 0 && !this.closed) {
+            this.ensureRetryTimer();
+        }
+        else {
+            this.clearRetryTimer();
+        }
+    }
+    ensureRetryTimer() {
+        if (this.retryTimer !== null)
+            return;
+        // Unref'd: do not keep a Node event loop alive purely for retries.
+        this.retryTimer = this.startTimer('interval', () => {
+            void this.drainQueue();
+        }, RETRY_INTERVAL_MS, true);
+    }
+    clearRetryTimer() {
+        if (this.retryTimer !== null) {
+            try {
+                this.clearIntervalFn(this.retryTimer);
+            }
+            catch {
+                // ignore
+            }
+            this.retryTimer = null;
+        }
+    }
+    // ---- browser persistence ----------------------------------------------
+    persist() {
+        if (this.runtime === 'browser') {
+            this.persistBrowser();
+            return;
+        }
+        this.scheduleSpool();
+    }
+    persistBrowser() {
+        const storage = this.storage;
+        if (!storage)
+            return;
+        try {
+            // A crash handed to a keepalive request at pagehide is on its way
+            // already (see InFlight); spooling it would send it again next page.
+            const f = this.inFlight;
+            const queued = f && f.handedOff && f.keepalive ? this.queue.filter((q) => q.id !== f.id) : this.queue;
+            let items = queued.slice(-MAX_QUEUE);
+            let serialized = JSON.stringify(items);
+            while (serialized.length > MAX_SPOOL_BYTES && items.length > 1) {
+                items = items.slice(1);
+                serialized = JSON.stringify(items);
+            }
+            if (items.length === 0)
+                storage.removeItem(SPOOL_KEY);
+            else
+                storage.setItem(SPOOL_KEY, serialized);
+        }
+        catch (e) {
+            this.log('debug', 'spool persist failed', e);
+        }
+    }
+    restore() {
+        if (this.runtime === 'browser') {
+            this.restoreBrowser();
+            return;
+        }
+        this.restoreNode();
+    }
+    restoreBrowser() {
+        const storage = this.storage;
+        if (!storage)
+            return;
+        let raw = null;
+        try {
+            raw = storage.getItem(SPOOL_KEY);
+        }
+        catch (e) {
+            this.log('debug', 'spool read failed', e);
+            return;
+        }
+        if (!raw)
+            return;
+        let parsed;
+        try {
+            parsed = JSON.parse(raw);
+        }
+        catch {
+            this.log('debug', 'spool JSON parse failed; discarding corrupt spool');
+            this.safeRemoveSpool();
+            return;
+        }
+        if (!Array.isArray(parsed)) {
+            this.log('debug', 'spool was not an array; discarding corrupt spool');
+            this.safeRemoveSpool();
+            return;
+        }
+        // Restored events are older, so they go in front, then cap.
+        this.queue = [...this.coerceEntries(parsed), ...this.queue].slice(-MAX_QUEUE);
+    }
+    safeRemoveSpool() {
+        try {
+            this.storage?.removeItem(SPOOL_KEY);
+        }
+        catch {
+            // ignore
+        }
+    }
+    /** Validates raw spool entries; drops (with a debug log) any malformed one. */
+    coerceEntries(parsed) {
+        const valid = [];
+        for (const raw of parsed) {
+            const it = raw;
+            if (it &&
+                typeof it === 'object' &&
+                typeof it.id === 'string' &&
+                it.env !== null &&
+                typeof it.env === 'object') {
+                valid.push({ id: it.id, env: it.env });
+            }
+            else {
+                this.log('debug', 'discarded malformed spool entry');
+            }
+        }
+        return valid;
+    }
+    // ---- node disk spool ---------------------------------------------------
+    /** Debounced (~1s) request to write the queue to disk. No-op without spool. */
+    scheduleSpool() {
+        if (this.runtime !== 'node' || !this.fs || !this.spoolFile)
+            return;
+        this.spoolDirty = true;
+        if (this.spoolTimer !== null)
+            return;
+        // Unref'd: do not keep a Node event loop alive purely for a spool write.
+        this.spoolTimer = this.startTimer('timeout', () => {
+            this.spoolTimer = null;
+            this.flushSpool();
+        }, SPOOL_DEBOUNCE_MS, true);
+        // No timer available: write now rather than never.
+        if (this.spoolTimer === null)
+            this.flushSpool();
+    }
+    /**
+     * Writes the queue to `<spoolDir>/uh-oh-spool.json` atomically: serialize to
+     * a sibling `.tmp` file then rename over the target, so a concurrent reader
+     * never sees a partially written file. Force-flushes bypass the dirty check
+     * (used on close and on the uncaught-exception exit path). Never throws.
+     */
+    flushSpool(force = false) {
+        if (this.runtime !== 'node')
+            return;
+        const fs = this.fs;
+        const file = this.spoolFile;
+        const tmp = this.spoolTmp;
+        const dir = this.spoolDir;
+        if (!fs || !file || !tmp || dir === undefined)
+            return;
+        if (!force && !this.spoolDirty)
+            return;
+        this.spoolDirty = false;
+        try {
+            let items = this.queue.slice(-MAX_QUEUE);
+            let serialized = JSON.stringify(items);
+            while (serialized.length > MAX_SPOOL_BYTES && items.length > 1) {
+                items = items.slice(1);
+                serialized = JSON.stringify(items);
+            }
+            if (items.length === 0) {
+                this.safeUnlink(file);
+                return;
+            }
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(tmp, serialized);
+            fs.renameSync(tmp, file);
+        }
+        catch (e) {
+            this.log('debug', 'node spool persist failed', e);
+            // Leave no half-written tmp file behind on failure.
+            this.safeUnlink(tmp);
+        }
+    }
+    restoreNode() {
+        const fs = this.fs;
+        const file = this.spoolFile;
+        if (!fs || !file)
+            return;
+        let raw;
+        try {
+            if (typeof fs.existsSync === 'function' && !fs.existsSync(file))
+                return;
+            raw = fs.readFileSync(file, 'utf8');
+        }
+        catch (e) {
+            // Missing or unreadable file: nothing to restore.
+            this.log('debug', 'node spool read failed', e);
+            return;
+        }
+        if (!raw)
+            return;
+        let parsed;
+        try {
+            parsed = JSON.parse(raw);
+        }
+        catch {
+            this.log('debug', 'node spool JSON parse failed; discarding corrupt spool');
+            this.safeUnlink(file);
+            return;
+        }
+        if (!Array.isArray(parsed)) {
+            this.log('debug', 'node spool was not an array; discarding corrupt spool');
+            this.safeUnlink(file);
+            return;
+        }
+        this.queue = [...this.coerceEntries(parsed), ...this.queue].slice(-MAX_QUEUE);
+    }
+    safeUnlink(path) {
+        try {
+            this.fs?.unlinkSync?.(path);
+        }
+        catch {
+            // best-effort
+        }
+    }
+    clearSpoolTimer() {
+        if (this.spoolTimer !== null) {
+            try {
+                this.clearTimeoutFn(this.spoolTimer);
+            }
+            catch {
+                // ignore
+            }
+            this.spoolTimer = null;
+        }
+    }
+    beaconFlush() {
+        if (!this.dsn || this.queue.length === 0)
+            return;
+        const nav = this.nav;
+        const beacon = nav && typeof nav.sendBeacon === 'function' ? nav.sendBeacon.bind(nav) : null;
+        if (!beacon) {
+            void this.drainQueue();
+            return;
+        }
+        const remaining = [];
+        const flight = this.inFlight;
+        for (const item of this.queue) {
+            if (flight && item.id === flight.id) {
+                // Its POST is in flight: a beacon too would deliver it twice. It stays
+                // queued until that POST settles (see sendQueued). A keepalive POST
+                // outlives the page, so persist() leaves it out of the spool; a plain
+                // one (over the quota, or refused) dies with the page, so the spool
+                // keeps it for the next page load.
+                flight.handedOff = true;
+                remaining.push(item);
+                continue;
+            }
+            let ok = false;
+            try {
+                const json = JSON.stringify(item.env);
+                // Over the keepalive quota sendBeacon can only refuse it: keep it
+                // queued (persisted below) for a plain fetch from this page's retry
+                // timer or from the next page load.
+                ok = fitsKeepalive(json) && beacon(this.dsn.ingestUrl, this.beaconBody(json));
+            }
+            catch {
+                ok = false;
+            }
+            if (!ok)
+                remaining.push(item);
+        }
+        this.queue = remaining;
+        this.persist();
+    }
+    /**
+     * Beacon bodies are text/plain on purpose. navigator.sendBeacon always sends
+     * with credentials mode "include"; a body typed application/json is not a
+     * CORS-safelisted type, so the browser preflights it, and a preflight
+     * answered "Access-Control-Allow-Origin: *" fails for a credentialed request,
+     * so the POST is never sent (production showed only lone OPTIONS requests).
+     * text/plain is a CORS "simple" request: no preflight. Both ingest routes
+     * parse a text/plain body as JSON. A bare string body (no Blob) is sent by
+     * the browser as text/plain too. `json` is the already serialized payload,
+     * so callers can check its size first (fitsKeepalive).
+     */
+    beaconBody(json) {
+        try {
+            const BlobCtorRef = G.Blob;
+            if (BlobCtorRef)
+                return new BlobCtorRef([json], { type: BEACON_CONTENT_TYPE });
+        }
+        catch {
+            // fall through to string
+        }
+        return json;
+    }
+    // ---- analytics (usage tracking) ----------------------------------------
+    //
+    // Independent of the crash queue above: its own bounded queue (cap 20),
+    // its own 5s debounce-after-first-enqueue batching timer, and NO retry or
+    // spool on send failure - a dropped analytics batch is simply gone. This
+    // is intentional: usage analytics is high-volume, low-value-per-event data
+    // where holding memory/disk to retry a failed batch is the wrong trade,
+    // unlike a crash report. Never mints/stores/sends any identifier of its
+    // own; identity is entirely server-side (see CONTRACT U-IN).
+    /**
+     * Records a pageview. Browser: defaults `path` to `location.pathname`.
+     * Node: always dropped (with a debug log) - pageviews are a browser
+     * concept. Silent no-op when uninitialised/no dsn/closed. Never throws.
+     */
+    trackPageview(path) {
+        if (this.noop || this.closed)
+            return;
+        try {
+            if (this.runtime === 'node') {
+                this.log('debug', 'trackPageview: dropped on node runtime (pageviews are a browser concept)');
+                return;
+            }
+            this.sendPageview(path);
+        }
+        catch (e) {
+            this.log('debug', 'trackPageview failed internally', e);
+        }
+    }
+    /**
+     * Records a named custom event with optional props. Works on both
+     * runtimes. Validates client-side against the same shape the server
+     * enforces (name regex, <=10 props, key/value length caps); any violation
+     * drops the WHOLE call (not a partial/truncated send) with a debug log, so
+     * the client never ships something the server would reject anyway. Never
+     * throws.
+     */
+    trackEvent(name, props) {
+        if (this.noop || this.closed)
+            return;
+        try {
+            if (typeof name !== 'string' || !USAGE_NAME_RE.test(name)) {
+                this.log('debug', `trackEvent: invalid name ${JSON.stringify(safeStr(name, 80))}; dropped`);
+                return;
+            }
+            const validated = this.validateProps(props);
+            if (!validated.ok)
+                return; // reason already logged by validateProps
+            const evt = {
+                type: 'event',
+                ts: this.now(),
+                name,
+                ...(validated.props ? { props: validated.props } : {}),
+            };
+            this.enqueueAnalytics(evt);
+        }
+        catch (e) {
+            this.log('debug', 'trackEvent failed internally', e);
+        }
+    }
+    resolvePath(explicitPath) {
+        if (typeof explicitPath === 'string' && explicitPath.length > 0)
+            return explicitPath;
+        const loc = this.location;
+        return loc && typeof loc.pathname === 'string' ? loc.pathname : '';
+    }
+    /**
+     * Builds and enqueues one pageview. `path` falls back to
+     * `location.pathname` when omitted (used both for manual trackPageview()
+     * calls and for auto-mode navigation). A missing/empty resolved path, or
+     * one over the 512-char wire cap, drops the whole pageview (structural
+     * violation - mirrors what the server would reject). An over-length
+     * referrer instead just omits the referrer field and keeps the pageview:
+     * referrer is optional/best-effort, so degrading gracefully beats losing
+     * an entire pageview count over an incidental field.
+     */
+    sendPageview(explicitPath) {
+        const path = this.resolvePath(explicitPath);
+        if (!path) {
+            this.log('debug', 'trackPageview: dropped (no path available)');
+            return;
+        }
+        if (path.length > USAGE_PATH_MAX) {
+            this.log('debug', 'trackPageview: dropped (path exceeds 512 chars)');
+            return;
+        }
+        const evt = { type: 'pageview', ts: this.now(), path };
+        if (!this.referrerSent) {
+            this.referrerSent = true;
+            const doc = this.doc;
+            const ref = doc && typeof doc.referrer === 'string' ? doc.referrer : '';
+            if (ref) {
+                if (ref.length > USAGE_REFERRER_MAX) {
+                    this.log('debug', 'trackPageview: referrer exceeds 512 chars; omitted');
+                }
+                else {
+                    evt.referrer = ref;
+                }
+            }
+        }
+        this.enqueueAnalytics(evt);
+    }
+    /** Validates trackEvent's `props`; ok:false means "drop the whole event" (reason logged here). */
+    validateProps(props) {
+        if (props === undefined)
+            return { ok: true };
+        if (typeof props !== 'object' || props === null) {
+            this.log('debug', 'trackEvent: props must be an object; dropped');
+            return { ok: false };
+        }
+        const keys = Object.keys(props);
+        if (keys.length > USAGE_PROPS_MAX_KEYS) {
+            this.log('debug', `trackEvent: too many props (${String(keys.length)} > 10); dropped`);
+            return { ok: false };
+        }
+        const clean = {};
+        for (const key of keys) {
+            if (key.length > USAGE_PROP_KEY_MAX) {
+                this.log('debug', `trackEvent: prop key ${JSON.stringify(safeStr(key, 80))} too long; dropped`);
+                return { ok: false };
+            }
+            const value = props[key];
+            if (typeof value === 'string') {
+                if (value.length > USAGE_PROP_VALUE_MAX) {
+                    this.log('debug', `trackEvent: prop "${key}" value exceeds 256 chars; dropped`);
+                    return { ok: false };
+                }
+                clean[key] = value;
+            }
+            else if (typeof value === 'number') {
+                if (!Number.isFinite(value)) {
+                    this.log('debug', `trackEvent: prop "${key}" is not a finite number; dropped`);
+                    return { ok: false };
+                }
+                clean[key] = value;
+            }
+            else if (typeof value === 'boolean') {
+                clean[key] = value;
+            }
+            else {
+                this.log('debug', `trackEvent: prop "${key}" has an unsupported value type; dropped`);
+                return { ok: false };
+            }
+        }
+        return keys.length > 0 ? { ok: true, props: clean } : { ok: true };
+    }
+    enqueueAnalytics(evt) {
+        if (!this.dsn)
+            return;
+        // Stamp the init release on every usage event here (the single choke
+        // point both trackPageview/trackEvent and auto pageviews funnel through).
+        this.analyticsQueue.push({ ...evt, release: this.usageRelease });
+        if (this.analyticsQueue.length >= ANALYTICS_MAX_QUEUE) {
+            void this.flushAnalytics();
+            return;
+        }
+        this.ensureAnalyticsTimer();
+    }
+    ensureAnalyticsTimer() {
+        if (this.analyticsTimer !== null)
+            return;
+        // Unref'd: do not keep a Node event loop alive purely for an analytics
+        // batch. With no timer the batch waits for the 20-event cap, flush(),
+        // close() or the pagehide beacon instead of throwing.
+        this.analyticsTimer = this.startTimer('timeout', () => {
+            this.analyticsTimer = null;
+            void this.flushAnalytics();
+        }, ANALYTICS_DEBOUNCE_MS, true);
+    }
+    clearAnalyticsTimer() {
+        if (this.analyticsTimer !== null) {
+            try {
+                this.clearTimeoutFn(this.analyticsTimer);
+            }
+            catch {
+                // ignore
+            }
+            this.analyticsTimer = null;
+        }
+    }
+    /** Drains the analytics queue with a single POST. Resolves once sent (or immediately if empty). */
+    flushAnalytics() {
+        this.clearAnalyticsTimer();
+        if (!this.dsn || this.analyticsQueue.length === 0)
+            return Promise.resolve();
+        const batch = this.analyticsQueue;
+        this.analyticsQueue = [];
+        return this.sendAnalyticsBatch(batch);
+    }
+    /**
+     * Single-attempt POST of `{ events }` to `<ingestUrl>/usage`. Lossy by
+     * design: the batch is already removed from the queue by the caller
+     * before this runs, so on any failure (network error, non-2xx response)
+     * it is simply dropped - no retry, no spool, matching the crash queue's
+     * discipline is deliberately NOT done here.
+     */
+    async sendAnalyticsBatch(events) {
+        const dsn = this.dsn;
+        const fetchFn = this.fetchFn;
+        if (!dsn || !fetchFn)
+            return;
+        let controller;
+        try {
+            const Ctor = G.AbortController;
+            if (Ctor)
+                controller = new Ctor();
+        }
+        catch {
+            controller = undefined;
+        }
+        const timer = controller
+            ? this.startTimer('timeout', () => {
+                try {
+                    controller?.abort();
+                }
+                catch {
+                    // ignore
+                }
+            }, SEND_TIMEOUT_MS)
+            : null;
+        try {
+            const init = {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ events }),
+                ...(controller ? { signal: controller.signal } : {}),
+            };
+            const res = await this.post(fetchFn, `${dsn.ingestUrl}/usage`, init);
+            if (!res.ok) {
+                this.log('debug', `analytics batch dropped on non-2xx response (${String(res.status)})`);
+            }
+        }
+        catch {
+            this.log('debug', 'analytics batch dropped: send failed (no retry, no spool)');
+        }
+        finally {
+            this.stopTimer('timeout', timer);
+        }
+    }
+    /** Beacon-based batch flush for pagehide/hidden, mirroring the crash queue's beaconFlush discipline. */
+    beaconFlushAnalytics() {
+        if (!this.dsn || this.analyticsQueue.length === 0)
+            return;
+        this.clearAnalyticsTimer();
+        const batch = this.analyticsQueue;
+        this.analyticsQueue = [];
+        const nav = this.nav;
+        const beacon = nav && typeof nav.sendBeacon === 'function' ? nav.sendBeacon.bind(nav) : null;
+        if (!beacon) {
+            // No beacon support: best-effort async send. The page may unload
+            // before this completes - acceptable, analytics is lossy by design.
+            void this.sendAnalyticsBatch(batch);
+            return;
+        }
+        try {
+            const json = JSON.stringify({ events: batch });
+            if (!fitsKeepalive(json)) {
+                // sendBeacon would refuse a batch over the keepalive quota. A plain
+                // fetch still lands while the page is only hidden; at unload it may
+                // be cut off, which analytics accepts.
+                void this.sendAnalyticsBatch(batch);
+                return;
+            }
+            const ok = beacon(`${this.dsn.ingestUrl}/usage`, this.beaconBody(json));
+            if (!ok)
+                this.log('debug', 'analytics beacon flush rejected by the browser; batch dropped');
+        }
+        catch {
+            this.log('debug', 'analytics beacon flush failed; batch dropped');
+        }
+    }
+    /**
+     * Browser-only. When `analytics.auto` is set: sends one initial pageview,
+     * then hooks History pushState/replaceState + popstate to auto-track SPA
+     * navigation, de-duping consecutive identical paths. No-op otherwise.
+     */
+    installAutoAnalytics() {
+        if (!this.opts.analytics?.auto)
+            return;
+        try {
+            this.sendPageview(undefined);
+            this.lastAutoPath = this.resolvePath(undefined);
+            this.installHistoryHooks();
+            this.installPopstateHook();
+        }
+        catch (e) {
+            this.log('debug', 'failed to install auto analytics', e);
+        }
+    }
+    /**
+     * Wraps history.pushState/replaceState: always calls the original through
+     * (via apply, forwarding `this` and args) and always rethrows exactly what
+     * the original threw, if anything - our tracking hook runs regardless and
+     * never itself alters that call's outcome. Restored verbatim on close().
+     */
+    installHistoryHooks() {
+        const hist = this.history;
+        if (!hist)
+            return;
+        const handleNavigation = () => this.handleAutoNavigation();
+        const wrap = (method) => {
+            const original = hist[method];
+            if (typeof original !== 'function')
+                return;
+            const wrapped = function (...args) {
+                let threw = false;
+                let err;
+                let result;
+                try {
+                    result = original.apply(this, args);
+                }
+                catch (e) {
+                    threw = true;
+                    err = e;
+                }
+                try {
+                    handleNavigation();
+                }
+                catch {
+                    // tracking must never affect the original call's outcome
+                }
+                if (threw)
+                    throw err;
+                return result;
+            };
+            hist[method] = wrapped;
+            this.uninstallers.push(() => {
+                try {
+                    if (hist[method] === wrapped)
+                        hist[method] = original;
+                }
+                catch {
+                    // best-effort teardown
+                }
+            });
+        };
+        wrap('pushState');
+        wrap('replaceState');
+    }
+    installPopstateHook() {
+        const target = this.win;
+        if (!target || typeof target.addEventListener !== 'function')
+            return;
+        const onPopState = () => this.handleAutoNavigation();
+        target.addEventListener('popstate', onPopState);
+        this.uninstallers.push(() => {
+            try {
+                target.removeEventListener?.('popstate', onPopState);
+            }
+            catch {
+                // best-effort teardown
+            }
+        });
+    }
+    /** Sends an auto-mode pageview for the current location, de-duping consecutive identical paths. */
+    handleAutoNavigation() {
+        try {
+            const path = this.resolvePath(undefined);
+            if (path === this.lastAutoPath)
+                return;
+            this.lastAutoPath = path;
+            this.sendPageview(path);
+        }
+        catch (e) {
+            this.log('debug', 'auto pageview tracking failed', e);
+        }
+    }
+    /** Pending analytics-queue length (test/introspection helper). */
+    analyticsSize() {
+        return this.analyticsQueue.length;
+    }
+    // ---- lifecycle ---------------------------------------------------------
+    /** Best-effort drain bounded by `timeoutMs`. Never rejects. */
+    async flush(timeoutMs = 5_000) {
+        try {
+            await this.flushWithTimeout(timeoutMs);
+        }
+        catch {
+            // best-effort
+        }
+    }
+    flushWithTimeout(ms) {
+        return new Promise((resolve) => {
+            let settled = false;
+            // `timer` is declared before `finish` so a setTimeout stub that fires its
+            // callback synchronously does not hit a temporal-dead-zone reference.
+            let timer = null;
+            const finish = () => {
+                if (settled)
+                    return;
+                settled = true;
+                this.stopTimer('timeout', timer);
+                resolve();
+            };
+            // No usable timer (startTimer returned null): the flush is then bounded
+            // only by the sends themselves, which never reject.
+            timer = this.startTimer('timeout', finish, ms);
+            Promise.all([this.drainQueue(), this.flushAnalytics()]).then(finish, finish);
+        });
+    }
+    close() {
+        this.closed = true;
+        for (const fn of this.uninstallers) {
+            try {
+                fn();
+            }
+            catch {
+                // best-effort teardown
+            }
+        }
+        this.uninstallers = [];
+        this.clearRetryTimer();
+        // Best-effort, fire-and-forget final flush of any pending analytics
+        // (lossy by design - close() does not await or retry this).
+        void this.flushAnalytics();
+        // Persist any still-pending events before we go, then stop the debounce.
+        this.flushSpool(true);
+        this.clearSpoolTimer();
+    }
+    /** Pending queue length (test/introspection helper). */
+    size() {
+        return this.queue.length;
+    }
+}
+function pick(dep, fromGlobal) {
+    if (dep === null)
+        return undefined;
+    if (dep === undefined)
+        return fromGlobal;
+    return dep;
+}
+/**
+ * Binds a host function taken off globalThis (setTimeout, clearInterval, ...)
+ * back to globalThis. Browser globals are WebIDL operations that throw
+ * "TypeError: Illegal invocation" when called with any other `this`, which is
+ * exactly what storing one on the Client and calling `this.setTimeoutFn(...)`
+ * does. Node's timers ignore `this`, so the unbound version passed every Node
+ * and injected-fake test while the real browser client never sent anything.
+ */
+function bindGlobal(fn) {
+    return typeof fn === 'function' ? fn.bind(globalThis) : undefined;
+}
+// ---------------------------------------------------------------------------
+// Functional singleton API - what consumer apps import. Every entry point is
+// wrapped so it can never throw out of the public surface.
+// ---------------------------------------------------------------------------
+// The live client is kept in a global slot keyed by Symbol.for, not only in
+// this module. A bundler can evaluate this file more than once in one process:
+// Next.js (Turbopack) builds instrumentation.ts and each route handler as
+// separate module graphs, so init() in instrumentation set a client that route
+// code never saw, and the minifier folded the route copy's captureException
+// down to `return ""`. Every copy reads the same Symbol.for key, so the copy
+// that called init() serves them all.
+//
+// Contract: one functional-API client per global scope (a page, a Node
+// process, a worker; workers have their own globalThis). A second init() from
+// any copy closes and replaces the first, as a second init() always did within
+// one copy. Two independent apps on one page that each need their own DSN
+// should construct `new Client()` directly. close() from any copy clears the
+// slot, so a test that resets modules should still call close(). When the slot
+// cannot be written (a frozen global), each copy keeps its own client.
+const CLIENT_SLOT = Symbol.for('uh-oh.client');
+let moduleClient = null;
+function isClientLike(v) {
+    return (typeof v === 'object' &&
+        v !== null &&
+        typeof v.captureException === 'function');
+}
+/** The client every copy shares, else this copy's own (slot unwritable). */
+function liveClient() {
+    try {
+        const held = G[CLIENT_SLOT];
+        if (isClientLike(held))
+            return held;
+        if (held === null)
+            return null; // cleared by some copy's close()
+    }
+    catch {
+        // unreadable global: fall back to this copy's own client
+    }
+    return moduleClient;
+}
+function setLiveClient(c) {
+    moduleClient = c;
+    try {
+        G[CLIENT_SLOT] = c;
+    }
+    catch {
+        // frozen or locked-down global: this copy keeps its own client
+    }
+}
+export function init(opts) {
+    let next = null;
+    try {
+        const previous = liveClient();
+        if (previous)
+            previous.close();
+        next = new Client(opts);
+        setLiveClient(next);
+        next.install();
+    }
+    catch (e) {
+        try {
+            next?.close();
+        }
+        catch {
+            // never throw
+        }
+        setLiveClient(null);
+        try {
+            if (opts && opts.debug) {
+                const c = G.console;
+                if (c && typeof c.error === 'function')
+                    c.error('uh-oh: init failed', e);
+            }
+        }
+        catch {
+            // never throw
+        }
+    }
+}
+export function captureException(err, opts) {
+    try {
+        const c = liveClient();
+        return c ? c.captureException(err, opts) : '';
+    }
+    catch {
+        return '';
+    }
+}
+export function captureMessage(msg, level) {
+    try {
+        const c = liveClient();
+        return c ? c.captureMessage(msg, level) : '';
+    }
+    catch {
+        return '';
+    }
+}
+export function addBreadcrumb(b) {
+    try {
+        liveClient()?.addBreadcrumb(b);
+    }
+    catch {
+        // never throw
+    }
+}
+export function setUser(u) {
+    try {
+        liveClient()?.setUser(u);
+    }
+    catch {
+        // never throw
+    }
+}
+export function setContext(key, value) {
+    try {
+        liveClient()?.setContext(key, value);
+    }
+    catch {
+        // never throw
+    }
+}
+export function setTag(key, value) {
+    try {
+        liveClient()?.setTag(key, value);
+    }
+    catch {
+        // never throw
+    }
+}
+export function setFingerprint(parts) {
+    try {
+        liveClient()?.setFingerprint(parts);
+    }
+    catch {
+        // never throw
+    }
+}
+export function checkIn(slug, opts) {
+    try {
+        liveClient()?.checkIn(slug, opts);
+    }
+    catch {
+        // never throw
+    }
+}
+export function trackPageview(path) {
+    try {
+        liveClient()?.trackPageview(path);
+    }
+    catch {
+        // never throw
+    }
+}
+export function trackEvent(name, props) {
+    try {
+        liveClient()?.trackEvent(name, props);
+    }
+    catch {
+        // never throw
+    }
+}
+export function flush(timeoutMs) {
+    try {
+        const c = liveClient();
+        return c ? c.flush(timeoutMs) : Promise.resolve();
+    }
+    catch {
+        return Promise.resolve();
+    }
+}
+export function close() {
+    try {
+        liveClient()?.close();
+    }
+    catch {
+        // never throw
+    }
+    finally {
+        setLiveClient(null);
+    }
+}
+//# sourceMappingURL=uh-oh-client.js.map
