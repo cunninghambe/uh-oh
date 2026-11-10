@@ -5,7 +5,12 @@ DB=/var/lib/uh-oh/uh-oh.db
 SYMBOLS_DIR=/var/lib/uh-oh/symbols
 DEST=/var/backups/uh-oh
 DATE=$(date +%Y%m%d)
-RETENTION_DAYS=30
+# Days of dated copies kept on the box. The symbols archive is a full copy of
+# symbols/ every day and rarely changes (on the live box every archive since
+# 2026-10-27 was byte-identical, ~190 MB a day), so it keeps a shorter tail
+# than the small DB copies. Both can be overridden from the environment.
+RETENTION_DAYS="${RETENTION_DAYS:-30}"
+SYMBOLS_RETENTION_DAYS="${SYMBOLS_RETENTION_DAYS:-7}"
 
 command -v sqlite3 >/dev/null 2>&1 || {
   echo "ERROR: sqlite3 not found in PATH — install it first (apt-get install -y sqlite3)" >&2
@@ -37,13 +42,14 @@ else
   echo "WARNING: $SYMBOLS_DIR does not exist, skipping symbols backup" >&2
 fi
 
-# Retention: keep 30 days, applied to both the DB and symbols archives.
+# Retention: RETENTION_DAYS (30) for the DB copies, SYMBOLS_RETENTION_DAYS (7)
+# for the symbols archives.
 # -maxdepth 1: retention manages ONLY the dated files this script writes at the
 # top level. Without it the glob descended into pre-v09/ (root-owned migration
 # safety copies), hit EPERM once those aged past 30 days, and set -e killed the
 # job AFTER a good backup but BEFORE its monitor check-in - three missed
 # heartbeats (2026-08-25..27) for a backup that was actually succeeding.
 find "$DEST" -maxdepth 1 -name 'uh-oh-*.db' -mtime "+$RETENTION_DAYS" -delete
-find "$DEST" -maxdepth 1 -name 'uh-oh-symbols-*.tar.gz' -mtime "+$RETENTION_DAYS" -delete
+find "$DEST" -maxdepth 1 -name 'uh-oh-symbols-*.tar.gz' -mtime "+$SYMBOLS_RETENTION_DAYS" -delete
 
 echo "Backup written: $DB_BACKUP (+ symbols archive if present)"

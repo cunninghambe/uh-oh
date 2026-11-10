@@ -175,7 +175,7 @@ From outside the box, port 3300 must be unreachable (UFW blocks it). Use the ngi
 
 The `symbols/` directory (ProGuard mappings, Hermes source maps) is archived alongside the DB into `/var/backups/uh-oh/uh-oh-symbols-YYYYMMDD.tar.gz`. Restoring the DB without also restoring this archive leaves `releases.mapping_uploaded_at` / `sourcemap_uploaded_at` pointing at symbol files that no longer exist — symbolication breaks with no hint in the UI.
 
-Both the `.db` and `.tar.gz` files older than 30 days are deleted automatically.
+`.db` copies older than 30 days and symbols archives older than 7 days are deleted automatically. The symbols archive is a full copy of `symbols/` every day and rarely changes, so a long tail of it is mostly duplicates (about 190 MB a day on a busy box). Override either with `RETENTION_DAYS` / `SYMBOLS_RETENTION_DAYS` in the environment of `uh-oh-backup.service`.
 
 ### Backup failure alerts
 
